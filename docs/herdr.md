@@ -157,6 +157,18 @@ is not, for two minutes more with still no word from the hook. What Herdr
 shows is reported from then on. A terminal at rest contradicts nothing, and
 a hook that speaks again holds it again.
 
+The variables below are ones any program in a terminal can set, so a hook's
+hold is good only for what its own session shows. When Herdr shows an agent
+blocked, or (herdr-core) failed, and the hook's session does not show the
+same within a minute and a half, what Herdr shows is reported, and stays
+reported until the hook's session shows it too or the agent moves on. And a
+hook holds a terminal or pane only if its session's folder is the one Herdr
+gives for it, a folder inside that one, or one above it that is still inside
+the environment's `root`: Herdr names the folder of whatever is running in
+front, which may be deeper than the agent's own. Set `root` to the folder
+your work is under, or a hooked agent whose pane is elsewhere is reported
+twice.
+
 - herdr-core gives a terminal's processes `HC_TERMINAL_ID` and
   `HC_TERMINAL_SOCKET`. A hook that runs with an address-shaped
   `HC_TERMINAL_ID` and a `HC_TERMINAL_SOCKET` that is this environment's

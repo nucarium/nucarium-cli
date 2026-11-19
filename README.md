@@ -488,8 +488,8 @@ and all mode 600:
 | `merged.json` | GitHub's answers to "was this commit merged?", so the count asks about a commit once an hour at most and never again once it was merged. |
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
-| `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, and, for a claim in doubt, its key and since when. No title, message or path. |
-| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
+| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
 | `config-sync.json` | Per environment: the commit its config was applied from, whether a synced file was changed by hand, one fixed word for how the sync stands, and two times. No address, branch, path or name. Only with `[config_sync]` set. |
 
 One folder is kept outside it, because it holds content: `~/.cache/nucleated/`
@@ -700,8 +700,25 @@ What holds for every driver, whatever its adapter:
   then sees the session at work or waiting on its owner while the hook's
   session is not, for two minutes more with still no word from the hook, the
   note is dropped and the driver's view is reported. A session at rest
-  contradicts nothing, and a hook that speaks again wins again. How a hook
-  knows where it is
+  contradicts nothing, and a hook that speaks again wins again.
+
+  A hook is believed for what its own session shows, and for nothing more.
+  Its note is a file any program on the box could write, by running
+  `nucleated hook` with a driver's variables set. So it never keeps from you
+  a session that waits on you or has failed: when the driver sees either,
+  and no hook that speaks for the session shows the same within a minute and
+  a half, the driver's view is reported, and stays reported until a hook's
+  own session shows it too or the session moves on. A session the driver
+  had already reported as waiting or failed is not taken back at all on such
+  a note. An agent whose hooks have no word for what the driver sees (Codex
+  waiting on an answer, say) is therefore reported from both for as long as
+  that lasts. And where the driver says which folder a session works in, a
+  note counts only if its hook's session works in that folder or inside it,
+  or above it and still inside the environment's `root`; a note that names
+  no folder, or another, is some other session's. What a note can still do
+  is stand in for a session that is at work or at rest.
+
+  How a hook knows where it is
   running is each driver's own, from the variables the driver documents or
   from the folder, and is on its page. For Herdr it holds only when the
   socket the hook's terminal names is the environment's own; for Orca it is
@@ -765,6 +782,13 @@ is never touched.
 - **A change made by hand is put back by the next commit**, or by `nucleated
   config sync` run by hand, and by nothing else: the scheduled pass notices
   it and reports it, and writes nothing while the branch stands still.
+- **Only the hook handlers `nucleated` and `nucleate` write are kept from
+  the file on the box**, and a handler is one of those only if it is,
+  whole, a form they write: what `nucleated hooks print` prints, or one of
+  the two worktree hooks above, with the program as the bare name or as
+  `.local/bin/<name>` under the agent user's home. A handler that only
+  starts like one, or carries anything else along, is a change made by hand:
+  it is reported as one and the next sync writes the file without it.
 - **Git's own words for an error are shown nowhere**: not in the log, not in
   the state folder, and not by `nucleated config sync` at a terminal. They
   can quote the repository's address. The command gives one fixed word, and

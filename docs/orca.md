@@ -120,7 +120,13 @@ of Orca's worktrees, the Claude Code agents Orca lists in that worktree are
 not reported from Orca, until the hook's session ends. A hook that has gone
 quiet does not hold that for ever: when it has said nothing for two minutes,
 and Orca then shows such an agent at work or waiting on you while the hook's
-session is not, for two minutes more, Orca's view is reported again. A Codex
+session is not, for two minutes more, Orca's view is reported again. A hook
+never keeps from you an agent that waits on you or has failed: when Orca
+shows either and no hook's session in that worktree shows the same a minute
+and a half on, Orca's view of that agent is reported, until a hook's session
+shows it or the agent moves on. Codex has a hook for an approval and none
+for any other wait, so a hooked Codex that Orca shows `blocked` or `waiting`
+on anything else is reported from Orca too while it waits. A Codex
 hook does the same for the Codex agents there. A Codex beside a hooked Claude Code, with
 no hooks of its own, is still reported from Orca, and so is every other
 agent Orca runs.

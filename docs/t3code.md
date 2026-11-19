@@ -197,6 +197,15 @@ hook that has gone quiet while T3 Code shows the thread at work or waiting
 on you, and the hook's session is not, loses that after two minutes of each:
 see "The hook wins" in the README.
 
+`T3CODE_THREAD_ID` is a variable, and any program can set one. So the hook
+stands in for a thread only so far as its own session shows what the thread
+is doing. A thread that waits on you or has failed, with no hook's session
+showing the same a minute and a half on, is reported from T3 Code as well,
+until a hook's session shows it or the thread moves on. And where T3 Code
+gives the thread's folder (`worktreePath`, else `workspaceRoot`), the hook
+counts only if its session works in that folder or inside it, or above it
+and inside the environment's `root`.
+
 ## When T3 Code is absent or unhappy
 
 A look that fails writes no event, ends no session and changes nothing about

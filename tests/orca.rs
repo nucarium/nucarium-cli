@@ -721,7 +721,16 @@ fn one_agents_hook_stands_in_for_that_agent_and_not_for_another_kind_beside_it()
     );
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    // Orca shows that Codex blocked on its owner, and its hook has said no
+    // such thing. What the owner needs to hear is not taken back on the
+    // hook's word that it is there.
     let before = rig.spooled().len();
+    let memory = orca.look();
+    assert_eq!(spooled(rig, before), events(&[]));
+    assert!(memory.sessions.contains_key(beside));
+    // Once Orca shows it at work again, the hook's word is enough.
+    row(&mut answer, beside)["state"] = json!("working");
+    orca.answers(&answer);
     orca.look();
     assert_eq!(spooled(rig, before), events(&[(beside, "session_end")]));
     // The Codex in the other worktree, where no hook has spoken, is not
@@ -731,7 +740,7 @@ fn one_agents_hook_stands_in_for_that_agent_and_not_for_another_kind_beside_it()
     assert!(memory.sessions.contains_key(CODEX));
     assert!(!memory.sessions.contains_key(beside));
     assert!(!memory.sessions.contains_key(CLAUDE));
-    orca.assert_only_asked(3);
+    orca.assert_only_asked(4);
 }
 
 /// Everything about a project, its worktrees and its remote that a job

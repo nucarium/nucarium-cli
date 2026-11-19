@@ -790,9 +790,12 @@ impl<'a> Run<'a> {
         };
         let settings = settings
             .map(|settings| {
-                merge::owners(settings, layout.config_dir_var).map_err(|refused| match refused {
-                    merge::Refused::Invalid => Why::InvalidSettings,
-                    merge::Refused::ForbiddenKey => Why::ForbiddenKey,
+                let ours = merge::Ours::on_this_box();
+                merge::owners(&ours, settings, layout.config_dir_var).map_err(|refused| {
+                    match refused {
+                        merge::Refused::Invalid => Why::InvalidSettings,
+                        merge::Refused::ForbiddenKey => Why::ForbiddenKey,
+                    }
                 })
             })
             .transpose()?;
@@ -893,7 +896,7 @@ impl<'a> Run<'a> {
                 destination(config_dir, layout.settings).map_err(|_| Why::UnsafeDestination)?;
             let current = settings_on_disk(&file)?;
             let owner = plan.settings.clone().unwrap_or_else(|| json!({}));
-            let merged = merge::merged(&owner, current.as_ref());
+            let merged = merge::merged(&merge::Ours::on_this_box(), &owner, current.as_ref());
             let differs = current.as_ref() != Some(&merged);
             if differs {
                 changes.push(Change {
@@ -1094,7 +1097,9 @@ impl<'a> Run<'a> {
                     .filter(|_| now.is_some())
                     .and_then(|file| settings_on_disk(&file).ok().flatten());
                 let differs = match (owner, current) {
-                    (Some(owner), Some(current)) => !merge::same_but_for_owned(&owner, &current),
+                    (Some(owner), Some(current)) => {
+                        !merge::same_but_for_owned(&merge::Ours::on_this_box(), &owner, &current)
+                    }
                     _ => true,
                 };
                 if settings.stat != now || settings.modified != differs {

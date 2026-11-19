@@ -65,6 +65,18 @@ const CLAIM_RENEW: Duration = Duration::from_secs(30);
 /// hook's agent has gone without saying so, and whatever is in the driver's
 /// session now has no hook.
 const CLAIM_QUIET: Duration = Duration::from_secs(120);
+/// How long a driver's session may wait on its owner, or stand failed,
+/// before the hook that speaks for it has to be showing the same. A hook is
+/// believed for what its own session shows and for nothing more, so past
+/// this the driver's view is reported, whatever the hook goes on saying. It
+/// is longer than the minute Claude Code leaves a prompt idle before its
+/// hook says so, with the look and the batch that follow it, so a hook that
+/// has a word for what the driver sees has said it by then. One that has
+/// none (Codex waiting on an answer) leaves the session reported from both.
+const CLAIM_UNHEARD: Duration = Duration::from_secs(90);
+/// A claim names at most this many folders: where its hook's session works,
+/// and the folders that one is in.
+const CLAIM_FOLDERS: usize = 64;
 
 /// What a driver's agent is doing, in the daemon's words. An adapter maps
 /// its driver's documented state words to these and says nothing for a word
@@ -430,6 +442,11 @@ pub struct Memory {
     /// quiet doing what the hook's session is not. See [`CLAIM_QUIET`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub doubts: BTreeMap<String, u64>,
+    /// By the driver's id for a session a hook speaks for, when a look first
+    /// saw it wait on its owner or stand failed while no hook's session
+    /// showed the same. See [`CLAIM_UNHEARD`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unheard: BTreeMap<String, u64>,
 }
 
 impl Memory {
@@ -505,6 +522,7 @@ pub fn read_memory(state_dir: &Path, environment: &str) -> Option<Memory> {
         .filter(|reference| valid_session_id(reference));
     memory.facts.retain(|name, _| valid_key(name));
     memory.doubts.retain(|key, _| valid_key(key));
+    memory.unheard.retain(|id, _| valid_session_id(id));
     Some(memory)
 }
 
@@ -514,16 +532,75 @@ fn claims_dir(state_dir: &Path, driver_environment: &str) -> PathBuf {
     state_dir.join("claims").join(driver_environment)
 }
 
+/// A number made from a folder's path, so that a claim can say where its
+/// hook's session works without the folder's name being written anywhere.
+fn folder_number(folder: &Path) -> String {
+    // FNV-1a, written out so the hook and the daemon always agree.
+    let hash = folder
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("{hash:016x}")
+}
+
+fn resolved(folder: &Path) -> PathBuf {
+    folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf())
+}
+
+/// The numbers of the folder a hook's session works in and of every folder
+/// that one is in, its own first.
+fn folder_numbers(folder: &Path) -> Vec<String> {
+    resolved(folder)
+        .ancestors()
+        .take(CLAIM_FOLDERS)
+        .map(folder_number)
+        .collect()
+}
+
+/// Whether a claim was made from where the driver says its session works.
+/// A driver that names no folder is taken at the claim's word. One that
+/// names a folder is agreed with by a hook whose session works in that
+/// folder or inside it, or in a folder above it that is still within the
+/// driver environment's own root: a driver may name the folder of whatever
+/// its agent is running at the moment. A claim that names no folder, or
+/// another, is some other session's.
+fn same_place(environment: &Environment, folder: Option<&Path>, numbers: &[String]) -> bool {
+    let Some(folder) = folder else {
+        return true;
+    };
+    let Some(hooks) = numbers.first() else {
+        return false;
+    };
+    let folder = resolved(folder);
+    if numbers.contains(&folder_number(&folder)) {
+        return true;
+    }
+    let root = resolved(&environment.root);
+    folder
+        .ancestors()
+        .skip(1)
+        .take(CLAIM_FOLDERS)
+        .take_while(|above| above.starts_with(&root))
+        .any(|above| folder_number(above) == *hooks)
+}
+
 /// Note that a hook-reported session is running inside one of a driver's
 /// sessions. Called from the hook entry point: one small file, written when
 /// it is not already there and again once it is [`CLAIM_RENEW`] old. A claim
-/// is only as good as its hook's last word.
+/// is only as good as its hook's last word. `folder` is where the hook's
+/// session works; the claim keeps numbers made from it and never its name.
 pub fn claim(
     state_dir: &Path,
     driver_environment: &str,
     key: &str,
     environment: &str,
     session_id: &str,
+    folder: Option<&Path>,
 ) {
     if !valid_key(key) || !valid_session_id(session_id) {
         return;
@@ -531,15 +608,20 @@ pub fn claim(
     let path = claims_dir(state_dir, driver_environment)
         .join(key)
         .join(format!("{session_id}.json"));
+    let mut note = environment.to_string();
+    if let Some(folder) = folder {
+        note.push('\n');
+        note.push_str(&folder_numbers(folder).join(" "));
+    }
     let renewed = fs::metadata(&path)
         .and_then(|meta| meta.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < CLAIM_RENEW);
-    if renewed && fs::read_to_string(&path).is_ok_and(|held| held == environment) {
+    if renewed && fs::read_to_string(&path).is_ok_and(|held| held == note) {
         return;
     }
-    let _ = paths::write_private(&path, environment.as_bytes());
+    let _ = paths::write_private(&path, note.as_bytes());
 }
 
 /// Ask every configured driver whether a hook's agent is one of its own,
@@ -570,6 +652,7 @@ pub fn note_claims(
                 &key,
                 environment,
                 session_id,
+                cwd,
             );
         }
     }
@@ -584,6 +667,8 @@ struct Claim {
     /// What the hook's session was last doing. Nothing while the daemon has
     /// not yet applied the hook's first event.
     status: Option<Status>,
+    /// Where the hook's session works, as numbers: see [`folder_numbers`].
+    folders: Vec<String>,
 }
 
 /// The claims that live hook-reported sessions hold on a driver's sessions,
@@ -611,12 +696,24 @@ fn claimed(
             let Some(session_id) = file.strip_suffix(".json") else {
                 continue;
             };
-            let session = fs::read_to_string(claim.path())
-                .ok()
-                .and_then(|environment| {
-                    settings.environment(environment.trim())?;
-                    Some(store.load(environment.trim(), session_id))
-                });
+            let note = fs::read_to_string(claim.path()).unwrap_or_default();
+            let mut lines = note.lines();
+            let session = lines.next().and_then(|environment| {
+                settings.environment(environment.trim())?;
+                Some(store.load(environment.trim(), session_id))
+            });
+            // The file is the box's own, and something else may have
+            // written to it: a number is sixteen digits or it is nothing.
+            let folders: Vec<String> = lines
+                .next()
+                .unwrap_or_default()
+                .split(' ')
+                .filter(|number| {
+                    number.len() == 16 && number.bytes().all(|c| c.is_ascii_hexdigit())
+                })
+                .take(CLAIM_FOLDERS)
+                .map(str::to_string)
+                .collect();
             // A claim dated ahead of the clock is from before the clock
             // moved, and is as new as a claim can be.
             let age = fs::metadata(claim.path())
@@ -636,6 +733,7 @@ fn claimed(
                     file: claim.path(),
                     fresh: age.is_none_or(|age| age < CLAIM_QUIET),
                     status,
+                    folders,
                 }),
                 None => {
                     let _ = fs::remove_file(claim.path());
@@ -700,6 +798,17 @@ fn claims_stand(
     false
 }
 
+/// True when a hook's session in `status` shows what a driver sees of a
+/// session in `phase` that its owner needs to hear of: that it waits on
+/// them, or that it failed. Any other phase asks nothing of the hook.
+fn accounts_for(phase: Option<Phase>, status: Option<Status>) -> bool {
+    match phase {
+        Some(phase) if phase.needs_input() => status == Some(Status::NeedsInput),
+        Some(Phase::Failed) => status == Some(Status::Failed),
+        _ => true,
+    }
+}
+
 // ---- from two looks to events ----------------------------------------------
 
 /// The events that take a session from the phase it was remembered in to the
@@ -745,7 +854,11 @@ fn log(line: &str) {
 /// A failed look changes the condition word and nothing else. A session is
 /// reported under the driver's own id for it; a session a live hook has
 /// claimed is not reported, and is ended if it was. A claim does not outlive
-/// its hook's silence for ever: see [`claims_stand`].
+/// its hook's silence for ever: see [`claims_stand`]. It counts only when it
+/// was made from where the driver says the session works: see
+/// [`same_place`]. And it never hides a session that waits on its owner or
+/// has failed unless the hook's own session shows the same: see
+/// [`CLAIM_UNHEARD`].
 pub fn apply(
     settings: &Settings,
     environment: &Environment,
@@ -794,17 +907,24 @@ pub fn apply(
     let mut claimed = claimed(settings, &environment.name, now);
     memory.doubts.retain(|key, _| claimed.contains_key(key));
     let store = Store::new(&settings.state_dir);
-    // True when a hook has reported, and not ended, a session of this id.
-    let hook_reports = |observed: &Observed, id: &str| {
-        valid_session_id(id)
-            && settings.environments.iter().any(|other| {
-                // A driver's own session is not a hook's, whatever its id.
-                (other.name != environment.name || id != observed.id)
-                    && store
-                        .load(&other.name, id)
-                        .is_some_and(|session| session.status != Status::Ended)
-            })
+    // What each session a hook has reported under this id, and not ended,
+    // is doing.
+    let hook_reports = |observed: &Observed, id: &str| -> Vec<Option<Status>> {
+        if !valid_session_id(id) {
+            return Vec::new();
+        }
+        settings
+            .environments
+            .iter()
+            // A driver's own session is not a hook's, whatever its id.
+            .filter(|other| other.name != environment.name || id != observed.id)
+            .filter_map(|other| store.load(&other.name, id))
+            .filter(|session| session.status != Status::Ended)
+            .map(|session| Some(session.status))
+            .collect()
     };
+    let grace = CLAIM_UNHEARD.as_millis() as u64;
+    let mut unheard = BTreeMap::new();
     let beat = ACTIVITY_BEAT.as_millis() as u64;
     let mut written = 0u64;
     let mut seen = BTreeSet::new();
@@ -844,21 +964,48 @@ pub fn apply(
             continue;
         }
         let known = memory.sessions.get(&observed.id).cloned();
-        // The same agent seen twice: the hook wins.
-        let claim_stands = observed.claim_key.as_ref().is_some_and(|key| {
+        // The same agent seen twice: the hook wins. What each hook that
+        // speaks for this session shows its own session doing.
+        let mut speaking: Vec<Option<Status>> = Vec::new();
+        if let Some(key) = &observed.claim_key {
             let stands = claimed.get(key).is_some_and(|held| {
                 claims_stand(&mut memory.doubts, key, held, observed.phase, now_ms)
             });
             if !stands {
                 claimed.remove(key);
             }
-            stands
-        });
-        let hooked = claim_stands
-            || observed
-                .agent_session_id
-                .as_deref()
-                .is_some_and(|id| hook_reports(observed, id));
+            // A claim made from somewhere else is another session's.
+            speaking.extend(
+                claimed
+                    .get(key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|claim| {
+                        same_place(environment, observed.cwd.as_deref(), &claim.folders)
+                    })
+                    .map(|claim| claim.status),
+            );
+        }
+        if let Some(id) = observed.agent_session_id.as_deref() {
+            speaking.extend(hook_reports(observed, id));
+        }
+        let mut hooked = !speaking.is_empty();
+        if hooked
+            && !speaking
+                .iter()
+                .any(|status| accounts_for(observed.phase, *status))
+        {
+            // The owner needs to hear of this, and no hook is saying it. A
+            // hook about to say it is waited for, a short while, when the
+            // driver's own report is not already out. After that, or when it
+            // is, the driver's view is the one reported.
+            let since = memory.unheard.get(&observed.id).copied().unwrap_or(now_ms);
+            unheard.insert(observed.id.clone(), since);
+            if known.is_none() && now_ms.saturating_sub(since) < grace {
+                continue;
+            }
+            hooked = false;
+        }
         if hooked {
             if let Some(known) = known {
                 // Only a session that was reported has an end to report.
@@ -979,6 +1126,7 @@ pub fn apply(
             }
         }
     }
+    memory.unheard = unheard;
     memory.baseline = true;
     written as usize
 }
@@ -1577,6 +1725,7 @@ mod tests {
             "thread-7",
             "client-a",
             "hook-session",
+            None,
         );
         let now = SystemTime::now();
         let hooked = looked(
@@ -1753,7 +1902,7 @@ mod tests {
         // An agent with hooks ran in the driver's session, mid-turn, and was
         // killed: no `SessionEnd` hook ran, and its session never ended.
         hook_session(&settings, "killed", &[EventType::UserPromptSubmit], now);
-        claim(&settings.state_dir, "t3", "t7", "client-a", "killed");
+        claim(&settings.state_dir, "t3", "t7", "client-a", "killed", None);
         hook_last_spoke(&settings, "t7", "killed", now - Duration::from_secs(3_600));
 
         // The session at rest contradicts nothing, however long it rests.
@@ -1798,7 +1947,7 @@ mod tests {
 
         // Had the hook's agent been alive after all, its next word claims
         // the session again, and the hook wins again.
-        claim(&settings.state_dir, "t3", "t7", "client-a", "killed");
+        claim(&settings.state_dir, "t3", "t7", "client-a", "killed", None);
         let again = looked(
             &settings,
             &mut memory,
@@ -1828,7 +1977,7 @@ mod tests {
             &[EventType::UserPromptSubmit, EventType::PermissionPrompt],
             now,
         );
-        claim(&settings.state_dir, "t3", "t7", "client-a", "waiting");
+        claim(&settings.state_dir, "t3", "t7", "client-a", "waiting", None);
         hook_last_spoke(&settings, "t7", "waiting", now - Duration::from_secs(3_600));
         // Hook and driver say the same, and the hook's word stands.
         assert_eq!(look(Phase::NeedsPermission, 0), events(&[]));
@@ -1858,13 +2007,216 @@ mod tests {
                 .duration_since(fs::metadata(&file).unwrap().modified().unwrap())
                 .unwrap_or_default()
         };
-        claim(&settings.state_dir, "t3", "t7", "client-a", "s1");
+        claim(&settings.state_dir, "t3", "t7", "client-a", "s1", None);
         hook_last_spoke(&settings, "t7", "s1", SystemTime::now() - CLAIM_QUIET * 3);
         assert!(age() >= CLAIM_QUIET);
         // The next hook event of the same session, from the same place.
-        claim(&settings.state_dir, "t3", "t7", "client-a", "s1");
+        claim(&settings.state_dir, "t3", "t7", "client-a", "s1", None);
         assert!(age() < CLAIM_RENEW);
         assert_eq!(fs::read_to_string(&file).unwrap(), "client-a");
+    }
+
+    #[test]
+    fn a_claim_does_not_hide_a_session_that_waits_or_fails_unless_its_hook_shows_the_same() {
+        let (_dir, settings) = rig();
+        let mut memory = Memory::new("t3code");
+        let now = SystemTime::now();
+        let later = |seconds: u64| now + Duration::from_secs(seconds);
+        // Something ran `nucleated hook` with the driver's variables: a
+        // session that only ever started, and a claim it goes on renewing.
+        hook_session(&settings, "decoy", &[EventType::SessionStart], now);
+        claim(&settings.state_dir, "t3", "t7", "client-a", "decoy", None);
+        let look = |memory: &mut Memory, phase: Phase, at: u64| {
+            hook_last_spoke(&settings, "t7", "decoy", later(at));
+            let slot = Observed {
+                claim_key: Some("t7".into()),
+                ..seen("t7-slot", phase)
+            };
+            looked(&settings, memory, list(vec![slot]), later(at))
+        };
+        // At work or at rest, the hook speaks for the session.
+        assert_eq!(look(&mut memory, Phase::Working, 0), events(&[]));
+        // It waits on its owner. A hook about to say so is waited for...
+        assert_eq!(look(&mut memory, Phase::NeedsPermission, 15), events(&[]));
+        assert_eq!(look(&mut memory, Phase::NeedsPermission, 60), events(&[]));
+        // ...and when none has, the owner hears it from the driver, however
+        // lately the hook has spoken of other things.
+        assert_eq!(
+            look(
+                &mut memory,
+                Phase::NeedsPermission,
+                15 + CLAIM_UNHEARD.as_secs()
+            ),
+            events(&[
+                ("t7-slot", "session_start"),
+                ("t7-slot", "permission_prompt")
+            ])
+        );
+        // The claim has not lapsed, and still does not take the report back.
+        assert_eq!(look(&mut memory, Phase::NeedsPermission, 200), events(&[]));
+        assert!(memory.sessions.contains_key("t7-slot"));
+        assert_eq!(files_under(&claims_dir(&settings.state_dir, "t3")).len(), 1);
+        // A failure the hook does not show is reported as it happens.
+        assert_eq!(
+            look(&mut memory, Phase::Failed, 215),
+            events(&[("t7-slot", "stop_failure")])
+        );
+        // Once the hook's own session shows the failure, the owner has it
+        // from the hook, and the driver stands aside again.
+        hook_session(
+            &settings,
+            "decoy",
+            &[EventType::SessionStart, EventType::StopFailure],
+            now,
+        );
+        assert_eq!(
+            look(&mut memory, Phase::Failed, 230),
+            events(&[("t7-slot", "session_end")])
+        );
+        assert_eq!(look(&mut memory, Phase::Working, 245), events(&[]));
+        assert!(memory.unheard.is_empty());
+    }
+
+    #[test]
+    fn a_session_already_reported_as_waiting_is_not_ended_by_a_claim_that_says_nothing_of_it() {
+        let (_dir, settings) = rig();
+        let mut memory = Memory::new("t3code");
+        let now = SystemTime::now();
+        let slot = || Observed {
+            claim_key: Some("t7".into()),
+            ..seen("t7-slot", Phase::NeedsInput)
+        };
+        let first = looked(&settings, &mut memory, list(vec![slot()]), now);
+        assert_eq!(
+            first,
+            events(&[("t7-slot", "session_start"), ("t7-slot", "input_prompt")])
+        );
+        hook_session(&settings, "decoy", &[EventType::SessionStart], now);
+        claim(&settings.state_dir, "t3", "t7", "client-a", "decoy", None);
+        for seconds in [15, 300] {
+            let after = looked(
+                &settings,
+                &mut memory,
+                list(vec![slot()]),
+                now + Duration::from_secs(seconds),
+            );
+            assert_eq!(after, events(&[]));
+            assert!(memory.sessions.contains_key("t7-slot"));
+        }
+    }
+
+    #[test]
+    fn an_agents_own_session_id_does_not_hide_a_wait_its_hook_never_showed() {
+        let (_dir, settings) = rig();
+        let mut memory = Memory::new("t3code");
+        let pane = |phase: Phase| Observed {
+            agent_session_id: Some("agent-session-1".into()),
+            ..seen("pane-3", phase)
+        };
+        // A hook reports a session of that very id, at work.
+        hook_session(
+            &settings,
+            "agent-session-1",
+            &[EventType::UserPromptSubmit],
+            at(0),
+        );
+        let mut look = |phase: Phase, seconds: u64| {
+            looked(&settings, &mut memory, list(vec![pane(phase)]), at(seconds))
+        };
+        assert_eq!(look(Phase::Working, 0), events(&[]));
+        assert_eq!(look(Phase::NeedsElicitation, 15), events(&[]));
+        assert_eq!(
+            look(Phase::NeedsElicitation, 15 + CLAIM_UNHEARD.as_secs()),
+            events(&[
+                ("pane-3", "session_start"),
+                ("pane-3", "elicitation_prompt")
+            ])
+        );
+        // The owner answers, and the hook's word is enough again.
+        assert_eq!(
+            look(Phase::Working, 200),
+            events(&[("pane-3", "session_end")])
+        );
+    }
+
+    #[test]
+    fn a_claim_speaks_only_for_a_session_the_driver_places_where_its_hook_works() {
+        let (dir, settings) = rig();
+        let mut memory = Memory::new("t3code");
+        let now = SystemTime::now();
+        let work = dir.path().join("work");
+        let here = work.join("SENTINEL named for a task");
+        let inside = here.join("src");
+        let elsewhere = work.join("another");
+        for folder in [&inside, &elsewhere] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        hook_session(
+            &settings,
+            "hook-session",
+            &[EventType::UserPromptSubmit],
+            now,
+        );
+        let from = |folder: Option<&Path>| {
+            claim(
+                &settings.state_dir,
+                "t3",
+                "thread-7",
+                "client-a",
+                "hook-session",
+                folder,
+            );
+        };
+        let placed = Observed {
+            claim_key: Some("thread-7".into()),
+            cwd: Some(here.clone()),
+            ..seen("thread-7", Phase::Working)
+        };
+        let mut look =
+            |observed: &Observed| looked(&settings, &mut memory, list(vec![observed.clone()]), now);
+        let reported = events(&[
+            ("thread-7", "session_start"),
+            ("thread-7", "user_prompt_submit"),
+        ]);
+        // A hook run with the thread's variable from some other folder is
+        // not the thread's agent, and neither is one that names no folder.
+        from(Some(&elsewhere));
+        assert_eq!(look(&placed), reported);
+        from(None);
+        assert_eq!(look(&placed), events(&[]));
+        // The agent's own hook, from a folder inside the thread's, is.
+        note_claims(
+            &settings,
+            "client-a",
+            "claude-code",
+            "hook-session",
+            Some(&inside),
+            &|_| Some("thread-7".to_string()),
+        );
+        assert_eq!(look(&placed), events(&[("thread-7", "session_end")]));
+        // So is one from above it that is still inside the driver's root:
+        // a driver may place a session by what its agent is running.
+        from(Some(&work));
+        assert_eq!(look(&placed), events(&[]));
+        // From above the root, it could be anything on the box.
+        from(Some(dir.path()));
+        assert_eq!(look(&placed), reported);
+        // A driver that does not say where a session works is taken at the
+        // claim's word.
+        let unplaced = Observed {
+            cwd: None,
+            ..placed.clone()
+        };
+        assert_eq!(look(&unplaced), events(&[("thread-7", "session_end")]));
+
+        // Where the hook works is kept as numbers, never as a name.
+        from(Some(&inside));
+        let claims = files_under(&claims_dir(&settings.state_dir, "t3"));
+        assert_eq!(claims.len(), 1);
+        let kept = fs::read_to_string(&claims[0]).unwrap();
+        assert!(!kept.contains("SENTINEL"), "{kept}");
+        assert!(!kept.contains('/'), "{kept}");
+        assert!(!claims[0].to_string_lossy().contains("SENTINEL"));
     }
 
     fn draft_like(draft: &Draft) -> Draft {
@@ -1891,17 +2243,17 @@ mod tests {
     fn a_claim_is_a_key_and_two_ids_and_nothing_that_could_be_a_path() {
         let (_dir, settings) = rig();
         let state = &settings.state_dir;
-        claim(state, "t3", "..", "client-a", "s1");
-        claim(state, "t3", "a/b", "client-a", "s1");
-        claim(state, "t3", "a sentence, not a key", "client-a", "s1");
-        claim(state, "t3", "t7", "client-a", "../../escape");
+        claim(state, "t3", "..", "client-a", "s1", None);
+        claim(state, "t3", "a/b", "client-a", "s1", None);
+        claim(state, "t3", "a sentence, not a key", "client-a", "s1", None);
+        claim(state, "t3", "t7", "client-a", "../../escape", None);
         assert!(files_under(state).is_empty());
-        claim(state, "t3", "t7", "client-a", "s1");
-        claim(state, "t3", "t7", "client-a", "s1");
+        claim(state, "t3", "t7", "client-a", "s1", None);
+        claim(state, "t3", "t7", "client-a", "s1", None);
         assert_eq!(files_under(state).len(), 1);
         // A claim for an environment the config does not have stands for
         // nothing, and is cleared away.
-        claim(state, "t3", "t8", "gone", "s2");
+        claim(state, "t3", "t8", "gone", "s2", None);
         let held = claimed(&settings, "t3", SystemTime::now());
         assert_eq!(held.into_keys().collect::<Vec<_>>(), ["t7"]);
         assert_eq!(files_under(state).len(), 1);

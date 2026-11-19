@@ -75,13 +75,44 @@ write is never removed.
 
 ## Your settings, under the entries `nucleate` and `nucleated` own
 
-The settings file is merged, never copied. Owned means a hook handler of
-type `command` whose program is `nucleated` and whose first argument is
-`hook`, or whose program is `nucleate` and whose first argument is
-`hook-create` or `hook-remove`. The program may have a folder in front.
+The settings file is merged, never copied. Owned means a hook handler that
+is, whole, one of the forms `nucleated` and `nucleate` themselves write, and
+nothing that only starts like one:
 
-1. Anything in your settings that looks owned is taken out. The repository
-   can neither forge an owned entry nor replace one.
+- **The command** is exactly what an agent's adapter prints for the event
+  the handler is registered under (`nucleated hooks print`, with or without
+  `--agent` and `--env`): `nucleated hook <event>`, then `--agent <name>`
+  for an agent other than Claude Code, then `--env <name>` if there is one,
+  in that order, one space between words. Or it is `nucleate hook-create`,
+  with or without repo names after it, under `WorktreeCreate`, or `nucleate
+  hook-remove` under `WorktreeRemove`. A name is letters, digits, `.`, `_`,
+  `-` and `/`. Nothing may follow: no `;`, `&&`, `|`, redirection, `$(...)`,
+  quotes, or further argument.
+- **The program** is the bare name, or `$HOME/.local/bin/<name>` written
+  that way letter for letter, as the box recipe writes it, or that path
+  written out under the home of the user the daemon runs as
+  (`/home/agent/.local/bin/nucleated`). `.local/bin` under that home is where
+  the recipe installs both programs and where the daemon's own unit runs
+  from. A program anywhere else is not owned, whatever it is called, and
+  neither is the path in quotes, with `~`, or with `${HOME}`. If your
+  binaries are somewhere else on the `PATH`, register the bare name.
+- **The handler** has `type` `command`, the command, and at most a
+  `timeout` that is a whole number and an `async` that is true or false. Any
+  other key makes it not owned. Its matcher group has the handlers and at
+  most a `matcher` that is a string.
+
+A handler on the box that does not fit is not kept by a sync, and it makes
+the file read as changed by hand (see below). That holds for one that fits
+in every way but one: `nucleated hook Stop; ...`, `/tmp/x/nucleated hook
+Stop`, an owned command under another event, an owned command with a
+`shell` key beside it. If you registered `nucleated`'s hooks by hand in
+another form, register them again as `nucleated hooks print` prints them
+before your next sync, or the sync will take them out.
+
+1. Anything in your settings that is owned by that rule is taken out. The
+   repository can neither forge an owned entry nor replace one. A handler
+   in your settings that only resembles one is yours, and is written as
+   yours.
 2. The owned handlers of the file on the box are kept: per event, each
    matcher group cut down to its owned handlers.
 3. The result is your settings with, for each event, your groups first and
@@ -176,8 +207,10 @@ Each pass (every 30 seconds) looks at each file the sync wrote, once, and
 reads one only when its size, time or mode has moved. `settings.json` is
 compared by meaning: it counts as changed only if your own settings in it
 differ from the commit's. Reformatting it, or registering `nucleated`'s
-hooks again, is not a change. Claude Code's own `/config` and `/plugin`
-write this file, and that does count: keep those keys in the repository.
+hooks again in a form above, is not a change. Any other handler is one,
+however much it looks like `nucleated`'s: only the exact forms are set
+aside. Claude Code's own `/config` and `/plugin` write this file, and that
+does count: keep those keys in the repository.
 
 A file added by hand beside the synced ones is not noticed. The flag clears
 when the files match again or a commit is applied.
