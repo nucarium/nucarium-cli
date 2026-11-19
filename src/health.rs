@@ -1,16 +1,24 @@
 //! Machine health for the heartbeat, and whether an agent server is alive.
 //!
-//! Four numbers about the box and one yes-or-no per environment. Nothing here
-//! reads a session or a file inside a nucleus.
+//! Four numbers and two yes-or-noes about the box, and a yes-or-no and a
+//! count per environment. Nothing here reads a session or a file inside a
+//! nucleus, and nothing here changes anything: every probe only asks.
 
 use crate::settings::Environment;
 use crate::watch::MachineHealth;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// No probe prints more than a word or a number. More than this is not an answer.
+const PROBE_OUTPUT: u64 = 4_096;
+/// Where Debian and Ubuntu say a reboot is needed, and the file that tells
+/// such a system from one with another convention.
+const REBOOT_FLAG: &str = "/var/run/reboot-required";
+const DEBIAN_FAMILY: &str = "/etc/debian_version";
 
 fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
@@ -96,9 +104,35 @@ fn parse_pressure(text: &str) -> Option<f64> {
         .map(|pct| pct.clamp(0.0, 100.0))
 }
 
+/// Whether the operating system says it needs a reboot. Debian and Ubuntu
+/// say so with a file; on a system of another family its absence would mean
+/// nothing, so there the answer is not known.
+fn reboot_required_at(flag: &Path, family: &Path) -> Option<bool> {
+    family.exists().then(|| flag.exists())
+}
+
+/// True when a UPS status as NUT reports it, such as `OB DISCHRG`, holds the
+/// token for "on battery". Nothing for a status with no tokens at all.
+fn status_on_battery(status: &str) -> Option<bool> {
+    let mut tokens = status.split_whitespace().peekable();
+    tokens.peek()?;
+    Some(tokens.any(|token| token == "OB"))
+}
+
+/// Whether the box runs from its UPS battery, asked of NUT. Nothing on a box
+/// with no UPS configured, and when NUT gives no answer.
+pub fn on_battery(ups: Option<&str>) -> Option<bool> {
+    let status = output(
+        Command::new("upsc").args([ups?, "ups.status"]),
+        PROBE_TIMEOUT,
+    )?;
+    status_on_battery(&status)
+}
+
 /// Sample the machine. Disk is the fullest filesystem among `/` and the
-/// environments' nuclei, since a full nucleus is what stops agents.
-pub fn sample(environments: &[Environment]) -> MachineHealth {
+/// environments' nuclei, since a full nucleus is what stops agents. `ups` is
+/// the UPS to ask about its battery, on a box that has one.
+pub fn sample(environments: &[Environment], ups: Option<&str>) -> MachineHealth {
     let disk = std::iter::once(Path::new("/"))
         .chain(environments.iter().map(|env| env.root.as_path()))
         .filter_map(disk_used_pct)
@@ -108,32 +142,57 @@ pub fn sample(environments: &[Environment]) -> MachineHealth {
         load_1m: (load_1m().unwrap_or(0.0).clamp(0.0, 100_000.0) * 100.0).round() / 100.0,
         uptime_s: uptime_s().unwrap_or(0),
         memory_pressure_pct: memory_pressure_pct().map(round1),
+        on_battery: on_battery(ups),
+        reboot_required: reboot_required_at(Path::new(REBOOT_FLAG), Path::new(DEBIAN_FAMILY)),
+        ..MachineHealth::default()
     }
 }
 
-/// Run a command quietly and say whether it succeeded. A command that takes
-/// longer than the timeout is stopped and counts as a failure.
-fn succeeds(command: &mut Command, timeout: Duration) -> bool {
-    let Ok(mut child) = command
+/// Run a command quietly and wait for it, at most `timeout`. A command that
+/// takes longer is stopped and counts as a failure.
+fn finishes(
+    command: &mut Command,
+    stdout: Stdio,
+    timeout: Duration,
+) -> Option<std::process::Child> {
+    let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(stdout)
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return false;
-    };
+        .ok()?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return status.success().then_some(child),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
+}
+
+/// Run a command quietly and say whether it succeeded.
+fn succeeds(command: &mut Command, timeout: Duration) -> bool {
+    finishes(command, Stdio::null(), timeout).is_some()
+}
+
+/// Run a command quietly and return the little it printed, or nothing when it
+/// failed or took too long. A command that prints more than a pipe holds
+/// never finishes, and so counts as one that took too long.
+fn output(command: &mut Command, timeout: Duration) -> Option<String> {
+    let mut child = finishes(command, Stdio::piped(), timeout)?;
+    let mut text = String::new();
+    child
+        .stdout
+        .take()?
+        .take(PROBE_OUTPUT)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 /// Whether an environment's agent server is alive: its `check` command exits
@@ -147,6 +206,31 @@ pub fn server_alive(environment: &Environment) -> bool {
             PROBE_TIMEOUT,
         ),
     }
+}
+
+fn parse_restarts(text: &str) -> Option<u64> {
+    text.trim().parse().ok()
+}
+
+/// How often systemd has restarted an environment's agent server: the unit's
+/// own running count. Nothing for an environment watched by a `check`
+/// command, which has no supervisor this program can ask, and nothing when
+/// systemd gives no answer.
+pub fn server_restarts(environment: &Environment) -> Option<u64> {
+    if environment.check.is_some() {
+        return None;
+    }
+    let count = output(
+        Command::new("systemctl").args([
+            "--user",
+            "show",
+            "--property=NRestarts",
+            "--value",
+            &environment.unit,
+        ]),
+        PROBE_TIMEOUT,
+    )?;
+    parse_restarts(&count)
 }
 
 #[cfg(test)]
@@ -169,7 +253,8 @@ mod tests {
 
     #[test]
     fn health_is_within_the_ranges_watch_accepts() {
-        let health = sample(&[environment(None)]);
+        let health = sample(&[environment(None)], None);
+        assert_eq!(health.on_battery, None);
         assert!((0.0..=100.0).contains(&health.disk_used_pct));
         assert!(health.disk_used_pct > 0.0);
         assert!((0.0..=100_000.0).contains(&health.load_1m));
@@ -192,6 +277,73 @@ mod tests {
         assert!(server_alive(&environment(Some("true"))));
         assert!(!server_alive(&environment(Some("false"))));
         assert!(!server_alive(&environment(Some("exit 3"))));
+    }
+
+    #[test]
+    fn a_probe_returns_what_the_command_printed_or_nothing() {
+        let run = |script: &str| {
+            output(
+                Command::new("sh").args(["-c", script]),
+                Duration::from_secs(5),
+            )
+        };
+        assert_eq!(run("echo 4").as_deref(), Some("4\n"));
+        assert_eq!(run("echo 4; exit 3"), None);
+        assert_eq!(run("echo words >&2").as_deref(), Some(""));
+        assert_eq!(
+            output(
+                &mut Command::new("no-such-probe-command"),
+                Duration::from_secs(5)
+            ),
+            None
+        );
+        let started = Instant::now();
+        assert_eq!(
+            output(
+                Command::new("sh").args(["-c", "echo 4; sleep 30"]),
+                Duration::from_millis(200)
+            ),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_restart_count_is_a_number_and_nothing_else() {
+        assert_eq!(parse_restarts("4\n"), Some(4));
+        assert_eq!(parse_restarts("0"), Some(0));
+        assert_eq!(parse_restarts(""), None);
+        assert_eq!(parse_restarts("-1"), None);
+        assert_eq!(parse_restarts("Unit not found"), None);
+        // An environment watched by a command has no supervisor to ask.
+        assert_eq!(server_restarts(&environment(Some("true"))), None);
+    }
+
+    #[test]
+    fn the_ups_is_on_battery_when_its_status_says_ob() {
+        assert_eq!(status_on_battery("OL\n"), Some(false));
+        assert_eq!(status_on_battery("OL CHRG"), Some(false));
+        assert_eq!(status_on_battery("OB DISCHRG\n"), Some(true));
+        assert_eq!(status_on_battery("LB OB"), Some(true));
+        // A token that only contains the letters is not the token.
+        assert_eq!(status_on_battery("OBSERVING"), Some(false));
+        assert_eq!(status_on_battery(""), None);
+        assert_eq!(status_on_battery("\n"), None);
+        assert_eq!(on_battery(None), None);
+    }
+
+    #[test]
+    fn a_reboot_is_required_where_the_system_says_so_and_unknown_where_it_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flag, family) = (
+            dir.path().join("reboot-required"),
+            dir.path().join("family"),
+        );
+        assert_eq!(reboot_required_at(&flag, &family), None);
+        std::fs::write(&family, "13.1\n").unwrap();
+        assert_eq!(reboot_required_at(&flag, &family), Some(false));
+        std::fs::write(&flag, "").unwrap();
+        assert_eq!(reboot_required_at(&flag, &family), Some(true));
     }
 
     #[test]

@@ -43,6 +43,16 @@ pub struct Housekeeping {
     pub cleanup_min_age: Duration,
 }
 
+/// Where the box speaks for itself while it cannot reach Watch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notify {
+    /// The owner's own webhook, shaped as ntfy takes one.
+    pub url: String,
+    pub token_file: Option<PathBuf>,
+    /// How long Watch must have been unreachable before the box says so.
+    pub after: Duration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// The file these came from, whether or not it exists.
@@ -60,6 +70,13 @@ pub struct Settings {
     pub spool_dir: PathBuf,
     pub spool_max_age: Duration,
     pub spool_max_events: usize,
+    /// The UPS as NUT names it, such as `ups@localhost`. `None` on a box
+    /// with no UPS.
+    pub ups: Option<String>,
+    /// How often unsaved work is counted. `None` is "off".
+    pub report_unsaved: Option<Duration>,
+    /// `None` is off, which is the default.
+    pub notify: Option<Notify>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -77,6 +94,29 @@ struct File {
     housekeeping: HousekeepingFile,
     #[serde(default)]
     spool: SpoolFile,
+    #[serde(default)]
+    ups: UpsFile,
+    #[serde(default)]
+    report: ReportFile,
+    #[serde(default)]
+    notify: NotifyFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UpsFile {
+    name: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReportFile {
+    unsaved: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NotifyFile {
+    url: Option<String>,
+    token_file: Option<PathBuf>,
+    after: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -240,6 +280,45 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
     if heartbeat_interval < Duration::from_secs(10) {
         bail!("heartbeat.interval is under ten seconds");
     }
+    let ups = file
+        .ups
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    // The name is handed to `upsc` as one argument. It must not read as an option.
+    if let Some(name) = ups.as_deref() {
+        let plain = name.len() <= 255
+            && !name.starts_with('-')
+            && name.bytes().all(|c| c.is_ascii_graphic());
+        if !plain {
+            bail!("ups.name is {name:?}; it takes a NUT name such as \"ups@localhost\"");
+        }
+    }
+    let report_unsaved = match file.report.unsaved.as_deref() {
+        None => Some(Duration::from_secs(600)),
+        Some("off") => None,
+        Some(text) => {
+            let every = parse_duration(text).context("report.unsaved")?;
+            if every < Duration::from_secs(60) {
+                bail!("report.unsaved is under a minute; it takes \"1m\" or longer, or \"off\"");
+            }
+            Some(every)
+        }
+    };
+    let notify = match file.notify.url.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(url) => {
+            let after = duration("notify.after", file.notify.after.as_ref(), 600)?;
+            if after < Duration::from_secs(120) {
+                bail!("notify.after is under two minutes");
+            }
+            Some(Notify {
+                url: crate::watch::normalize_webhook_url(url).context("notify.url")?,
+                token_file: file.notify.token_file,
+                after,
+            })
+        }
+    };
     Ok(Settings {
         path: path.to_path_buf(),
         exists,
@@ -278,6 +357,9 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
         spool_max_age: duration("spool.max_age", file.spool.max_age.as_ref(), 604_800)?,
         spool_max_events: file.spool.max_events.unwrap_or(10_000).max(1),
         state_dir,
+        ups,
+        report_unsaved,
+        notify,
     })
 }
 
@@ -376,6 +458,54 @@ mod tests {
         assert_eq!(settings.environments[1].unit, "ops.service");
         assert_eq!(settings.environments[1].check.as_deref(), Some("true"));
         assert_eq!(settings.housekeeping.cleanup, None);
+    }
+
+    #[test]
+    fn the_ups_the_report_and_the_notifier_are_off_or_default_until_set() {
+        let settings = parse("").unwrap();
+        assert_eq!(settings.ups, None);
+        assert_eq!(settings.report_unsaved, Some(Duration::from_secs(600)));
+        assert_eq!(settings.notify, None);
+
+        let settings = parse(
+            "[ups]\nname = \"ups@localhost\"\n[report]\nunsaved = \"1m\"\n\
+             [notify]\nurl = \"https://ntfy.sh/your-private-topic\"\ntoken_file = \"/run/t\"\n",
+        )
+        .unwrap();
+        assert_eq!(settings.ups.as_deref(), Some("ups@localhost"));
+        assert_eq!(settings.report_unsaved, Some(Duration::from_secs(60)));
+        assert_eq!(
+            settings.notify,
+            Some(Notify {
+                url: "https://ntfy.sh/your-private-topic".into(),
+                token_file: Some(PathBuf::from("/run/t")),
+                after: Duration::from_secs(600),
+            })
+        );
+        assert_eq!(
+            parse("[report]\nunsaved = \"off\"\n")
+                .unwrap()
+                .report_unsaved,
+            None
+        );
+        // An address left empty is a notifier left off.
+        assert_eq!(parse("[notify]\nurl = \"\"\n").unwrap().notify, None);
+    }
+
+    #[test]
+    fn settings_that_would_cost_too_much_or_leak_are_refused() {
+        assert!(parse("[report]\nunsaved = \"30s\"\n").is_err());
+        assert!(parse("[report]\nunsaved = \"sometimes\"\n").is_err());
+        assert!(parse("[ups]\nname = \"--help\"\n").is_err());
+        assert!(parse("[ups]\nname = \"ups one\"\n").is_err());
+        let notify = |rest: &str| parse(&format!("[notify]\n{rest}\n"));
+        assert!(notify("url = \"http://ntfy.example.test/topic\"").is_err());
+        assert!(notify("url = \"https://user:pass@ntfy.example.test/topic\"").is_err());
+        assert!(notify("url = \"ntfy.sh/topic\"").is_err());
+        assert!(notify("url = \"https://ntfy.sh/topic\"\nafter = \"1m\"").is_err());
+        assert!(
+            notify("url = \"http://127.0.0.1:8080/topic?priority=high\"\nafter = \"2m\"").is_ok()
+        );
     }
 
     #[test]

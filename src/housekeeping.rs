@@ -67,7 +67,7 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 }
 
 /// The names of the environments whose nucleus is this one's, itself included.
-fn sharing_nucleus(settings: &Settings, environment: &Environment) -> Vec<String> {
+pub(crate) fn sharing_nucleus(settings: &Settings, environment: &Environment) -> Vec<String> {
     settings
         .environments
         .iter()
@@ -78,7 +78,7 @@ fn sharing_nucleus(settings: &Settings, environment: &Environment) -> Vec<String
 
 /// One environment per nucleus: where two logins share a nucleus, a job over
 /// it runs once, under the first of them.
-fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
+pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
     let mut chosen: Vec<&Environment> = Vec::new();
     for environment in &settings.environments {
         if !chosen
@@ -91,7 +91,7 @@ fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
     chosen
 }
 
-fn workspace(environment: &Environment) -> Workspace {
+pub(crate) fn workspace(environment: &Environment) -> Workspace {
     Workspace::new(config::for_root(
         &environment.root,
         environment.github_token_file.clone(),
@@ -461,6 +461,12 @@ pub struct LastRun {
     pub ok: bool,
     /// A count of what the job did, or the error that stopped it.
     pub summary: String,
+    /// When the job last finished with nothing failed: no error, and no repo
+    /// or worktree it could not deal with. Carried over a run that was not.
+    #[serde(default)]
+    pub good_at: Option<String>,
+    #[serde(default)]
+    pub good_at_s: Option<u64>,
 }
 
 /// When each job last ran for each environment, keyed `<environment>/<job>`.
@@ -502,6 +508,18 @@ fn summarize(report: &Value) -> String {
         .join(", ")
 }
 
+/// True when a job's report holds nothing it failed at.
+fn nothing_failed(report: &Value) -> bool {
+    ["repos", "sessions", "worktrees"]
+        .iter()
+        .filter_map(|name| report[name].as_array())
+        .flatten()
+        .all(|item| match item["action"].as_str() {
+            Some(action) => action != "failed",
+            None => item["ok"] == true,
+        })
+}
+
 /// Run every job that is due, once.
 pub fn run_due(settings: &Settings, now: SystemTime) -> Result<()> {
     let now_s = unix_ms(now) / 1000;
@@ -523,6 +541,15 @@ pub fn run_due(settings: &Settings, now: SystemTime) -> Result<()> {
                 Ok(report) => (true, summarize(report)),
                 Err(error) => (false, format!("{error:#}")),
             };
+            let good = outcome.as_ref().is_ok_and(nothing_failed);
+            let before = ledger.get(&key);
+            let (good_at, good_at_s) = match good {
+                true => (Some(rfc3339(now)), Some(now_s)),
+                false => (
+                    before.and_then(|last| last.good_at.clone()),
+                    before.and_then(|last| last.good_at_s),
+                ),
+            };
             eprintln!(
                 "nucleated: {} for {}: {summary}",
                 job.name(),
@@ -535,6 +562,8 @@ pub fn run_due(settings: &Settings, now: SystemTime) -> Result<()> {
                     at_s: now_s,
                     ok,
                     summary,
+                    good_at,
+                    good_at_s,
                 },
             );
             // Written after every job, so a stop in the middle loses nothing.
@@ -545,7 +574,7 @@ pub fn run_due(settings: &Settings, now: SystemTime) -> Result<()> {
     Ok(())
 }
 
-fn wait(stop: &AtomicBool, duration: Duration) -> bool {
+pub(crate) fn wait(stop: &AtomicBool, duration: Duration) -> bool {
     let mut left = duration;
     while !left.is_zero() && !stop.load(Ordering::SeqCst) {
         let step = left.min(Duration::from_millis(250));
@@ -632,5 +661,20 @@ mod tests {
             "1 failed, 1 fetched"
         );
         assert_eq!(summarize(&json!({ "worktrees": [] })), "no worktrees");
+    }
+
+    #[test]
+    fn a_run_is_good_when_nothing_in_it_failed() {
+        assert!(nothing_failed(&json!({ "worktrees": [] })));
+        assert!(nothing_failed(&json!({ "worktrees": [
+            { "action": "snapshot" }, { "action": "skipped" },
+        ] })));
+        assert!(!nothing_failed(&json!({ "worktrees": [
+            { "action": "snapshot" }, { "action": "failed" },
+        ] })));
+        assert!(nothing_failed(&json!({ "repos": [{ "ok": true }] })));
+        assert!(!nothing_failed(
+            &json!({ "repos": [{ "ok": true }, { "ok": false }] })
+        ));
     }
 }

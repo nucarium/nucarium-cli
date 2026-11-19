@@ -4,9 +4,11 @@
 
 mod common;
 
-use common::{dead_api, mode, Mock, Reply, Request, Rig, TOKEN};
+use common::{contract, dead_api, mode, Mock, Reply, Request, Rig, TOKEN};
 use nucleate::daemon::{Daemon, Timings};
+use nucleate::envelope::{unix_ms, Draft, Envelope, EventType};
 use nucleate::hook;
+use nucleate::spool::{Record, Spool};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -27,6 +29,10 @@ fn api() -> (Mock, Arc<Knobs>) {
     knobs.heartbeat_interval.store(60, Ordering::SeqCst);
     let seen = knobs.clone();
     let mock = Mock::start(move |request: &Request| {
+        // As Watch does, refuse anything the contract does not allow.
+        if let Some(refused) = contract::refusal(request) {
+            return refused;
+        }
         let delay = Duration::from_millis(seen.delay_ms.load(Ordering::SeqCst));
         let problem = |status: u16| match status {
             401 => Reply::problem(401, "unauthorized"),
@@ -98,11 +104,16 @@ fn daemon(rig: &Rig) -> Daemon {
 /// Record a hook event as the entry point would, each a millisecond after the last.
 fn emit(rig: &Rig, event: &str, session: &str, extra: Value) {
     static CLOCK: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now() + Duration::from_millis(CLOCK.fetch_add(1, Ordering::SeqCst));
+    emit_at(rig, event, session, extra, now);
+}
+
+/// Record a hook event as if the hook had run at `now`.
+fn emit_at(rig: &Rig, event: &str, session: &str, extra: Value, now: SystemTime) {
     let mut payload = json!({ "session_id": session, "cwd": rig.root });
     for (key, value) in extra.as_object().cloned().unwrap_or_default() {
         payload[key] = value;
     }
-    let now = SystemTime::now() + Duration::from_millis(CLOCK.fetch_add(1, Ordering::SeqCst));
     let written = hook::record(
         &rig.settings(),
         event,
@@ -122,8 +133,10 @@ fn needs_input(rig: &Rig, session: &str) {
     );
 }
 
-/// The batches of events the API received, in order.
+/// The batches of events the API received, in order. None of them, and no
+/// heartbeat, may be one Watch would have refused.
 fn batches(mock: &Mock) -> Vec<Vec<Value>> {
+    assert_eq!(contract::violations(mock), Vec::<String>::new());
     mock.to("/v1/events:ingest")
         .iter()
         .map(|request| request.json()["events"].as_array().cloned().unwrap())
@@ -162,17 +175,28 @@ fn the_first_tick_sends_a_heartbeat_with_health_and_live_agent_servers() {
         .header("content-type")
         .unwrap()
         .starts_with("application/json"));
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
     let body = beat.json();
     let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
     assert_eq!(
         keys,
-        ["client_ts", "daemon_version", "environments", "machine"]
+        [
+            "activity_beat_s",
+            "client_ts",
+            "daemon_version",
+            "environments",
+            "machine"
+        ]
     );
+    // Claude Code gives no version and no login expiry to read, so the
+    // environment says nothing about either.
     assert_eq!(
         body["environments"],
         json!([{ "env_id": "client-a", "server_alive": true }])
     );
     assert_eq!(body["daemon_version"], env!("CARGO_PKG_VERSION"));
+    // The promise Watch needs before it calls a session stuck for no tool activity.
+    assert_eq!(body["activity_beat_s"], 300);
     let machine = body["machine"].as_object().unwrap();
     for key in machine.keys() {
         assert!(
@@ -180,7 +204,9 @@ fn the_first_tick_sends_a_heartbeat_with_health_and_live_agent_servers() {
                 "disk_used_pct",
                 "load_1m",
                 "uptime_s",
-                "memory_pressure_pct"
+                "memory_pressure_pct",
+                // Said only by a system that has a way to say it.
+                "reboot_required",
             ]
             .contains(&key.as_str()),
             "unexpected health field {key}"
@@ -447,6 +473,334 @@ fn a_tool_call_is_sent_only_when_it_changes_what_the_session_is_doing() {
         ["user_prompt_submit", "permission_prompt", "activity"]
     );
     assert!(rig.spooled().is_empty());
+}
+
+#[test]
+fn a_working_sessions_tool_calls_reach_watch_once_in_five_minutes() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let mut daemon = daemon(&rig);
+    let start = Instant::now();
+    daemon.tick(start);
+    // The hooks' clock, moved by hand: a prompt, then a tool call a minute
+    // for twelve minutes.
+    let began = SystemTime::now();
+    emit_at(&rig, "UserPromptSubmit", "s1", json!({}), began);
+    for minute in 1..=12 {
+        emit_at(
+            &rig,
+            "PostToolUse",
+            "s1",
+            json!({}),
+            began + secs(60 * minute),
+        );
+    }
+    daemon.tick(start + secs(1));
+    daemon.tick(start + secs(20));
+    let sent = batches(&mock).concat();
+    assert_eq!(types(&sent), ["user_prompt_submit", "activity", "activity"]);
+    // The fifth minute's and the tenth's: never more than five minutes apart.
+    let at = |event: &Value| event["client_ts"].as_str().unwrap().to_string();
+    assert_eq!(
+        [at(&sent[1]), at(&sent[2])],
+        [
+            nucleate::envelope::rfc3339(began + secs(300)),
+            nucleate::envelope::rfc3339(began + secs(600))
+        ]
+    );
+    assert!(rig.spooled().is_empty());
+}
+
+#[test]
+fn the_five_minutes_survive_a_restart_of_the_daemon() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let began = SystemTime::now();
+    let start = Instant::now();
+    let mut first = daemon(&rig);
+    first.tick(start);
+    emit_at(&rig, "UserPromptSubmit", "s1", json!({}), began);
+    first.tick(start + secs(1));
+    first.tick(start + secs(20));
+    drop(first);
+
+    let mut second = daemon(&rig);
+    second.tick(start + secs(21));
+    emit_at(&rig, "PostToolUse", "s1", json!({}), began + secs(120));
+    emit_at(&rig, "PostToolUse", "s1", json!({}), began + secs(301));
+    second.tick(start + secs(22));
+    second.tick(start + secs(40));
+    assert_eq!(
+        types(&batches(&mock).concat()),
+        ["user_prompt_submit", "activity"]
+    );
+}
+
+#[test]
+fn a_limit_reset_time_goes_out_with_the_failed_stop_when_an_agent_gives_one() {
+    // No agent this box knows gives one yet, so the event is written as the
+    // hook would write it for an adapter that did.
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let mut daemon = daemon(&rig);
+    let start = Instant::now();
+    daemon.tick(start);
+    let now = SystemTime::now();
+    let draft = |session: &str| Draft {
+        env_id: "client-a".into(),
+        session_id: session.into(),
+        error_kind: Some("rate_limit".into()),
+        limit_resets_at: Some(now + secs(4 * 3_600)),
+        ..Draft::default()
+    };
+    let spool = Spool::new(&rig.spool_dir());
+    for (kind, session) in [(EventType::StopFailure, "s1"), (EventType::Stop, "s2")] {
+        spool
+            .write(&Record {
+                event: Envelope::new(kind, draft(session), now).unwrap(),
+                at_ms: unix_ms(now),
+                workspace: None,
+            })
+            .unwrap();
+    }
+    daemon.tick(start + secs(1));
+    daemon.tick(start + secs(20));
+
+    let sent = batches(&mock).concat();
+    assert_eq!(sent.len(), 2);
+    let failed = sent.iter().find(|e| e["type"] == "stop_failure").unwrap();
+    assert_eq!(failed["error_kind"], "rate_limit");
+    assert_eq!(
+        failed["limit_resets_at"],
+        nucleate::envelope::rfc3339(now + secs(4 * 3_600))
+    );
+    // Only a failed stop carries one.
+    let stopped = sent.iter().find(|e| e["type"] == "stop").unwrap();
+    assert!(stopped.get("limit_resets_at").is_none());
+    assert!(stopped.get("error_kind").is_none());
+
+    // The box keeps the session as failed, with the kind and the time.
+    let sessions = nucleate::sessions::Store::new(&rig.home.state_dir()).list("client-a");
+    let kept = sessions.iter().find(|s| s.session_id == "s1").unwrap();
+    assert_eq!(kept.status, nucleate::sessions::Status::Failed);
+    assert_eq!(kept.error_kind.as_deref(), Some("rate_limit"));
+    assert_eq!(
+        kept.limit_resets_at.as_deref(),
+        failed["limit_resets_at"].as_str()
+    );
+    assert_eq!(daemon.state(true).events.rejected, 0);
+}
+
+#[test]
+fn the_stand_in_api_holds_the_contract_as_watch_does() {
+    let heartbeat = || {
+        json!({
+            "machine": {
+                "disk_used_pct": 41.5, "load_1m": 0.62, "uptime_s": 864000,
+                "memory_pressure_pct": 3.1, "on_battery": false, "reboot_required": false,
+                "uncommitted_repos": 2, "unpushed_commits": 5,
+                "last_snapshot_at": "2026-11-19T11:10:04.000Z",
+            },
+            "environments": [
+                {
+                    "env_id": "client-a", "server_alive": true, "server_restarts": 4,
+                    "agent_version": "2.1.0", "login_expires_at": "2026-12-01T09:00:00.000Z",
+                    "last_snapshot_at": "2026-11-19T11:10:04.000Z",
+                    "unsaved": {
+                        "uncommitted_repos": 2, "unpushed_commits": 5,
+                        "counted_at": "2026-11-19T11:52:00.000Z",
+                    },
+                },
+                { "env_id": "personal", "server_alive": true, "server_restarts": 0 },
+            ],
+            "daemon_version": "0.1.0",
+            "activity_beat_s": 300,
+            "paused_until": "2026-11-19T13:00:00.000Z",
+            "client_ts": "2026-11-19T12:00:00.000Z",
+        })
+    };
+    assert_eq!(contract::heartbeat(&heartbeat()), Ok(()));
+    // An older daemon's heartbeat is still one the contract takes.
+    assert_eq!(
+        contract::heartbeat(&json!({
+            "machine": { "disk_used_pct": 41.5, "load_1m": 0.62, "uptime_s": 864000 },
+            "environments": [{ "env_id": "client-a", "server_alive": true }],
+            "daemon_version": "0.1.0",
+            "client_ts": "2026-11-19T12:00:00.000Z",
+        })),
+        Ok(())
+    );
+    let spoiled = |change: &dyn Fn(&mut Value)| {
+        let mut body = heartbeat();
+        change(&mut body);
+        contract::heartbeat(&body)
+    };
+    for (what, refused) in [
+        (
+            "an unknown field",
+            spoiled(&|b| b["hostname"] = json!("agentbox")),
+        ),
+        (
+            "an unknown machine field",
+            spoiled(&|b| b["machine"]["kernel"] = json!("6.8")),
+        ),
+        (
+            "an unknown environment field",
+            spoiled(&|b| b["environments"][0]["sessions"] = json!(3)),
+        ),
+        (
+            "a beat below a minute",
+            spoiled(&|b| b["activity_beat_s"] = json!(30)),
+        ),
+        (
+            "a beat that is not a whole number",
+            spoiled(&|b| b["activity_beat_s"] = json!("300")),
+        ),
+        (
+            "a version that is a sentence",
+            spoiled(&|b| b["environments"][0]["agent_version"] = json!("2.1.0 (Claude Code)")),
+        ),
+        (
+            "an expiry that is not a time",
+            spoiled(&|b| b["environments"][0]["login_expires_at"] = json!("next Tuesday")),
+        ),
+        (
+            "a pause in words",
+            spoiled(&|b| b["paused_until"] = json!("until the new disk is in")),
+        ),
+        (
+            "a battery state in words",
+            spoiled(&|b| b["machine"]["on_battery"] = json!("OB DISCHRG")),
+        ),
+        (
+            "more unpushed commits than the contract counts",
+            spoiled(&|b| b["machine"]["unpushed_commits"] = json!(1_000_001)),
+        ),
+        (
+            "a restart count below zero",
+            spoiled(&|b| b["environments"][0]["server_restarts"] = json!(-1)),
+        ),
+        (
+            "an unsaved count without the time it was counted",
+            spoiled(&|b| {
+                let unsaved = b["environments"][0]["unsaved"].as_object_mut().unwrap();
+                unsaved.remove("counted_at");
+            }),
+        ),
+        (
+            "a file name beside an unsaved count",
+            spoiled(&|b| b["environments"][0]["unsaved"]["files"] = json!(["notes.txt"])),
+        ),
+        (
+            "a snapshot time in words",
+            spoiled(&|b| b["environments"][0]["last_snapshot_at"] = json!("an hour ago")),
+        ),
+        (
+            "no clock",
+            spoiled(&|b| {
+                b.as_object_mut().unwrap().remove("client_ts");
+            }),
+        ),
+        (
+            "an environment named twice",
+            spoiled(&|b| b["environments"][1]["env_id"] = json!("client-a")),
+        ),
+    ] {
+        assert!(refused.is_err(), "the stand-in took {what}");
+    }
+
+    let event = || {
+        json!({
+            "event_id": "01JD3KB7T4N9W2Y6C8M1Q3R5S7",
+            "env_id": "client-a",
+            "session_id": "7f3c2a1e-58b4-4d0c-9a6e-2b1f0c9d8e7a",
+            "type": "stop_failure",
+            "error_kind": "rate_limit",
+            "limit_resets_at": "2026-11-20T03:10:00.000Z",
+            "repos": ["your-org/web", "your-org/api"],
+            "branch": "agent/checkout-fix",
+            "client_ts": "2026-11-19T22:41:17.305Z",
+        })
+    };
+    let batch = |event: Value| contract::events(&json!({ "events": [event] }));
+    assert_eq!(batch(event()), Ok(()));
+    let mut outcome = event();
+    outcome["type"] = json!("outcome");
+    outcome["commits"] = json!(3);
+    outcome["uncommitted_repos"] = json!(0);
+    outcome["unpushed_commits"] = json!(0);
+    outcome["pull_requests"] = json!(["https://github.com/Your-Org/web/pull/412"]);
+    assert_eq!(batch(outcome.clone()), Ok(()));
+    let spoiled = |change: &dyn Fn(&mut Value)| {
+        let mut body = outcome.clone();
+        change(&mut body);
+        batch(body)
+    };
+    for (what, refused) in [
+        (
+            "an unknown field",
+            spoiled(&|e| e["title"] = json!("Fix the checkout")),
+        ),
+        (
+            "a reset time in words",
+            spoiled(&|e| e["limit_resets_at"] = json!("in four hours")),
+        ),
+        (
+            "an error message",
+            spoiled(&|e| e["error_kind"] = json!("Rate limited: try later")),
+        ),
+        ("an unknown type", spoiled(&|e| e["type"] = json!("stuck"))),
+        (
+            "a pull request on a repo the event does not name",
+            spoiled(&|e| e["pull_requests"] = json!(["https://github.com/other/web/pull/1"])),
+        ),
+        (
+            "a pull request address with a query",
+            spoiled(&|e| {
+                e["pull_requests"] = json!(["https://github.com/your-org/web/pull/1?x=1"])
+            }),
+        ),
+        (
+            "a count out of range",
+            spoiled(&|e| e["uncommitted_repos"] = json!(33)),
+        ),
+        (
+            "no batch at all",
+            contract::events(&json!({ "events": [] })),
+        ),
+        (
+            "a field beside the batch",
+            contract::events(&json!({ "events": [event()], "machine": "agentbox" })),
+        ),
+    ] {
+        assert!(refused.is_err(), "the stand-in took {what}");
+    }
+
+    // And over the wire it answers as the API does.
+    let (mock, _) = api();
+    let post = |path: &str, body: Value| {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        agent
+            .post(format!("{}{path}", mock.url))
+            .send_json(body)
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+    assert_eq!(post(contract::HEARTBEATS, heartbeat()), 200);
+    let mut unknown = heartbeat();
+    unknown["hostname"] = json!("agentbox");
+    assert_eq!(post(contract::HEARTBEATS, unknown), 400);
+    assert_eq!(post(contract::EVENTS, json!({ "events": [event()] })), 200);
+    let mut unknown = event();
+    unknown["title"] = json!("Fix the checkout");
+    assert_eq!(post(contract::EVENTS, json!({ "events": [unknown] })), 400);
 }
 
 // ---- failure, backoff and replay --------------------------------------

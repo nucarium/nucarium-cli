@@ -200,6 +200,39 @@ impl Drop for Mock {
     }
 }
 
+/// A stand-in for the GitHub API. It answers the one call nucleate makes,
+/// "list pull requests associated with a commit", with whatever `pulls`
+/// returns for the `owner/name` and the commit asked about.
+pub fn github(pulls: impl Fn(&str, &str) -> Reply + Send + 'static) -> Mock {
+    Mock::start(move |request: &Request| {
+        let parts: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+        match parts.as_slice() {
+            ["repos", owner, name, "commits", sha, "pulls"] if request.method == "GET" => {
+                pulls(&format!("{owner}/{name}"), sha)
+            }
+            _ => Reply::json(404, serde_json::json!({ "message": "Not Found" })),
+        }
+    })
+}
+
+/// A folder of stand-in programs, each a shell script, to go first on a
+/// command's `PATH`. Returns the `PATH` to use.
+pub fn path_with(home: &Home, programs: &[(&str, &str)]) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home.dir.join("stand-ins");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, script) in programs {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut paths = vec![dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
 /// The address of an API that is not there: a port nothing listens on.
 pub fn dead_api() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -421,6 +454,18 @@ impl Rig {
         self.home.nucleated()
     }
 
+    /// Make the `web` repo's remote read as one on GitHub, so that the repo
+    /// has an owner and its pull requests have addresses, while git still
+    /// fetches from and pushes to the upstream folder. Nothing here reaches
+    /// GitHub: a test that uses this points nucleate at a stand-in.
+    pub fn as_github(&self, slug: &str) {
+        let bare = self.root.join(".repos/web.git");
+        let url = format!("https://github.com/{slug}.git");
+        let rewrite = format!("url.{}.insteadOf", self.upstream.display());
+        git(&bare, &["config", &rewrite, &url]);
+        git(&bare, &["config", "remote.origin.url", &url]);
+    }
+
     /// Create a nucleus session holding the `web` repo; returns its worktree.
     pub fn session(&self, name: &str) -> PathBuf {
         let out = run(self.nucleate().args(["create-session", name, "web"]), "");
@@ -466,4 +511,390 @@ pub fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
         }
     }
     found
+}
+
+/// The two ingest requests as the Watch contract (0.5.0) defines them, held as
+/// strictly as the API holds them: a field the contract does not name, or a
+/// value outside its pattern or range, is refused. The stand-in APIs answer
+/// through this, so a daemon that sends what Watch would refuse fails here
+/// first.
+pub mod contract {
+    use super::{Mock, Reply, Request};
+    use serde_json::{Map, Value};
+
+    pub const HEARTBEATS: &str = "/v1/heartbeats:ingest";
+    pub const EVENTS: &str = "/v1/events:ingest";
+
+    type Check = Result<(), String>;
+
+    fn chars(value: &str, min: usize, max: usize, allowed: impl Fn(char) -> bool) -> bool {
+        (min..=max).contains(&value.chars().count()) && value.chars().all(allowed)
+    }
+
+    fn word(c: char) -> bool {
+        c.is_ascii_alphanumeric() || "._-".contains(c)
+    }
+
+    /// `^[a-z0-9][a-z0-9._-]{0,63}$`
+    fn env_key(value: &str) -> bool {
+        let lower = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+        value.chars().next().is_some_and(lower)
+            && chars(value, 1, 64, |c| lower(c) || "._-".contains(c))
+    }
+
+    /// `^[0-9A-Za-z.+-]{1,32}$`
+    fn version(value: &str) -> bool {
+        chars(value, 1, 32, |c| {
+            c.is_ascii_alphanumeric() || ".+-".contains(c)
+        })
+    }
+
+    /// `^[A-Za-z0-9._-]{1,100}(/[A-Za-z0-9._-]{1,100})?$`
+    fn repo(value: &str) -> bool {
+        let parts: Vec<&str> = value.split('/').collect();
+        parts.len() <= 2 && parts.iter().all(|part| chars(part, 1, 100, word))
+    }
+
+    /// `^https://github\.com/<owner>/<name>/pull/[1-9][0-9]{0,9}$`, at most
+    /// 240 characters. Answers with the `owner/name` it names.
+    fn pull_request(value: &str) -> Option<String> {
+        let rest = value.strip_prefix("https://github.com/")?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        let [owner, name, "pull", number] = parts.as_slice() else {
+            return None;
+        };
+        let numbered = chars(number, 1, 10, |c| c.is_ascii_digit()) && !number.starts_with('0');
+        (value.len() <= 240 && chars(owner, 1, 100, word) && chars(name, 1, 100, word) && numbered)
+            .then(|| format!("{owner}/{name}"))
+    }
+
+    /// RFC 3339: `2026-11-19T12:00:00Z`, with or without a fraction, with `Z`
+    /// or an offset.
+    fn date_time(value: &str) -> bool {
+        let Some((date, time)) = value.split_once(['T', 't']) else {
+            return false;
+        };
+        let digits =
+            |text: &str, len: usize| text.len() == len && text.bytes().all(|c| c.is_ascii_digit());
+        let number = |text: &str| text.parse::<u32>().unwrap_or(u32::MAX);
+        let date: Vec<&str> = date.split('-').collect();
+        let [year, month, day] = date.as_slice() else {
+            return false;
+        };
+        let (clock, zone) = match time.find(['Z', 'z', '+', '-']) {
+            Some(at) => time.split_at(at),
+            None => return false,
+        };
+        let (clock, fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+        let clock: Vec<&str> = clock.split(':').collect();
+        let [hour, minute, second] = clock.as_slice() else {
+            return false;
+        };
+        let zone_ok = zone.eq_ignore_ascii_case("z")
+            || zone[1..].split_once(':').is_some_and(|(h, m)| {
+                digits(h, 2) && digits(m, 2) && number(h) < 24 && number(m) < 60
+            });
+        digits(year, 4)
+            && digits(month, 2)
+            && (1..=12).contains(&number(month))
+            && digits(day, 2)
+            && (1..=31).contains(&number(day))
+            && digits(hour, 2)
+            && number(hour) < 24
+            && digits(minute, 2)
+            && number(minute) < 60
+            && digits(second, 2)
+            && number(second) <= 60
+            && !fraction.is_empty()
+            && fraction.bytes().all(|c| c.is_ascii_digit())
+            && zone_ok
+    }
+
+    fn object<'a>(value: &'a Value, what: &str) -> Result<&'a Map<String, Value>, String> {
+        value.as_object().ok_or(format!("{what} is not an object"))
+    }
+
+    /// `additionalProperties: false`, and every required property present.
+    fn closed(map: &Map<String, Value>, what: &str, required: &[&str], optional: &[&str]) -> Check {
+        for key in map.keys() {
+            if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+                return Err(format!(
+                    "{what} has a field the contract does not name: {key}"
+                ));
+            }
+        }
+        match required.iter().find(|key| !map.contains_key(**key)) {
+            Some(missing) => Err(format!("{what} lacks {missing}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Check one property when it is present.
+    fn field(
+        map: &Map<String, Value>,
+        what: &str,
+        key: &str,
+        fits: impl Fn(&Value) -> bool,
+    ) -> Check {
+        match map.get(key) {
+            Some(value) if !fits(value) => Err(format!("{what}.{key} does not fit: {value}")),
+            _ => Ok(()),
+        }
+    }
+
+    fn integer(min: u64, max: u64) -> impl Fn(&Value) -> bool {
+        move |value| value.as_u64().is_some_and(|n| (min..=max).contains(&n))
+    }
+
+    fn number(min: f64, max: f64) -> impl Fn(&Value) -> bool {
+        move |value| value.as_f64().is_some_and(|n| (min..=max).contains(&n))
+    }
+
+    fn string(fits: impl Fn(&str) -> bool) -> impl Fn(&Value) -> bool {
+        move |value| value.as_str().is_some_and(&fits)
+    }
+
+    fn boolean(value: &Value) -> bool {
+        value.is_boolean()
+    }
+
+    /// `HeartbeatRequest`.
+    pub fn heartbeat(body: &Value) -> Check {
+        let top = object(body, "heartbeat")?;
+        closed(
+            top,
+            "heartbeat",
+            &["machine", "environments", "client_ts"],
+            &["daemon_version", "activity_beat_s", "paused_until"],
+        )?;
+        field(top, "heartbeat", "daemon_version", string(version))?;
+        field(top, "heartbeat", "activity_beat_s", integer(60, 3_600))?;
+        field(top, "heartbeat", "paused_until", string(date_time))?;
+        field(top, "heartbeat", "client_ts", string(date_time))?;
+
+        let machine = object(&top["machine"], "machine")?;
+        closed(
+            machine,
+            "machine",
+            &["disk_used_pct", "load_1m", "uptime_s"],
+            &[
+                "memory_pressure_pct",
+                "on_battery",
+                "reboot_required",
+                "uncommitted_repos",
+                "unpushed_commits",
+                "last_snapshot_at",
+            ],
+        )?;
+        field(machine, "machine", "disk_used_pct", number(0.0, 100.0))?;
+        field(machine, "machine", "load_1m", number(0.0, 100_000.0))?;
+        field(machine, "machine", "uptime_s", integer(0, u64::MAX))?;
+        field(
+            machine,
+            "machine",
+            "memory_pressure_pct",
+            number(0.0, 100.0),
+        )?;
+        field(machine, "machine", "on_battery", boolean)?;
+        field(machine, "machine", "reboot_required", boolean)?;
+        field(machine, "machine", "uncommitted_repos", integer(0, 10_000))?;
+        field(
+            machine,
+            "machine",
+            "unpushed_commits",
+            integer(0, 1_000_000),
+        )?;
+        field(machine, "machine", "last_snapshot_at", string(date_time))?;
+
+        let environments = top["environments"]
+            .as_array()
+            .filter(|list| list.len() <= 40)
+            .ok_or("environments is not a list of at most 40")?;
+        let mut seen = Vec::new();
+        for entry in environments {
+            let environment = object(entry, "environment")?;
+            closed(
+                environment,
+                "environment",
+                &["env_id", "server_alive"],
+                &[
+                    "server_restarts",
+                    "agent_version",
+                    "login_expires_at",
+                    "last_snapshot_at",
+                    "unsaved",
+                ],
+            )?;
+            field(environment, "environment", "env_id", string(env_key))?;
+            field(environment, "environment", "server_alive", boolean)?;
+            field(
+                environment,
+                "environment",
+                "server_restarts",
+                integer(0, 2_147_483_647),
+            )?;
+            field(environment, "environment", "agent_version", string(version))?;
+            field(
+                environment,
+                "environment",
+                "login_expires_at",
+                string(date_time),
+            )?;
+            field(
+                environment,
+                "environment",
+                "last_snapshot_at",
+                string(date_time),
+            )?;
+            if let Some(unsaved) = environment.get("unsaved") {
+                let unsaved = object(unsaved, "unsaved")?;
+                closed(
+                    unsaved,
+                    "unsaved",
+                    &["uncommitted_repos", "unpushed_commits", "counted_at"],
+                    &[],
+                )?;
+                field(unsaved, "unsaved", "uncommitted_repos", integer(0, 10_000))?;
+                field(
+                    unsaved,
+                    "unsaved",
+                    "unpushed_commits",
+                    integer(0, 1_000_000),
+                )?;
+                field(unsaved, "unsaved", "counted_at", string(date_time))?;
+            }
+            if seen.contains(&&environment["env_id"]) {
+                return Err(format!("{} is named twice", environment["env_id"]));
+            }
+            seen.push(&environment["env_id"]);
+        }
+        Ok(())
+    }
+
+    const TYPES: [&str; 10] = [
+        "session_start",
+        "user_prompt_submit",
+        "activity",
+        "permission_prompt",
+        "input_prompt",
+        "elicitation_prompt",
+        "stop",
+        "stop_failure",
+        "session_end",
+        "outcome",
+    ];
+
+    /// `EventEnvelope`. Every field is held to its shape whatever the `type`.
+    fn envelope(value: &Value) -> Check {
+        let event = object(value, "event")?;
+        closed(
+            event,
+            "event",
+            &["event_id", "env_id", "session_id", "type", "client_ts"],
+            &[
+                "bridge_session_id",
+                "repos",
+                "branch",
+                "error_kind",
+                "limit_resets_at",
+                "commits",
+                "uncommitted_repos",
+                "unpushed_commits",
+                "pull_requests",
+            ],
+        )?;
+        let id = |c: char| c.is_ascii_alphanumeric() || "_-".contains(c);
+        let session = |value: &str| chars(value, 1, 128, |c| word(c) || c == ':');
+        let lower = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c);
+        field(event, "event", "event_id", string(|v| chars(v, 8, 64, id)))?;
+        field(event, "event", "env_id", string(env_key))?;
+        field(event, "event", "session_id", string(session))?;
+        field(event, "event", "bridge_session_id", string(session))?;
+        field(event, "event", "type", string(|v| TYPES.contains(&v)))?;
+        field(event, "event", "repos", |repos| {
+            repos
+                .as_array()
+                .is_some_and(|list| list.len() <= 32 && list.iter().all(string(repo)))
+        })?;
+        field(
+            event,
+            "event",
+            "branch",
+            string(|v| chars(v, 1, 255, |c| word(c) || "/@+=#".contains(c))),
+        )?;
+        field(
+            event,
+            "event",
+            "error_kind",
+            string(|v| chars(v, 1, 64, lower)),
+        )?;
+        field(event, "event", "limit_resets_at", string(date_time))?;
+        field(event, "event", "commits", integer(0, 100_000))?;
+        field(event, "event", "uncommitted_repos", integer(0, 32))?;
+        field(event, "event", "unpushed_commits", integer(0, 100_000))?;
+        field(event, "event", "client_ts", string(date_time))?;
+        if let Some(pulls) = event.get("pull_requests") {
+            let pulls = pulls
+                .as_array()
+                .filter(|list| list.len() <= 16)
+                .ok_or("event.pull_requests is not a list of at most 16")?;
+            let repos: Vec<String> = event
+                .get("repos")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_lowercase)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pull in pulls {
+                let named = pull
+                    .as_str()
+                    .and_then(pull_request)
+                    .ok_or(format!("event.pull_requests does not fit: {pull}"))?;
+                if !repos.contains(&named.to_lowercase()) {
+                    return Err(format!("{pull} is on a repo the event does not name"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `EventsRequest`: one to a hundred envelopes.
+    pub fn events(body: &Value) -> Check {
+        let top = object(body, "events request")?;
+        closed(top, "events request", &["events"], &[])?;
+        let events = top["events"]
+            .as_array()
+            .filter(|list| (1..=100).contains(&list.len()))
+            .ok_or("events is not a list of 1 to 100")?;
+        events.iter().try_for_each(envelope)
+    }
+
+    /// What the contract has against a request to an ingest route, if anything.
+    pub fn violation(request: &Request) -> Option<String> {
+        let (limit, check): (usize, fn(&Value) -> Check) = match request.path.as_str() {
+            HEARTBEATS => (32 * 1024, heartbeat),
+            EVENTS => (256 * 1000, events),
+            _ => return None,
+        };
+        if request.body.len() > limit {
+            return Some(format!("{} is over its {limit} byte limit", request.path));
+        }
+        match serde_json::from_str::<Value>(&request.body) {
+            Ok(body) => check(&body).err(),
+            Err(_) => Some(format!("{} was not sent JSON", request.path)),
+        }
+    }
+
+    /// The API's answer to a request the contract refuses.
+    pub fn refusal(request: &Request) -> Option<Reply> {
+        violation(request).map(|_| Reply::problem(400, "validation_failed"))
+    }
+
+    /// Everything the mock was sent that Watch would have refused.
+    pub fn violations(mock: &Mock) -> Vec<String> {
+        mock.requests().iter().filter_map(violation).collect()
+    }
 }

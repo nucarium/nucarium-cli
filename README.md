@@ -15,7 +15,8 @@ This repository builds two binaries:
 - **`nucleate`**, the workspace CLI described first. It also signs a box in to
   [Nucarium Watch](https://nucarium.com) (`nucleate login`).
 - **`nucleated`**, the box daemon: a heartbeat, session lifecycle events,
-  housekeeping, and a local status view. See [nucleated](#nucleated).
+  unsaved work and what each session left behind, housekeeping, and a local
+  status view. See [nucleated](#nucleated).
 
 Both are useful with no account. Watch is the hosted half: it tells you the
 moment an agent needs you or a box goes dark.
@@ -111,6 +112,12 @@ The last check asks GitHub, because a squash merge rewrites the commits and the
 branch is usually deleted afterwards. If GitHub can't be reached, the answer is
 treated as "not merged". `remove-session` is all or nothing: one unsaved repo
 keeps the whole session.
+
+`nucleated` counts by this same rule, so what Watch shows as unsaved is what
+`nucleate` would refuse to delete: the worktrees with uncommitted changes, and
+the commits that are on no remote. A new session branch tracks the
+repository's default branch until it is pushed with `git push -u`. Commits
+pushed without `-u` are still ahead of that upstream, so they still count.
 
 ## Configuration
 
@@ -279,18 +286,24 @@ if the box were not signed in.
 
 ## nucleated
 
-The daemon runs as the agent user, never as root. It does five things:
+The daemon runs as the agent user, never as root. It does eight things:
 
 | Job | What it does |
 |---|---|
-| Heartbeat | Every 60 seconds: disk used, load, uptime, memory pressure, and which configured agent servers are alive. |
+| Heartbeat | Every 60 seconds: disk used, load, uptime, memory pressure, whether the box is on battery and whether it needs a reboot, which configured agent servers are alive and how often each has been restarted, the last count of unsaved work, and how often the daemon passes on a working session's tool activity. |
 | Event forwarding | `nucleated hook <event>` writes the allowlisted fields of an agent hook to a local spool. The daemon sends routine events in batches and "needs input" at once. |
 | Environment discovery | It reads the agent servers on the box from its config and reports each as an environment. |
+| Unsaved work and outcomes | It counts what exists only on the box, on a schedule, and when a session stops or ends it reports what the session left behind: commits made, work not saved, and the addresses of its open pull requests. See [Unsaved work and outcomes](#unsaved-work-and-outcomes). |
 | Housekeeping | Fetch and prune, remove sessions that are finished and hold nothing unsaved, and snapshot uncommitted work to a hidden ref. These call the same code as `nucleate`. |
+| Maintenance pause | `nucleated pause 2h` tells Watch to hold its alerts for this box going dark while you work on it. See [The maintenance pause](#the-maintenance-pause). |
+| Fallback notifier | With an address of your own in the config, the box tells you itself when it cannot reach Watch. Off by default. See [When Watch cannot be reached](#when-watch-cannot-be-reached). |
 | Local status | `nucleated status` prints what Watch would show, for a box with no account. |
 
 Its target is hosted Watch, or none. Signed in, it reports to Watch. Not signed
 in, it sends nothing anywhere and everything else still works.
+
+The daemon observes. It reports and it tidies, and it never starts, stops,
+pauses or resumes an agent or an agent server. Every probe it runs only asks.
 
 ### Commands
 
@@ -304,6 +317,8 @@ in, it sends nothing anywhere and everything else still works.
 | `nucleated hooks print [--env NAME]` | Prints the `hooks` block to merge into that login's `settings.json`. |
 | `nucleated housekeeping run <job> [--env NAME] [--dry-run]` | Runs one job now: `refresh`, `cleanup` or `snapshot`. Prints JSON. `--dry-run` reports what `cleanup` or `snapshot` would do. |
 | `nucleated unit` | Prints the systemd user unit below. |
+| `nucleated pause <duration>` | Announces maintenance for `<duration>`, at most `24h`: `30m`, `2h`. Prints `{ "paused": true, "until" }`. Exits 2, and pauses nothing, for no time at all, more than a day, or anything that is not a duration. Pausing again replaces the pause. |
+| `nucleated resume` | Ends the pause now. Prints `{ "paused": false, "was_paused" }`. Harmless when nothing is paused. |
 
 ### Configuration
 
@@ -361,6 +376,27 @@ snapshot = "hourly"
 # A session younger than this is never cleaned up.
 cleanup_min_age = "7d"
 
+[report]
+# How often unsaved work is counted, once per nucleus: "1m" or longer, or
+# "off". A heartbeat reads the last count and never runs git itself.
+unsaved = "10m"
+
+# Only on a box with a UPS that NUT watches. The daemon asks NUT whether the
+# box is running on battery. Left out, nothing is said about a battery.
+# [ups]
+# name = "ups@localhost"
+
+# Only to have the box tell you itself when it cannot reach Watch. Left out,
+# the box posts nowhere.
+# [notify]
+# An address of your own, shaped as ntfy takes a post. https, or http on this
+# machine.
+# url = "https://ntfy.sh/your-private-topic"
+# A file holding a bearer token for that address, mode 600.
+# token_file = "/home/agent/.config/nucleated/notify-token"
+# How long Watch must have been unreachable before the box says so. At least "2m".
+# after = "10m"
+
 [spool]
 # dir = "/home/agent/.local/state/nucleated/spool"
 max_age = "7d"
@@ -378,10 +414,15 @@ and all mode 600:
 |---|---|
 | `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. |
 | `spool/rejected/` | Events Watch refused. Kept for `max_age`, never retried. |
-| `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch. `nucleated status` reads these. |
+| `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, and when an event for it was last sent. `nucleated status` reads these. |
 | `daemon.json` | The daemon's last heartbeat and what it has sent. |
-| `housekeeping.json` | When each housekeeping job last ran, and what it did. |
+| `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
+| `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times. The heartbeat reads it. |
+| `outcomes/<environment>/<session_id>.json` | A note that a session stopped or ended and its repos are to be looked at. Removed when they have been. |
+| `merged.json` | GitHub's answers to "was this commit merged?", so the count asks about a commit once an hour at most and never again once it was merged. |
+| `pause.json` | The time a maintenance pause ends. Only while one is set. |
+| `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 
 ### The systemd user unit
 
@@ -413,7 +454,7 @@ systemctl --user enable --now nucleated.service
 The agent user needs lingering (`loginctl enable-linger agent`) for the unit to
 start at boot. The daemon picks up a new token or a changed config file by
 itself; neither needs a restart. It runs `git` as the agent user, with that
-user's git credentials, for housekeeping.
+user's git credentials, for housekeeping and for the count of unsaved work.
 
 ### Hooks
 
@@ -469,15 +510,41 @@ What each event becomes:
 | `Notification` `idle_prompt`, `agent_needs_input` | `input_prompt` | needs input |
 | `Notification` `elicitation_dialog`, `elicitation_url_dialog` | `elicitation_prompt` | needs input |
 | `Notification` `elicitation_complete`, `elicitation_response` | `activity` | working |
-| `PostToolUse` | `activity`, only when the session was not already working | working |
+| `PostToolUse` | `activity`, when the session was not already working, and once in five minutes while it is | working |
 | `Stop` | `stop` | idle |
 | `StopFailure` | `stop_failure`, with the error kind | failed |
 | `SessionEnd` | `session_end` | ended |
 
+One more event comes from no hook. Ten seconds after a `Stop`, a `StopFailure`
+or a `SessionEnd` in a nucleus session, the daemon sends an `outcome`: what the
+session left behind. It moves the session to no other status. See
+[Unsaved work and outcomes](#unsaved-work-and-outcomes).
+
 `PostToolUse` is how a session leaves "needs input" after you grant a
 permission: the tool ran, so the agent is working again. It fires on every tool
-call; the daemon drops it unless it changes the session's status, so a busy
-session sends nothing extra.
+call. The daemon sends the one that changes the session's status, and after
+that one in every five minutes for as long as the tools keep running. Watch
+calls a session stuck when it has been working with no tool activity for the
+time you set, so it has to hear that there is some; a busy session costs one
+small event every five minutes and no more. The five minutes are counted on the
+hooks' own clock, from the last event sent for that session, and carry over a
+restart of the daemon. Each heartbeat tells Watch the interval as
+`activity_beat_s`, and Watch never judges a session on less than twice it.
+
+A failed stop carries the agent's own short kind for the failure. Watch reads
+it: `rate_limit` shows as paused on a usage limit, `authentication_failed` as
+an expired login, and any other kind as failed. Those lists are Watch's. The
+box does not know them, sends whatever short kind the agent gives, and
+`nucleated status` shows the session as failed with its kind.
+
+Three more facts have a place in what the box sends, and Claude Code gives the
+box none of them to read, so today the daemon sends none: when a usage limit
+resets (`limit_resets_at` on a failed stop), when an environment's login
+expires (`login_expires_at` on the heartbeat) and the agent's version
+(`agent_version` on the heartbeat). Each is read by the agent's adapter in
+`src/agent.rs`, and an adapter answers only from a field or a file the agent
+documents. The daemon does not guess: Watch says "paused on a usage limit"
+without a time, and warns of no expiry it was not told about.
 
 The hook never blocks a session. It prints nothing, exits 0, gives up after two
 seconds, and needs neither the daemon nor the network: it only writes a file.
@@ -496,11 +563,23 @@ Every payload is built from named fields. This is the whole list.
 | `repos` | The session's repos, as `owner/name` from each remote, else the folder name. |
 | `branch` | The session's branch. |
 | `error_kind` | The hook's `error`, for `StopFailure` only, and only when it is a short kind such as `rate_limit`. |
+| `limit_resets_at` | When the agent says a usage limit resets, for `StopFailure` only: a timestamp, kept only from a minute before to eight days after the event. Claude Code's hook gives none, so none is sent. |
 | `client_ts` | The box's clock. |
-| Heartbeat | Disk used %, 1-minute load, uptime, memory pressure %, each environment's name and whether its agent server is alive, the daemon's version, the box's clock. |
+| `commits`, with an `outcome` only | How many commits the session made: those on its branch since the commit each worktree started from. A number. |
+| `uncommitted_repos`, `unpushed_commits`, with an `outcome` only | How many of the session's repos hold uncommitted changes, and how many of its commits are on no remote. Numbers. |
+| `pull_requests`, with an `outcome` only | The addresses of the open pull requests whose head is the session's commit, from GitHub. Each is `https://github.com/<owner>/<name>/pull/<number>` on a repo the same event names in `repos`, and nothing else: no title, no query, no fragment. |
+| Heartbeat | Disk used %, 1-minute load, uptime, memory pressure %, each environment's name and whether its agent server is alive, the daemon's version, `activity_beat_s` (the number 300), the box's clock. |
+| Heartbeat, about the box | `on_battery`, yes or no, from NUT, only with `[ups]` set. `reboot_required`, yes or no, on Debian and Ubuntu, where `/var/run/reboot-required` says so. `uncommitted_repos`, `unpushed_commits` and `last_snapshot_at`: the box's unsaved work with each nucleus counted once, and the time since which every nucleus has had a good snapshot. `paused_until`, a timestamp, only while a maintenance pause is set. |
+| Heartbeat, per environment | `server_restarts`, systemd's running count of restarts of the agent server's unit. `unsaved`: `uncommitted_repos`, `unpushed_commits` and `counted_at`, two numbers and a time. `last_snapshot_at`, when the snapshot job last finished for that nucleus with nothing failed. |
+| Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
 
 Each value is checked against the shape Watch accepts before it is written
-down. One that does not fit is left out.
+down or sent. One that does not fit is left out. A time is built from a time
+and never from the agent's words for one, a count is a number, and a pull
+request's address is held to its pattern, so there is nowhere in any of them
+for a sentence to go. A value the box could not find out is left out too, which
+is not the same as zero: a probe that gets no answer, a count not yet made and
+a GitHub that does not reply each leave their field off.
 
 Never read from the hook, never written to disk, never sent: prompts, messages,
 session titles, tool inputs and outputs, transcript paths and contents, the
@@ -509,10 +588,30 @@ file contents, file paths beyond a repo's name, environment variables, user
 names and tokens. The hook's `cwd` is read to find the session's repos and
 branch, and goes no further.
 
+Never sent from what the box finds out itself: commit subjects and messages,
+file names, diffs, pull request titles, descriptions, branches and authors.
+The daemon never asks git for a commit's subject or a file's contents. `git
+status` names the files that changed, and that answer is read for whether it is
+empty and then dropped. From GitHub's list of pull requests it reads four
+fields: the address, the state, whether it was merged and the head commit.
+
+Two things leave the box for somewhere other than Watch, and neither goes to
+Nucarium. The hourly snapshot pushes uncommitted work, which is code, to
+`refs/wip/<branch>` on the repository's own remote: your Git host, under your
+credentials. And with `[notify]` set, the box posts a machine name, an
+environment name and a time to the address you gave it, while it cannot reach
+Watch.
+
 `tests/privacy.rs` is the release gate for this. It feeds every hook event a
 payload with a sentinel string in every content-bearing field, in the working
 directory's path and in the environment, then proves that no sentinel is in the
-spool, in the local state, or in any request the daemon makes.
+spool, in the local state, or in any request the daemon makes. It does the same
+for what the box finds out itself: a session's repository gets a commit subject,
+file names and file contents full of the sentinel, a stand-in for GitHub
+describes its pull request with the sentinel in the title, the body, the branch
+and the author, and what leaves is counts, times and one address. It lists
+every field an event and a heartbeat may carry, and fails if one is sent that
+is not on the list.
 
 ### Spool and replay
 
@@ -532,6 +631,127 @@ than `max_age` are dropped.
 
 With no target, events update the local state and their spool files are deleted
 once applied.
+
+### Unsaved work and outcomes
+
+A box that dies takes with it whatever was only on the box. Watch shows how
+much that is before it happens, and says it when a session ends holding some
+or a machine goes dark.
+
+The **count** is per environment: how many worktrees in its nucleus hold
+uncommitted changes, and how many commits are on no remote, by
+[the rule `nucleate` deletes by](#what-counts-as-unsaved). A third thread, the
+reporter, makes it every ten minutes (`unsaved` in `[report]`), once per
+nucleus, and writes two numbers and a time to `unsaved.json`. The heartbeat
+reads that file. It runs no git, however many worktrees there are, so a
+heartbeat costs the same on a box with one session as with a hundred. Two
+logins that share a nucleus report the same counts, and the box's own totals
+count that nucleus once. A worktree git cannot read makes its nucleus's count
+unknown, and nothing is sent in place of it. `"off"` stops the count and
+removes the last one.
+
+With the count goes `last_snapshot_at`: when the snapshot job last finished for
+that nucleus with nothing failed. A run whose push was refused does not move
+it.
+
+The **outcome** is per session. When a session in a nucleus stops, fails or
+ends, the daemon's loop leaves a note and the reporter looks at that session's
+repos ten seconds later, so a push that was still running has landed. It looks
+at most once a minute for one session, however often the session stops, and
+sends:
+
+- `commits`: the commits on the session's branch since each worktree started;
+- `uncommitted_repos` and `unpushed_commits`: what the session holds that is
+  nowhere else;
+- `pull_requests`: the addresses of the open pull requests whose head is the
+  session's commit. GitHub is asked only for a repo whose remote is on GitHub,
+  where the session has made a commit, and whose `HEAD` is on a remote branch;
+  it is the one call `nucleate` already makes to recognise a merged branch.
+
+What the box could not find out it leaves off, and Watch keeps what it had: no
+`pull_requests` when GitHub did not answer or the session's commit is on no
+remote branch, no `commits` when a worktree's starting commit cannot be read.
+An empty `pull_requests` says there are none: the session made no commit, or
+GitHub listed no open pull request with its commit as the head.
+When the session's folder is already gone, the outcome says only that nothing
+unsaved is left. A session outside a nucleus has no outcome: `nucleate` made no
+folder for it and keeps no record of where it started.
+
+The reporter asks about a worktree with `git --no-optional-locks status`, so it
+never leaves the index locked under an agent that is committing.
+
+### The maintenance pause
+
+Reboot a box, or pull its power to move it, and Watch tells you it has gone
+dark, which you knew. Say so first:
+
+```bash
+nucleated pause 2h
+```
+
+```json
+{
+  "paused": true,
+  "until": "2026-11-20T03:10:00.000Z"
+}
+```
+
+The running daemon sends a heartbeat at once, carrying the time the pause ends.
+Until then Watch holds its alerts for this machine and its agent servers going
+dark, and shows the machine as paused for maintenance. If the box is still dark
+when the pause ends, the alert held is sent then. If it came back first, nothing
+is sent.
+
+`nucleated resume` ends the pause now. Otherwise it ends by itself: a pause is
+at most a day, and one whose time has passed is over without anyone ending it.
+
+A pause holds those alerts and does nothing else. No agent, agent server or
+housekeeping job is touched, sessions go on being reported, and every other
+kind of alert is sent as ever. A pause set on a box that is not signed in is
+kept and tells nobody.
+
+### When Watch cannot be reached
+
+Watch tells you when a box goes dark. It cannot tell you that it has stopped
+hearing from every box at once, or that this box's route to it is down while
+its agents work on. With an address of your own in the config, the box says so
+itself:
+
+```toml
+[notify]
+url = "https://ntfy.sh/your-private-topic"
+```
+
+It posts three kinds of message, each once:
+
+| When | The post |
+|---|---|
+| No heartbeat has been accepted for `after` (ten minutes) | `agentbox cannot reach Nucarium Watch`: "No heartbeat has been accepted since 13:40 UTC. This box tells you here when a session waits on you." |
+| While that lasts, each time a session starts waiting on you | `An agent on client-a is waiting for you`: "A session on client-a (agentbox) has waited since 13:52 UTC. Watch cannot be reached, so this comes from the box." |
+| A heartbeat is accepted again | `agentbox can reach Nucarium Watch again`: "Heartbeats are accepted again after 25 minutes." |
+
+A post has the shape Watch's own alerts have: the title in a `Title` header, the
+sentence as a plain-text body, `Priority`, `Tags`, and `X-Nucarium-Alert-Kind`
+set to `box_watch_unreachable`, `box_session_waiting` or `box_watch_reachable`.
+It carries the machine's name, the environment's name and a time in UTC. It
+goes to that one address, with the token in `token_file` if you set one, and
+never to Nucarium. The machine token is Watch's and is sent to nothing else.
+
+A session that started waiting before the box had spoken is told of right
+after the first post. A session that is answered and waits again is told of
+again; the same wait never is. `notify.json` records what was posted, so
+restarting the daemon in the middle of an outage repeats nothing. A post that
+fails is tried again after a second, doubling to five minutes. If Watch comes
+back before the first post was ever delivered, neither it nor the "again" post
+is sent.
+
+A refused token and a request to slow down are answers from Watch, not an
+outage. The notifier runs only on a box that reports to Watch: with no login,
+or with `target = "none"`, it posts nothing.
+
+This covers Watch being unreachable from a box that still has a network. A box
+with no network cannot post either. That case is the one Watch itself covers:
+it tells you the machine has gone dark.
 
 ### Housekeeping
 
@@ -570,9 +790,32 @@ Choices this repository makes where the product spec leaves room:
   alternative where there is no unit to ask.
 - **The daemon, not the hook, decides what is worth sending.** The hook writes
   every event it is given; the daemon applies them in order to the local state
-  and forwards the ones that change a session's status or its "needs input".
+  and forwards the ones that change a session's status or its "needs input",
+  and one tool call in five minutes from a session that stays working.
+- **The box does not sort failures or call a session stuck.** It reports a
+  failed stop with the agent's kind and leaves it to Watch to say which kinds
+  are a usage limit or an expired login. Stuck is decided on Watch's clock,
+  from deadlines the account sets. `nucleated status` shows `failed` with the
+  kind, and `working`.
 - **Hosted Watch or nothing.** There is no setting for another Watch. `url` in
   `[watch]` exists for developing against an API on the same machine.
+- **One rule for unsaved work.** The counts Watch shows come from the same
+  function `nucleate` refuses a deletion by, so the two never disagree.
+- **Unknown is not zero.** A probe that gets no answer, a count not yet made
+  and a GitHub that does not reply leave their field out of what is sent.
+  Nothing is put in its place.
+- **Restarts are systemd's to count.** `server_restarts` is the unit's own
+  `NRestarts`. An environment watched by a `check` command has no supervisor
+  the daemon can ask, so it sends no count. Watch decides what a restart loop
+  is; the box only reports the number.
+- **A reboot is required where the system can say so.** On Debian and Ubuntu
+  `/var/run/reboot-required` is the convention, and its absence means no. On
+  another system its absence would mean nothing, so nothing is sent.
+- **Pull requests are GitHub's.** Their addresses come from GitHub's list of
+  the pull requests for a commit, which `nucleate` already reads to recognise a
+  merged branch. A remote on another host has none the box can know of.
+- **The notifier speaks only when Watch cannot.** It tells you of a waiting
+  session only when the event that would have told Watch is still unsent.
 
 ## Development
 
@@ -582,10 +825,20 @@ cargo test -- --ignored    # also runs the one test that calls the GitHub API
 cargo clippy --all-targets -- -D warnings
 ```
 
-Nothing in the suite talks to Watch. `tests/common` starts a stand-in for its
-API on a local port; `tests/login.rs` drives the sign-in against it through
-every device-flow error, a slow API and a dead one, and `tests/daemon.rs`
-drives the daemon's loop through batching, backoff and replay after an outage.
+Nothing in the suite talks to Watch or to GitHub. `tests/common` starts a
+stand-in for the Watch API on a local port; `tests/login.rs` drives the sign-in
+against it through every device-flow error, a slow API and a dead one, and
+`tests/daemon.rs` drives the daemon's loop through batching, backoff and replay
+after an outage. `tests/reports.rs` covers what the box reports about itself:
+the unsaved count and its schedule, outcomes, the supervisor's signals, the
+pause and the notifier. It moves the clock and waits for nothing. Where a test
+needs GitHub, `NUCLEATE_GITHUB_API_URL` or the reporter's own seam points
+`nucleate` at a stand-in, and only an `http` address on this machine is
+accepted there, so nothing else can take GitHub's place.
+The stand-in holds the two ingest routes to the Watch contract as the API
+does (`contract` in `tests/common`): a field the contract does not name, or a
+value outside its pattern or range, is answered with `validation_failed`.
+When the contract changes, that module changes with it.
 `tests/privacy.rs` is the release gate described under
 [What leaves the box](#what-leaves-the-box): if it fails, do not release.
 

@@ -11,7 +11,7 @@
 //! ```
 
 use crate::config::Config;
-use crate::{git, github};
+use crate::{git, github, paths};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST: &str = ".workspace.json";
 
@@ -50,6 +51,63 @@ pub struct Workspace {
     repos_dir: PathBuf,
     sessions_dir: PathBuf,
     seeds_dir: PathBuf,
+    /// Where GitHub's answers to "was this commit merged?" are remembered,
+    /// for a caller that asks on a schedule.
+    merges: Option<PathBuf>,
+}
+
+/// What a worktree holds that exists nowhere else. This is the one rule:
+/// `nucleate` refuses to delete on it, and the daemon counts by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Unsaved {
+    /// Changes that are not committed, untracked files included.
+    pub uncommitted: bool,
+    /// Commits on no remote: those ahead of the branch's upstream or, for a
+    /// branch with none, those no remote branch holds, unless a merged pull
+    /// request's head is this very commit.
+    pub unpushed: u32,
+    /// Whether `unpushed` was counted against an upstream.
+    pub tracked: bool,
+}
+
+impl Unsaved {
+    pub fn is_saved(&self) -> bool {
+        !self.uncommitted && self.unpushed == 0
+    }
+
+    /// The same facts in words, for the person a removal was refused to.
+    pub fn reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.uncommitted {
+            reasons.push("uncommitted changes".to_string());
+        }
+        match (self.unpushed, self.tracked) {
+            (0, _) => {}
+            (ahead, true) => reasons.push(format!("{ahead} unpushed commit(s)")),
+            (_, false) => {
+                reasons.push("HEAD is not on any remote branch or merged pull request".to_string())
+            }
+        }
+        reasons
+    }
+}
+
+/// One answer from GitHub about one commit, and when it was given.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Asked {
+    merged: bool,
+    at_s: u64,
+}
+
+/// "Not merged" is asked again after this long. "Merged" never changes.
+const ASK_AGAIN_AFTER_S: u64 = 3_600;
+/// An answer nobody has needed for this long is forgotten.
+const FORGET_AFTER_S: u64 = 30 * 86_400;
+
+fn count(text: &str) -> Result<u32> {
+    text.trim()
+        .parse()
+        .with_context(|| format!("git printed {text:?} where a count belongs"))
 }
 
 fn valid_name(value: &str) -> bool {
@@ -98,12 +156,38 @@ impl Workspace {
             repos_dir: root.join(".repos"),
             sessions_dir: root.join(".worktrees"),
             seeds_dir: root.join(".seeds"),
+            merges: None,
         }
+    }
+
+    /// Remember GitHub's answers in `file`, so that counting unsaved work on
+    /// a schedule asks about each commit once an hour at most, and never
+    /// again once it was merged.
+    pub fn remembering_merges(mut self, file: PathBuf) -> Self {
+        self.merges = Some(file);
+        self
+    }
+
+    /// Ask a stand-in on this machine in place of GitHub. Any other address
+    /// is ignored.
+    pub fn asking_github_at(mut self, url: &str) -> Self {
+        if let Some(url) = github::stand_in(url) {
+            self.config.github_api = url;
+        }
+        self
+    }
+
+    pub fn github_api(&self) -> &str {
+        &self.config.github_api
+    }
+
+    pub fn github_token_file(&self) -> Option<&Path> {
+        self.config.github_token_file.as_deref()
     }
 
     // ---- repositories -------------------------------------------------
 
-    fn remote_url(bare: &Path) -> String {
+    pub fn remote_url(bare: &Path) -> String {
         git::try_bare(bare, &["config", "--get", "remote.origin.url"])
             .map(|o| o.stdout)
             .unwrap_or_default()
@@ -506,12 +590,13 @@ impl Workspace {
         Ok(session)
     }
 
-    /// Reasons a worktree must not be deleted: anything that exists nowhere else.
-    pub fn unsafe_reasons(&self, child: &Path) -> Result<Vec<String>> {
-        let mut reasons = Vec::new();
-        if !git::tree(child, &["status", "--porcelain"])?.is_empty() {
-            reasons.push("uncommitted changes".to_string());
-        }
+    /// What a worktree holds that exists nowhere else.
+    pub fn unsaved(&self, child: &Path) -> Result<Unsaved> {
+        // The daemon asks this on a schedule, beside an agent that is using
+        // the same worktree. Without the optional lock, asking never makes
+        // the agent's own `git add` or `git commit` find the index locked.
+        let status = git::tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
+        let uncommitted = !status.is_empty();
         let upstream = git::try_tree(
             child,
             &[
@@ -523,28 +608,79 @@ impl Workspace {
         )?;
         if upstream.ok && !upstream.stdout.is_empty() {
             let ahead = git::tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?;
-            if ahead != "0" {
-                reasons.push(format!("{ahead} unpushed commit(s)"));
-            }
-        } else if git::tree(child, &["branch", "-r", "--contains", "HEAD"])?.is_empty() {
+            return Ok(Unsaved {
+                uncommitted,
+                unpushed: count(&ahead)?,
+                tracked: true,
+            });
+        }
+        let mut unpushed = 0;
+        if git::tree(child, &["branch", "-r", "--contains", "HEAD"])?.is_empty() {
             let common = git::tree(
                 child,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )?;
             let head = git::tree(child, &["rev-parse", "HEAD"])?;
             if !self.merged(Path::new(&common), &head) {
-                reasons.push("HEAD is not on any remote branch or merged pull request".to_string());
+                let alone = git::tree(
+                    child,
+                    &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+                )?;
+                // HEAD is on no remote branch, so it is one of them at least.
+                unpushed = count(&alone)?.max(1);
             }
         }
-        Ok(reasons)
+        Ok(Unsaved {
+            uncommitted,
+            unpushed,
+            tracked: false,
+        })
+    }
+
+    /// Reasons a worktree must not be deleted: anything that exists nowhere else.
+    pub fn unsafe_reasons(&self, child: &Path) -> Result<Vec<String>> {
+        Ok(self.unsaved(child)?.reasons())
     }
 
     fn merged(&self, bare: &Path, sha: &str) -> bool {
-        github::merged(
-            &Self::remote_url(bare),
-            sha,
-            self.config.github_token_file.as_deref(),
-        )
+        let remote = Self::remote_url(bare);
+        let ask = || {
+            github::merged(
+                &self.config.github_api,
+                &remote,
+                sha,
+                self.config.github_token_file.as_deref(),
+            )
+        };
+        let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(&remote)) else {
+            return ask();
+        };
+        let key = format!("{owner}/{repo}@{sha}");
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let mut asked: BTreeMap<String, Asked> = fs::read_to_string(file)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        match asked.get(&key) {
+            Some(answer) if answer.merged => return true,
+            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => return false,
+            _ => {}
+        }
+        let merged = ask();
+        asked.retain(|_, answer| now_s.saturating_sub(answer.at_s) < FORGET_AFTER_S);
+        asked.insert(
+            key,
+            Asked {
+                merged,
+                at_s: now_s,
+            },
+        );
+        if let Ok(text) = serde_json::to_string(&asked) {
+            let _ = paths::write_private(file, text.as_bytes());
+        }
+        merged
     }
 
     fn remove_one(&self, name: &str, info: &RepoInfo, force: bool) -> Result<()> {
@@ -714,7 +850,27 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_branch, valid_name};
+    use super::{valid_branch, valid_name, Unsaved};
+
+    #[test]
+    fn unsaved_work_is_put_in_the_words_a_refusal_uses() {
+        let unsaved = |uncommitted, unpushed, tracked| Unsaved {
+            uncommitted,
+            unpushed,
+            tracked,
+        };
+        assert!(unsaved(false, 0, true).is_saved());
+        assert!(unsaved(false, 0, false).reasons().is_empty());
+        assert_eq!(
+            unsaved(true, 2, true).reasons(),
+            ["uncommitted changes", "2 unpushed commit(s)"]
+        );
+        assert_eq!(
+            unsaved(false, 3, false).reasons(),
+            ["HEAD is not on any remote branch or merged pull request"]
+        );
+        assert!(!unsaved(true, 0, false).is_saved());
+    }
 
     #[test]
     fn names() {

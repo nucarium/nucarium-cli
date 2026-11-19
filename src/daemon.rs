@@ -1,21 +1,25 @@
 //! `nucleated run`: the heartbeat and the forwarder.
 //!
-//! One loop, ticking twice a second. Each tick it notices a changed config or
-//! token, sends a heartbeat when one is due, applies new spool files to the
-//! local session state, and sends what is worth sending. Housekeeping runs
-//! beside it in its own thread, so a long fetch never delays a heartbeat.
+//! One loop, ticking twice a second. Each tick it notices a changed config,
+//! token or maintenance pause, sends a heartbeat when one is due, applies new
+//! spool files to the local session state, and sends what is worth sending.
+//! Housekeeping and the reporter run beside it in threads of their own, so a
+//! long fetch or a slow `git status` never delays a heartbeat.
 //!
 //! Nothing here can make a session wait: the hooks only write files, and this
-//! loop only reads them.
+//! loop only reads them. And nothing here acts on an agent: the daemon
+//! reports and tidies, and starts, stops or pauses nothing.
 
 use crate::credentials::{self, Stored, Token};
-use crate::envelope::{rfc3339, unix_ms, Envelope};
+use crate::envelope::{rfc3339, unix_ms, Envelope, EventType};
 use crate::health;
-use crate::sessions::{self, Store};
-use crate::settings::{self, Settings, Target};
+use crate::notifier::{Notifier, Waiting};
+use crate::reporter::{self, Counts};
+use crate::sessions::{self, Status, Store};
+use crate::settings::{self, Environment, Settings, Target};
 use crate::spool::Spool;
-use crate::watch::{ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth};
-use crate::{housekeeping, paths};
+use crate::watch::{ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, UnsavedReport};
+use crate::{agent, housekeeping, paths, pause};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +27,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The numbers the loop runs on. Tests shorten them; the daemon uses the defaults.
 #[derive(Debug, Clone)]
@@ -124,6 +128,115 @@ fn log(line: &str) {
     eprintln!("nucleated: {line}");
 }
 
+/// A wait before a retry, spread by up to a fifth so boxes do not retry in step.
+pub(crate) fn jittered(wait: Duration, jitter: bool) -> Duration {
+    if !jitter {
+        return wait;
+    }
+    let mut byte = [0u8; 1];
+    let _ = getrandom::fill(&mut byte);
+    wait + wait.mul_f64(f64::from(byte[0]) / 255.0 * 0.2)
+}
+
+fn at_ms(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// What a heartbeat says about one environment: whether its agent server is
+/// alive and how often its supervisor has restarted it, what the reporter
+/// last counted in its nucleus, and whatever its agent's adapter can read
+/// about the login and the version. Where a thing is not known, an adapter
+/// that cannot read it or a count not yet made, the heartbeat says nothing.
+fn environment_report(
+    environment: &Environment,
+    counts: Option<&Counts>,
+    now: SystemTime,
+) -> EnvironmentReport {
+    let adapter = agent::by_name(&environment.agent);
+    let nucleus = counts.and_then(|counts| counts.nucleus(&environment.name));
+    let counted_at = counts.map(|counts| at_ms(counts.counted_at_ms));
+    let unsaved = nucleus
+        .and_then(|nucleus| nucleus.unsaved)
+        .zip(counted_at)
+        .and_then(|(counted, at)| {
+            UnsavedReport::new(counted.uncommitted_repos, counted.unpushed_commits, at, now)
+        });
+    EnvironmentReport::new(
+        &environment.name,
+        health::server_alive(environment),
+        adapter.and_then(|adapter| adapter.version(environment)),
+        adapter.and_then(|adapter| adapter.login_expires_at(environment.config_dir.as_deref())),
+        now,
+    )
+    .with_restarts(health::server_restarts(environment))
+    .with_unsaved(unsaved)
+    .with_snapshot(
+        nucleus
+            .and_then(|nucleus| nucleus.last_snapshot_ms)
+            .map(at_ms),
+        now,
+    )
+}
+
+/// The whole box's unsaved work, each nucleus counted once, and the time
+/// since which every nucleus has had a good snapshot. Each is nothing unless
+/// it is known for every environment: a total that leaves a nucleus out
+/// would read as less than there is.
+fn machine_totals(settings: &Settings, counts: &Counts) -> (Option<(u64, u64)>, Option<u64>) {
+    let nuclei: Option<Vec<_>> = settings
+        .environments
+        .iter()
+        .map(|environment| counts.nucleus(&environment.name))
+        .collect();
+    let Some(mut nuclei) = nuclei.filter(|nuclei| !nuclei.is_empty()) else {
+        return (None, None);
+    };
+    // Environments that share a nucleus found the same entry.
+    nuclei.sort_by_key(|nucleus| &nucleus.environments);
+    nuclei.dedup_by_key(|nucleus| &nucleus.environments);
+    let unsaved = nuclei.iter().map(|nucleus| nucleus.unsaved).try_fold(
+        (0u64, 0u64),
+        |(uncommitted, unpushed), counted| {
+            counted.map(|counted| {
+                (
+                    uncommitted + counted.uncommitted_repos,
+                    unpushed + counted.unpushed_commits,
+                )
+            })
+        },
+    );
+    let snapshot = nuclei
+        .iter()
+        .map(|nucleus| nucleus.last_snapshot_ms)
+        .try_fold(u64::MAX, |oldest, at| at.map(|at| oldest.min(at)));
+    (unsaved, snapshot)
+}
+
+/// Everything a heartbeat says, sampled now. Each probe only asks, with a
+/// time limit, and one that gets no answer leaves its field out. The
+/// unsaved counts are read from the file the reporter writes: a heartbeat
+/// never runs git.
+///
+/// `nucleated check` and `nucleated status` build theirs here too. A heartbeat
+/// is the whole truth about the box, so a thinner one would tell Watch that
+/// what it left out is no longer so.
+pub fn heartbeat(settings: &Settings, now: SystemTime) -> Heartbeat {
+    let counts = reporter::read_counts(settings);
+    let (unsaved, snapshot) = counts
+        .as_ref()
+        .map_or((None, None), |counts| machine_totals(settings, counts));
+    let machine = health::sample(&settings.environments, settings.ups.as_deref())
+        .with_unsaved(unsaved)
+        .with_snapshot(snapshot.map(at_ms), now);
+    let environments = settings
+        .environments
+        .iter()
+        .map(|environment| environment_report(environment, counts.as_ref(), now))
+        .collect();
+    Heartbeat::new(machine, environments, now)
+        .with_pause(pause::until(&settings.state_dir, now), now)
+}
+
 pub struct Daemon {
     settings: Settings,
     settings_stamp: Option<SystemTime>,
@@ -159,6 +272,13 @@ pub struct Daemon {
     started_at: String,
     written: Option<String>,
     last_prune: Option<Instant>,
+
+    /// The pause file as last seen. Pausing or resuming changes it, and the
+    /// next heartbeat then goes at once.
+    pause_stamp: Option<SystemTime>,
+    notifier: Notifier,
+    /// The name Watch knows this box by, for what the box posts itself.
+    machine_name: Option<String>,
 }
 
 impl Daemon {
@@ -167,6 +287,9 @@ impl Daemon {
             settings_stamp: modified(&settings.path),
             spool: Spool::new(&settings.spool_dir),
             sessions: Store::new(&settings.state_dir),
+            pause_stamp: modified(&pause::file(&settings.state_dir)),
+            notifier: Notifier::new(&settings.state_dir),
+            machine_name: None,
             heartbeat: HeartbeatState {
                 interval_s: settings.heartbeat_interval.as_secs(),
                 ..HeartbeatState::default()
@@ -213,6 +336,10 @@ impl Daemon {
                 log("config changed; reloaded");
                 self.spool = Spool::new(&settings.spool_dir);
                 self.sessions = Store::new(&settings.state_dir);
+                if settings.state_dir != self.settings.state_dir {
+                    self.pause_stamp = modified(&pause::file(&settings.state_dir));
+                    self.notifier = Notifier::new(&settings.state_dir);
+                }
                 self.settings = settings;
                 self.token_checked = false;
                 self.next_heartbeat = None;
@@ -241,6 +368,7 @@ impl Daemon {
             }
             Err(_) => (None, "unreadable", None),
         };
+        self.machine_name = login.as_ref().and_then(|login| login.machine_name.clone());
         let api_url = token.as_ref().map(|_| {
             login
                 .map(|login| login.api_url)
@@ -274,37 +402,33 @@ impl Daemon {
             .max(self.server_interval.unwrap_or_default())
     }
 
+    /// A pause set or ended on the box is told to Watch at once, not at the
+    /// next beat: the person who typed it is about to pull a plug.
+    fn notice_pause(&mut self) {
+        let stamp = modified(&pause::file(&self.settings.state_dir));
+        if stamp != self.pause_stamp {
+            self.pause_stamp = stamp;
+            self.next_heartbeat = None;
+        }
+    }
+
     /// Sample the machine and its agent servers and, when signed in, tell Watch.
     fn beat(&mut self, now: Instant) {
         let wall = SystemTime::now();
         let stamp = rfc3339(wall);
-        let machine = health::sample(&self.settings.environments);
-        self.environments = self
-            .settings
+        let body = heartbeat(&self.settings, wall);
+        self.environments = body
             .environments
             .iter()
-            .map(|env| EnvironmentState {
-                name: env.name.clone(),
-                server_alive: health::server_alive(env),
+            .map(|report| EnvironmentState {
+                name: report.env_id.clone(),
+                server_alive: report.server_alive,
                 checked_at: stamp.clone(),
             })
             .collect();
-        self.machine = Some(machine.clone());
+        self.machine = Some(body.machine.clone());
         let mut wait = self.interval();
         if let (true, Some(client), Some(token)) = (self.hosted(), &self.client, &self.token) {
-            let body = Heartbeat {
-                machine,
-                environments: self
-                    .environments
-                    .iter()
-                    .map(|env| EnvironmentReport {
-                        env_id: env.name.clone(),
-                        server_alive: env.server_alive,
-                    })
-                    .collect(),
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                client_ts: stamp.clone(),
-            };
             self.heartbeat.last_attempt_at = Some(stamp.clone());
             match client.heartbeat(token, &body) {
                 Ok(ack) => {
@@ -320,6 +444,9 @@ impl Daemon {
                     self.token_rejected = false;
                     self.retry_at = None;
                     self.backoff = self.timings.backoff_min;
+                    if self.settings.notify.is_some() {
+                        self.notifier.heartbeat_accepted(now, wall);
+                    }
                     wait = self.interval();
                 }
                 Err(failure) => {
@@ -328,6 +455,16 @@ impl Daemon {
                     }
                     self.heartbeat.last_error = Some(failure.kind().to_string());
                     self.token_rejected |= failure == ApiError::Unauthorized;
+                    // A refused token and a request to slow down are both
+                    // answers: Watch is there. Anything else is not hearing
+                    // from it.
+                    let answered = matches!(
+                        failure,
+                        ApiError::Unauthorized | ApiError::RateLimited { .. }
+                    );
+                    if self.settings.notify.is_some() {
+                        self.notifier.heartbeat_failed(!answered, now, wall);
+                    }
                     // Try again sooner than the next beat, but ever less often.
                     let sooner =
                         Duration::from_secs(5).saturating_mul(1 << self.heartbeat_failures.min(10));
@@ -362,9 +499,28 @@ impl Daemon {
             let previous = self
                 .sessions
                 .load(&record.event.env_id, &record.event.session_id);
-            let applied = sessions::apply(previous, &record);
+            let Some(applied) = sessions::apply(previous, &record) else {
+                // An outcome for a session the box does not know.
+                self.spool.remove(&id);
+                continue;
+            };
             if applied.changed {
                 let _ = self.sessions.save(&applied.session);
+                // A session in a nucleus has stopped or ended: ask the
+                // reporter what it left behind. The reporter runs the git;
+                // this loop only leaves the note.
+                let finished = matches!(
+                    record.event.kind,
+                    EventType::Stop | EventType::StopFailure | EventType::SessionEnd
+                );
+                if finished && applied.session.workspace.is_some() {
+                    reporter::ask(
+                        &self.settings.state_dir,
+                        &applied.session.env,
+                        &applied.session.session_id,
+                        SystemTime::now(),
+                    );
+                }
             }
             if applied.forward && hosted {
                 self.pending.insert(
@@ -438,12 +594,55 @@ impl Daemon {
     fn next_backoff(&mut self) -> Duration {
         let wait = self.backoff;
         self.backoff = (self.backoff * 2).min(self.timings.backoff_max);
-        if !self.timings.jitter {
-            return wait;
+        jittered(wait, self.timings.jitter)
+    }
+
+    /// The sessions waiting on their owner that Watch has not heard about:
+    /// those with a "needs input" event still unsent, and still waiting.
+    fn unheard_waits(&self) -> Vec<Waiting> {
+        let mut seen = BTreeSet::new();
+        self.pending
+            .values()
+            .map(|pending| &pending.envelope)
+            .filter(|event| event.kind.needs_input())
+            .filter(|event| seen.insert((&event.env_id, &event.session_id)))
+            .filter_map(|event| {
+                let session = self.sessions.load(&event.env_id, &event.session_id)?;
+                (session.status == Status::NeedsInput).then_some(Waiting {
+                    env: session.env,
+                    session_id: session.session_id,
+                    since_ms: session.needs_since_ms?,
+                })
+            })
+            .collect()
+    }
+
+    /// Let the box speak for itself while Watch cannot be reached. Off
+    /// unless the config gives it an address, and silent on a box that does
+    /// not report to Watch: such a box has no Watch to lose.
+    fn notify(&mut self, now: Instant) {
+        let hosted = self.hosted();
+        let target = self.settings.notify.as_ref().filter(|_| hosted);
+        // No outage and nothing owed: every tick but a few, and it costs nothing.
+        if target.is_some() && self.notifier.is_idle() {
+            return;
         }
-        let mut byte = [0u8; 1];
-        let _ = getrandom::fill(&mut byte);
-        wait + wait.mul_f64(f64::from(byte[0]) / 255.0 * 0.2)
+        let waiting = match target.is_some() && self.notifier.tells_waits() {
+            true => self.unheard_waits(),
+            false => Vec::new(),
+        };
+        let machine = target
+            .and(self.machine_name.clone())
+            .or_else(|| target.and_then(|_| settings::machine_name(&self.settings)))
+            .unwrap_or_else(|| "This box".to_string());
+        self.notifier.tick(
+            target,
+            &machine,
+            &waiting,
+            &self.timings,
+            now,
+            SystemTime::now(),
+        );
     }
 
     /// Send one batch. `Ok` means every event in it is dealt with, delivered
@@ -559,12 +758,14 @@ impl Daemon {
     pub fn tick(&mut self, now: Instant) {
         self.reload_settings();
         self.reload_token();
+        self.notice_pause();
         if self.next_heartbeat.is_none_or(|due| now >= due) {
             self.beat(now);
         }
         self.take_in(now);
         self.enforce_limits();
         self.flush(now);
+        self.notify(now);
         self.prune(now);
     }
 
@@ -631,6 +832,11 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
         let path = settings.path.clone();
         std::thread::spawn(move || housekeeping::run_schedule(&path, &stop))
     };
+    let reporter = {
+        let stop = stop.clone();
+        let path = settings.path.clone();
+        std::thread::spawn(move || reporter::run_schedule(&path, &stop))
+    };
     let timings = Timings::default();
     let tick = timings.tick;
     let mut daemon = Daemon::new(settings, timings);
@@ -641,8 +847,10 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
     }
     daemon.write_state(false);
     log("stopped");
-    // Housekeeping may be in the middle of a fetch; it stops at the next
-    // job boundary, and nothing it does is left half-written.
+    // Housekeeping may be in the middle of a fetch, and the reporter of a
+    // count; each stops at its next boundary, and nothing either does is
+    // left half-written.
     drop(keeper);
+    drop(reporter);
     Ok(())
 }

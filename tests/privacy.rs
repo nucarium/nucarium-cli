@@ -7,15 +7,102 @@
 //! found nowhere: not in the spool, not in the local state, not in anything
 //! the hook prints, and not in any request the daemon makes.
 //!
+//! The same is done for what the box finds out by itself. A session's
+//! repository is given a commit subject, file names and file contents full
+//! of the sentinel, and a stand-in for GitHub describes its pull request with
+//! the sentinel in the title, the body, the branch and the author. What then
+//! leaves is counts, times and one address, and what the box posts to its
+//! owner's own address while Watch is unreachable is names and times.
+//!
 //! If this test fails, content can leave the box. Do not release.
 
 mod common;
 
-use common::{files_under, run, Mock, Reply, Request, Rig};
+use common::{contract, files_under, run, Mock, Reply, Request, Rig};
 use nucleate::daemon::{Daemon, Timings};
+use nucleate::envelope::rfc3339;
+use nucleate::reporter::Reporter;
+use nucleate::watch::{EnvironmentReport, Heartbeat, MachineHealth, UnsavedReport};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+/// Every field an event may carry. There is no other.
+const EVENT_FIELDS: [&str; 14] = [
+    "event_id",
+    "env_id",
+    "session_id",
+    "bridge_session_id",
+    "type",
+    "repos",
+    "branch",
+    "error_kind",
+    "limit_resets_at",
+    "commits",
+    "uncommitted_repos",
+    "unpushed_commits",
+    "pull_requests",
+    "client_ts",
+];
+
+/// Every field a heartbeat may carry, at its top, about the machine, about
+/// an environment and about an environment's unsaved work.
+const HEARTBEAT_FIELDS: [&str; 6] = [
+    "machine",
+    "environments",
+    "daemon_version",
+    "activity_beat_s",
+    "paused_until",
+    "client_ts",
+];
+const MACHINE_FIELDS: [&str; 9] = [
+    "disk_used_pct",
+    "load_1m",
+    "uptime_s",
+    "memory_pressure_pct",
+    "on_battery",
+    "reboot_required",
+    "uncommitted_repos",
+    "unpushed_commits",
+    "last_snapshot_at",
+];
+const ENVIRONMENT_FIELDS: [&str; 7] = [
+    "env_id",
+    "server_alive",
+    "server_restarts",
+    "agent_version",
+    "login_expires_at",
+    "last_snapshot_at",
+    "unsaved",
+];
+const UNSAVED_FIELDS: [&str; 3] = ["uncommitted_repos", "unpushed_commits", "counted_at"];
+
+/// Every key of every object the box sent is one this file lists.
+fn only_listed_fields(mock: &Mock) {
+    let listed = |what: &str, object: &Value, fields: &[&str]| {
+        for key in object.as_object().expect("an object").keys() {
+            assert!(fields.contains(&key.as_str()), "{what} carried {key}");
+        }
+    };
+    for request in mock.to(contract::EVENTS) {
+        let body = request.json();
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        for event in body["events"].as_array().unwrap() {
+            listed("an event", event, &EVENT_FIELDS);
+        }
+    }
+    for request in mock.to(contract::HEARTBEATS) {
+        let body = request.json();
+        listed("the heartbeat", &body, &HEARTBEAT_FIELDS);
+        listed("the machine", &body["machine"], &MACHINE_FIELDS);
+        for environment in body["environments"].as_array().unwrap() {
+            listed("an environment", environment, &ENVIRONMENT_FIELDS);
+            if let Some(unsaved) = environment.get("unsaved") {
+                listed("unsaved", unsaved, &UNSAVED_FIELDS);
+            }
+        }
+    }
+}
 
 /// The sentinel. It appears in every value that must stay on the box.
 const MARK: &str = "ZZLEAKZZ";
@@ -136,6 +223,19 @@ fn payload(event: &str, cwd: &Path, allowed: &Value) -> Value {
         "notification_type": mark("notification_type"),
         "something_added_next_year": { "deep": [mark("a field that does not exist yet")] },
     });
+    // Where an agent might one day say when a limit resets, when its login
+    // runs out, or which version it is. None is a field the box reads.
+    for field in [
+        "limit_resets_at",
+        "resets_at",
+        "retry_after",
+        "login_expires_at",
+        "expires_at",
+        "agent_version",
+        "version",
+    ] {
+        payload[field] = json!(mark(field));
+    }
     // The one short field the adapter may read for this event, set to a real
     // value. Everything else keeps its sentinel.
     for (key, value) in allowed.as_object().cloned().unwrap_or_default() {
@@ -178,6 +278,8 @@ fn leaks_on_disk(dir: &Path) -> Vec<String> {
 
 fn watch() -> Mock {
     Mock::start(|request: &Request| match request.path.as_str() {
+        // As Watch does, refuse anything the contract does not allow.
+        _ if contract::violation(request).is_some() => Reply::problem(400, "validation_failed"),
         "/v1/heartbeats:ingest" => Reply::json(
             200,
             json!({ "received_at": "2026-11-19T12:00:00.000Z", "heartbeat_interval_s": 60 }),
@@ -220,7 +322,7 @@ fn the_sentinel_fixture_would_catch_a_leak() {
     // really is full of the sentinel, and the scanner really finds it.
     let fixture = payload("PostToolUse", Path::new("/x"), &json!({})).to_string();
     assert!(
-        fixture.matches(MARK).count() >= 35,
+        fixture.matches(MARK).count() >= 42,
         "the fixture lost its sentinels"
     );
     for field in [
@@ -237,6 +339,9 @@ fn the_sentinel_fixture_would_catch_a_leak() {
         "compact_summary",
         "custom_instructions",
         "file_path",
+        "limit_resets_at",
+        "login_expires_at",
+        "agent_version",
     ] {
         assert!(
             fixture.contains(&format!("\"{field}\"")),
@@ -292,27 +397,18 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
         mock.to("/v1/heartbeats:ingest").len() == 1 && !mock.to("/v1/events:ingest").is_empty()
     );
     assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+    // Nothing sent was something Watch would refuse: no unknown field, and
+    // every value inside its pattern or range.
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
 
-    // Every field sent is one the envelope names. There is no other.
-    let allowed = [
-        "event_id",
-        "env_id",
-        "session_id",
-        "bridge_session_id",
-        "type",
-        "repos",
-        "branch",
-        "error_kind",
-        "client_ts",
-    ];
+    // Every field sent is one the envelope and the heartbeat name.
+    only_listed_fields(&mock);
     let mut types = std::collections::BTreeSet::new();
     for request in mock.to("/v1/events:ingest") {
-        let body = request.json();
-        assert_eq!(body.as_object().unwrap().len(), 1);
-        for event in body["events"].as_array().unwrap() {
-            for key in event.as_object().unwrap().keys() {
-                assert!(allowed.contains(&key.as_str()), "an event carried {key}");
-            }
+        for event in request.json()["events"].as_array().unwrap() {
+            // Claude Code's hook names no reset time, so none is sent,
+            // whatever the payload held under a name like one.
+            assert!(event.get("limit_resets_at").is_none());
             types.insert(event["type"].as_str().unwrap().to_string());
         }
     }
@@ -331,8 +427,12 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
         assert!(types.contains(kind), "no {kind} event was sent");
     }
     let heartbeat = mock.to("/v1/heartbeats:ingest")[0].json();
-    for key in heartbeat.as_object().unwrap().keys() {
-        assert!(["machine", "environments", "daemon_version", "client_ts"].contains(&key.as_str()));
+    // A number of seconds, and nothing else.
+    assert_eq!(heartbeat["activity_beat_s"], 300);
+    for environment in heartbeat["environments"].as_array().unwrap() {
+        // Claude Code gives the box neither to read, so neither is sent.
+        assert!(environment.get("agent_version").is_none());
+        assert!(environment.get("login_expires_at").is_none());
     }
 
     // The local state the daemon keeps: sessions, its own state, anything set aside.
@@ -425,6 +525,440 @@ fn content_where_a_short_word_belongs_is_dropped_not_sent() {
     tick(&rig);
     assert!(!mock.everything().contains(MARK));
     assert_eq!(leaks_on_disk(&rig.home.state_dir()), Vec::<String>::new());
+}
+
+#[test]
+fn the_new_fields_hold_a_time_a_number_or_a_short_word_and_never_a_sentence() {
+    let sentence = format!("{MARK} this is a sentence, not a value");
+    let now = SystemTime::now();
+
+    // `agent_version` and `login_expires_at`: whatever an agent's adapter
+    // hands over, a heartbeat takes a short version string and a time near
+    // now, and leaves anything else out.
+    let report = |version: &str, expires: SystemTime| {
+        EnvironmentReport::new(
+            "client-a",
+            true,
+            Some(version.to_string()),
+            Some(expires),
+            now,
+        )
+    };
+    let wordy = report(&sentence, now + Duration::from_secs(86_400 * 3_650));
+    assert_eq!(wordy.agent_version, None);
+    assert_eq!(wordy.login_expires_at, None);
+    let known = report("2.1.0", now + Duration::from_secs(86_400));
+    let machine = MachineHealth {
+        disk_used_pct: 41.5,
+        load_1m: 0.62,
+        uptime_s: 864_000,
+        ..MachineHealth::default()
+    };
+    let body = serde_json::to_value(Heartbeat::new(machine, vec![wordy, known], now)).unwrap();
+    assert!(!body.to_string().contains(MARK));
+    assert_eq!(
+        body["environments"],
+        json!([
+            { "env_id": "client-a", "server_alive": true },
+            {
+                "env_id": "client-a", "server_alive": true, "agent_version": "2.1.0",
+                "login_expires_at": rfc3339(now + Duration::from_secs(86_400)),
+            },
+        ])
+    );
+    // `activity_beat_s`: a number the daemon is built with.
+    assert_eq!(body["activity_beat_s"], 300);
+
+    // `limit_resets_at`: an event read back from the spool with words where
+    // the time belongs is set aside, not sent. A spool file is the only way
+    // to put words there: the envelope is built from a time, not a string.
+    let rig = Rig::new();
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    let mut daemon = Daemon::new(
+        rig.settings(),
+        Timings {
+            jitter: false,
+            ..Timings::default()
+        },
+    );
+    daemon.tick(Instant::now());
+    let id = "0193f2a0-0000-7000-8000-00000000beef";
+    let spool = rig.spool_dir();
+    std::fs::create_dir_all(&spool).unwrap();
+    std::fs::write(
+        spool.join(format!("{id}.json")),
+        json!({
+            "event": {
+                "event_id": id, "env_id": "client-a", "session_id": SESSION,
+                "type": "stop_failure", "error_kind": "rate_limit",
+                "limit_resets_at": sentence, "client_ts": rfc3339(now),
+            },
+            "at_ms": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    daemon.tick(Instant::now() + Duration::from_secs(1));
+    daemon.tick(Instant::now() + Duration::from_secs(30));
+    assert!(mock.to("/v1/events:ingest").is_empty());
+    assert!(!mock.everything().contains(MARK));
+    assert!(rig.spooled().is_empty());
+    assert_eq!(files_under(&spool.join("rejected")).len(), 1);
+    assert!(files_under(&rig.home.state_dir().join("sessions")).is_empty());
+}
+
+/// A stand-in for GitHub whose every answer is full of the sentinel, around
+/// one address that is an address.
+fn github_full_of_content() -> Mock {
+    common::github(|slug, sha| {
+        let mark = |field: &str| format!("{MARK} {field} written by a person");
+        let pull = |html_url: String| {
+            json!({
+                "html_url": html_url,
+                "url": format!("https://api.github.com/repos/{slug}/pulls/1?{MARK}_api_url"),
+                "state": "open",
+                "merged_at": null,
+                "title": mark("pull request title"),
+                "body": mark("pull request body"),
+                "user": { "login": mark("pull request author") },
+                "labels": [{ "name": mark("label"), "description": mark("label description") }],
+                "head": {
+                    "sha": sha,
+                    "ref": format!("{MARK}/pull-request-branch"),
+                    "label": mark("head label"),
+                    "repo": { "description": mark("repository description") },
+                },
+                "base": { "ref": format!("{MARK}/base-branch") },
+            })
+        };
+        Reply::json(
+            200,
+            json!([
+                pull(format!("https://github.com/{slug}/pull/412")),
+                // An address with anything more in it is not an address.
+                pull(format!("https://github.com/{slug}/pull/413?title={MARK}")),
+                pull(format!("https://github.com/{slug}/pull/414#{MARK}")),
+                pull(format!("https://github.com/{slug}/pull/{MARK}")),
+                pull(format!("https://github.com/{slug}/pull/415/{MARK}")),
+                pull(format!("https://github.com/{MARK}/web/pull/416")),
+                pull(mark("pull request address")),
+            ]),
+        )
+    })
+}
+
+#[test]
+fn what_a_session_left_behind_leaves_the_box_as_counts_times_and_one_address() {
+    let (rig, cwd) = {
+        let rig = Rig::under(&format!("{MARK}_parent_folder"));
+        rig.as_github("your-org/web");
+        let worktree = rig.session("fix-login");
+        let cwd = worktree.join("src").join(format!("{MARK}_subfolder"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        (rig, cwd)
+    };
+    let worktree = rig.root.join(".worktrees/fix-login/web");
+    let content = |what: &str| format!("{MARK} {what} written by the agent\n");
+
+    // A commit whose subject, body, file name and file contents all carry
+    // the sentinel, pushed, so that there is a pull request to ask about.
+    std::fs::write(
+        worktree.join(format!("{MARK}_committed_file.rs")),
+        content("committed file content"),
+    )
+    .unwrap();
+    common::git(&worktree, &["add", "."]);
+    let message = format!("{MARK} commit subject\n\n{MARK} commit body");
+    common::git(&worktree, &["commit", "-q", "-m", &message]);
+    common::git(&worktree, &["push", "-q", "-u", "origin", "HEAD"]);
+    // Work that is not committed: an untracked file and a changed one.
+    std::fs::write(
+        worktree.join(format!("{MARK}_untracked_file.txt")),
+        content("untracked file content"),
+    )
+    .unwrap();
+    std::fs::write(worktree.join("README.md"), content("changed file content")).unwrap();
+    // The net has no holes: git really would hand all of it over.
+    assert!(
+        common::git(&worktree, &["log", "-1", "--format=%s%n%b"])
+            .matches(MARK)
+            .count()
+            == 2
+    );
+    assert!(common::git(&worktree, &["status", "--porcelain"]).contains(MARK));
+    assert!(common::git(&worktree, &["diff"]).contains(MARK));
+
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    let stub = github_full_of_content();
+    for (event, allowed) in events() {
+        hook(&rig, event, &payload(event, &cwd, &allowed));
+    }
+    let mut daemon = Daemon::new(
+        rig.settings(),
+        Timings {
+            jitter: false,
+            ..Timings::default()
+        },
+    );
+    let start = Instant::now();
+    daemon.tick(start);
+    // The reporter counts the nucleus's unsaved work and looks at what the
+    // session left, asking the stand-in about its pull requests.
+    Reporter::default()
+        .asking_github_at(&stub.url)
+        .tick(&rig.settings(), SystemTime::now() + Duration::from_secs(11));
+    assert_eq!(
+        stub.requests().len(),
+        1,
+        "GitHub was not asked, so nothing was proved"
+    );
+    daemon.tick(start + Duration::from_secs(30));
+    daemon.tick(start + Duration::from_secs(61));
+    daemon.write_state(true);
+
+    // What left: the counts, the times and the one address.
+    let outcomes: Vec<Value> = mock
+        .to(contract::EVENTS)
+        .iter()
+        .flat_map(|request| request.json()["events"].as_array().cloned().unwrap())
+        .filter(|event| event["type"] == "outcome")
+        .collect();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0]["commits"], 1);
+    assert_eq!(outcomes[0]["uncommitted_repos"], 1);
+    assert_eq!(outcomes[0]["unpushed_commits"], 0);
+    assert_eq!(
+        outcomes[0]["pull_requests"],
+        json!(["https://github.com/your-org/web/pull/412"])
+    );
+    assert_eq!(outcomes[0]["repos"], json!(["your-org/web"]));
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 2);
+    let counted = &beats[1].json()["environments"][0]["unsaved"];
+    assert_eq!(counted["uncommitted_repos"], 1);
+    assert_eq!(counted["unpushed_commits"], 0);
+    assert_eq!(beats[1].json()["machine"]["uncommitted_repos"], 1);
+
+    let sent = mock.everything();
+    assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    only_listed_fields(&mock);
+    // What the box keeps: the count, the marker, the session and its outcome.
+    assert_eq!(
+        leaks_on_disk(&rig.home.state_dir()),
+        Vec::<String>::new(),
+        "content in the local state"
+    );
+    let status = run(rig.nucleated().args(["status", "--json"]), "");
+    let mut shown: Value = serde_json::from_slice(&status.stdout).unwrap();
+    // The nucleus path is the owner's own config, shown back to them.
+    shown["environments"] = json!([]);
+    assert!(!shown.to_string().contains(MARK), "{shown}");
+}
+
+#[test]
+fn what_the_box_posts_for_itself_is_names_and_times() {
+    let (rig, cwd) = rig();
+    // Watch does not answer, and the owner's own address does.
+    let mock = Mock::start(|_: &Request| Reply::problem(503, "internal_error"));
+    let ntfy = Mock::start(|_: &Request| Reply::json(200, json!({})));
+    rig.sign_in(&mock.url);
+    rig.configure(&format!(
+        "[notify]\nurl = \"{}/your-private-topic\"\nafter = \"2m\"\n",
+        ntfy.url
+    ));
+    for (event, allowed) in events() {
+        hook(&rig, event, &payload(event, &cwd, &allowed));
+    }
+    // One more session, left waiting on its owner with a prompt full of content.
+    let mut waiting = payload(
+        "Notification",
+        &cwd,
+        &json!({ "notification_type": "permission_prompt" }),
+    );
+    waiting["session_id"] = json!("0c9d8e7a-58b4-4d0c-9a6e-7f3c2a1e2b1f");
+    hook(&rig, "Notification", &waiting);
+
+    let mut daemon = Daemon::new(
+        rig.settings(),
+        Timings {
+            jitter: false,
+            http_timeout: Duration::from_secs(2),
+            ..Timings::default()
+        },
+    );
+    let start = Instant::now();
+    for later in [0, 120, 121, 122, 300] {
+        daemon.tick(start + Duration::from_secs(later));
+    }
+    daemon.write_state(true);
+
+    let posts = ntfy.requests();
+    let kinds: Vec<&str> = posts
+        .iter()
+        .map(|post| post.header("x-nucarium-alert-kind").unwrap())
+        .collect();
+    assert_eq!(kinds, ["box_watch_unreachable", "box_session_waiting"]);
+    let posted = ntfy.everything();
+    assert!(!posted.contains(MARK), "content in a post:\n{posted}");
+    for post in &posts {
+        // The machine's name, the environment's name and a time.
+        assert!(post.body.contains(" UTC"), "{}", post.body);
+        for (name, _) in &post.headers {
+            let name = name.to_ascii_lowercase();
+            assert!(
+                [
+                    "host",
+                    "user-agent",
+                    "accept",
+                    "accept-encoding",
+                    "connection",
+                    "content-length",
+                    "content-type",
+                    "title",
+                    "priority",
+                    "tags",
+                    "x-nucarium-alert-kind",
+                ]
+                .contains(&name.as_str()),
+                "a post carried the header {name}"
+            );
+        }
+    }
+    assert_eq!(
+        posts[1].header("title"),
+        Some("An agent on client-a is waiting for you")
+    );
+    // Nothing went to Watch but the two requests it has always been sent,
+    // and nothing the box wrote down about the outage holds content.
+    assert!(!mock.everything().contains(MARK));
+    assert!(mock
+        .requests()
+        .iter()
+        .all(|request| [contract::HEARTBEATS, contract::EVENTS].contains(&request.path.as_str())));
+    assert_eq!(leaks_on_disk(&rig.home.state_dir()), Vec::<String>::new());
+}
+
+#[test]
+fn a_count_a_time_or_an_address_with_words_in_it_is_never_sent() {
+    let sentence = format!("{MARK} this is a sentence, not a value");
+    let now = SystemTime::now();
+
+    // The heartbeat's new fields are numbers, yes-or-noes and times by
+    // their types: there is no string among them to put a sentence in.
+    let report = EnvironmentReport::new("client-a", true, None, None, now)
+        .with_restarts(Some(4))
+        .with_unsaved(UnsavedReport::new(2, 5, now, now))
+        .with_snapshot(Some(now), now);
+    let machine = MachineHealth {
+        on_battery: Some(true),
+        reboot_required: Some(false),
+        ..MachineHealth::default()
+    }
+    .with_unsaved(Some((2, 5)))
+    .with_snapshot(Some(now), now);
+    let body = serde_json::to_value(
+        Heartbeat::new(machine, vec![report], now)
+            .with_pause(Some(now + Duration::from_secs(600)), now),
+    )
+    .unwrap();
+    let stamp = |value: &Value| value.as_str().is_some_and(|s| s.len() == 24);
+    assert!(body["machine"]["on_battery"].is_boolean());
+    assert!(body["machine"]["reboot_required"].is_boolean());
+    assert!(body["machine"]["uncommitted_repos"].is_u64());
+    assert!(body["machine"]["unpushed_commits"].is_u64());
+    assert!(stamp(&body["machine"]["last_snapshot_at"]));
+    assert!(stamp(&body["paused_until"]));
+    let environment = &body["environments"][0];
+    assert!(environment["server_restarts"].is_u64());
+    assert!(stamp(&environment["last_snapshot_at"]));
+    assert!(environment["unsaved"]["uncommitted_repos"].is_u64());
+    assert!(environment["unsaved"]["unpushed_commits"].is_u64());
+    assert!(stamp(&environment["unsaved"]["counted_at"]));
+
+    // The files a heartbeat reads are the box's own, and something else may
+    // have written to them. Words where a number or a time belongs make the
+    // file no count, no pause and no record of a snapshot.
+    let rig = Rig::new();
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    let state = rig.home.state_dir();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("unsaved.json"),
+        json!({
+            "counted_at_ms": 1,
+            "nuclei": [{
+                "environments": ["client-a"],
+                "unsaved": { "uncommitted_repos": sentence, "unpushed_commits": 0 },
+                "last_snapshot_ms": sentence,
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("pause.json"),
+        json!({ "until_ms": sentence, "until": sentence, "set_at": sentence }).to_string(),
+    )
+    .unwrap();
+    let mut daemon = Daemon::new(
+        rig.settings(),
+        Timings {
+            jitter: false,
+            ..Timings::default()
+        },
+    );
+    daemon.tick(Instant::now());
+    let beat = mock.to(contract::HEARTBEATS)[0].json();
+    assert!(beat.get("paused_until").is_none());
+    assert!(beat["environments"][0].get("unsaved").is_none());
+    assert!(beat["environments"][0].get("last_snapshot_at").is_none());
+    assert!(beat["machine"].get("uncommitted_repos").is_none());
+
+    // An outcome read back from the spool with words where an address or a
+    // count belongs, or with a field the envelope does not have, is set
+    // aside and never sent.
+    let spool = rig.spool_dir();
+    std::fs::create_dir_all(&spool).unwrap();
+    let outcome = |id: &str, change: &dyn Fn(&mut Value)| {
+        let mut event = json!({
+            "event_id": id, "env_id": "client-a", "session_id": SESSION,
+            "type": "outcome", "repos": ["your-org/web"], "client_ts": rfc3339(now),
+        });
+        change(&mut event);
+        std::fs::write(
+            spool.join(format!("{id}.json")),
+            json!({ "event": event, "at_ms": 1 }).to_string(),
+        )
+        .unwrap();
+    };
+    outcome("0193f2a0-0000-7000-8000-00000000be01", &|event| {
+        event["pull_requests"] = json!([sentence]);
+    });
+    outcome("0193f2a0-0000-7000-8000-00000000be02", &|event| {
+        event["pull_requests"] = json!([format!(
+            "https://github.com/your-org/web/pull/412?title={MARK}"
+        )]);
+    });
+    outcome("0193f2a0-0000-7000-8000-00000000be03", &|event| {
+        event["commits"] = json!(sentence);
+    });
+    outcome("0193f2a0-0000-7000-8000-00000000be04", &|event| {
+        event["pull_request_titles"] = json!([sentence]);
+    });
+    outcome("0193f2a0-0000-7000-8000-00000000be05", &|event| {
+        event["unpushed_commits"] = json!(100_001);
+    });
+    daemon.tick(Instant::now() + Duration::from_secs(1));
+    daemon.tick(Instant::now() + Duration::from_secs(30));
+    assert!(mock.to(contract::EVENTS).is_empty());
+    assert!(!mock.everything().contains(MARK));
+    assert!(rig.spooled().is_empty());
+    assert_eq!(files_under(&spool.join("rejected")).len(), 5);
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
 }
 
 #[test]

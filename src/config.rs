@@ -15,6 +15,9 @@ pub struct Config {
     pub root: PathBuf,
     pub github_token_file: Option<PathBuf>,
     pub branch_prefix: String,
+    /// The GitHub API to ask. GitHub's own, unless a stand-in on this machine
+    /// is named for a test.
+    pub github_api: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,6 +84,7 @@ pub fn load(cli_root: Option<PathBuf>) -> Result<Config> {
         branch_prefix: file
             .branch_prefix
             .unwrap_or_else(|| "workspace".to_string()),
+        github_api: crate::github::api_url(),
     })
 }
 
@@ -100,6 +104,7 @@ pub fn for_root(
         branch_prefix: branch_prefix
             .or(file.branch_prefix)
             .unwrap_or_else(|| "workspace".to_string()),
+        github_api: crate::github::api_url(),
     }
 }
 

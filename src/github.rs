@@ -1,10 +1,36 @@
-//! The one question nucleate asks GitHub: was this commit merged?
+//! The two questions nucleate asks GitHub about a commit: was it merged, and
+//! which open pull requests is it the head of? Both are one documented call,
+//! "list pull requests associated with a commit", and four of its fields.
 
-use serde_json::Value;
+use crate::envelope::pull_request_repo;
+use crate::watch::normalize_api_url;
+use serde::de::IgnoredAny;
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+
+pub const API_URL: &str = "https://api.github.com";
+/// Moves the GitHub API to a stand-in on this machine, for tests.
+pub const API_URL_ENV: &str = "NUCLEATE_GITHUB_API_URL";
+
+/// An address for a stand-in GitHub API, accepted only when it is plain http
+/// on this machine. The token goes wherever this points, so nothing else,
+/// and nothing across a network, may take GitHub's place.
+pub fn stand_in(url: &str) -> Option<String> {
+    normalize_api_url(url)
+        .ok()
+        .filter(|url| url.starts_with("http://"))
+}
+
+/// The GitHub API to ask: GitHub's, unless the environment names a stand-in.
+pub fn api_url() -> String {
+    env::var(API_URL_ENV)
+        .ok()
+        .and_then(|url| stand_in(&url))
+        .unwrap_or_else(|| API_URL.to_string())
+}
 
 /// Extract `(owner, repo)` from a GitHub remote URL, or `None` for any other remote.
 pub fn slug(url: &str) -> Option<(String, String)> {
@@ -32,16 +58,47 @@ fn token(token_file: Option<&Path>) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-/// True when a merged pull request's head is exactly this commit.
-///
-/// A squash merge rewrites the commits and the branch is then deleted, so
-/// asking GitHub is the only way to recognise finished work. Any failure to
-/// get an answer counts as "no": nucleate never deletes on doubt.
-pub fn merged(remote_url: &str, sha: &str, token_file: Option<&Path>) -> bool {
-    let Some((owner, repo)) = slug(remote_url) else {
-        return false;
-    };
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}/pulls");
+/// The fields read from each pull request GitHub lists. Its title, its body,
+/// its branch names and its author are skipped by the parser and never held.
+#[derive(Deserialize)]
+struct Pull {
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    /// Read for whether it is there, not for what it says.
+    #[serde(default)]
+    merged_at: Option<IgnoredAny>,
+    #[serde(default)]
+    head: Option<Head>,
+}
+
+#[derive(Deserialize)]
+struct Head {
+    #[serde(default)]
+    sha: Option<String>,
+}
+
+impl Pull {
+    fn head_is(&self, sha: &str) -> bool {
+        self.head.as_ref().and_then(|head| head.sha.as_deref()) == Some(sha)
+    }
+}
+
+/// The pull requests GitHub associates with a commit, or nothing when there
+/// was no answer.
+fn pulls(
+    api: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+    token_file: Option<&Path>,
+) -> Option<Vec<Pull>> {
+    // A commit id goes into the address, so it has to be one.
+    if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let url = format!("{api}/repos/{owner}/{repo}/commits/{sha}/pulls");
     let mut request = ureq::get(&url)
         .config()
         .timeout_global(Some(Duration::from_secs(15)))
@@ -52,20 +109,56 @@ pub fn merged(remote_url: &str, sha: &str, token_file: Option<&Path>) -> bool {
     if let Some(token) = token(token_file) {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let Ok(mut response) = request.call() else {
+    request.call().ok()?.body_mut().read_json().ok()
+}
+
+/// True when a merged pull request's head is exactly this commit.
+///
+/// A squash merge rewrites the commits and the branch is then deleted, so
+/// asking GitHub is the only way to recognise finished work. Any failure to
+/// get an answer counts as "no": nucleate never deletes on doubt.
+pub fn merged(api: &str, remote_url: &str, sha: &str, token_file: Option<&Path>) -> bool {
+    let Some((owner, repo)) = slug(remote_url) else {
         return false;
     };
-    let Ok(Value::Array(pulls)) = response.body_mut().read_json::<Value>() else {
-        return false;
+    pulls(api, &owner, &repo, sha, token_file).is_some_and(|pulls| {
+        pulls
+            .iter()
+            .any(|pull| pull.merged_at.is_some() && pull.head_is(sha))
+    })
+}
+
+/// The addresses of the open pull requests whose head is exactly this commit.
+///
+/// Nothing when GitHub gave no answer, which is not the same as none. A
+/// remote that is not GitHub has none this program can know of. An address is
+/// kept only when it is a pull request on this same repo, so nothing else
+/// GitHub might put in the field is passed on.
+pub fn open_pulls(
+    api: &str,
+    remote_url: &str,
+    sha: &str,
+    token_file: Option<&Path>,
+) -> Option<Vec<String>> {
+    let Some((owner, repo)) = slug(remote_url) else {
+        return Some(Vec::new());
     };
-    pulls
-        .iter()
-        .any(|pull| !pull["merged_at"].is_null() && pull["head"]["sha"].as_str() == Some(sha))
+    let here = format!("{owner}/{repo}");
+    Some(
+        pulls(api, &owner, &repo, sha, token_file)?
+            .into_iter()
+            .filter(|pull| pull.state.as_deref() == Some("open") && pull.head_is(sha))
+            .filter_map(|pull| pull.html_url)
+            .filter(|url| {
+                pull_request_repo(url).is_some_and(|named| named.eq_ignore_ascii_case(&here))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{merged, slug};
+    use super::{merged, slug, stand_in, Pull, API_URL};
 
     /// Talks to the real GitHub API, so it only runs when asked for:
     /// `cargo test -- --ignored`.
@@ -89,8 +182,8 @@ mod tests {
             .find(|pull| !pull["merged_at"].is_null())
             .map(|pull| pull["head"]["sha"].as_str().unwrap().to_string())
             .expect("a merged pull request in the sample");
-        assert!(merged(remote, &head, None));
-        assert!(!merged(remote, &"0".repeat(40), None));
+        assert!(merged(API_URL, remote, &head, None));
+        assert!(!merged(API_URL, remote, &"0".repeat(40), None));
     }
 
     #[test]
@@ -107,5 +200,42 @@ mod tests {
         assert_eq!(slug("/srv/git/demo.git"), None);
         assert_eq!(slug("https://example.com/octo/demo.git"), None);
         assert_eq!(slug("https://github.com/octo"), None);
+    }
+
+    #[test]
+    fn only_this_machine_can_stand_in_for_github() {
+        assert_eq!(
+            stand_in("http://127.0.0.1:4010/").as_deref(),
+            Some("http://127.0.0.1:4010")
+        );
+        assert!(stand_in("http://localhost:4010").is_some());
+        assert!(stand_in("http://[::1]:4010").is_some());
+        assert_eq!(stand_in("https://api.github.com"), None);
+        assert_eq!(stand_in("https://github.example.test"), None);
+        assert_eq!(stand_in("http://github.example.test"), None);
+        assert_eq!(stand_in("http://127.0.0.1.example.test"), None);
+        assert_eq!(stand_in("not an address"), None);
+    }
+
+    #[test]
+    fn a_pull_request_is_read_for_four_fields_and_nothing_else() {
+        let listed = r#"[{
+            "html_url": "https://github.com/octo/demo/pull/7",
+            "state": "open",
+            "merged_at": null,
+            "title": "Fix the login page",
+            "body": "A long explanation.",
+            "user": { "login": "someone" },
+            "head": { "sha": "abc123", "ref": "fix/login", "label": "octo:fix/login" }
+        }, {
+            "state": "closed",
+            "merged_at": "2026-11-19T12:00:00Z",
+            "head": { "sha": "def456" }
+        }, {}]"#;
+        let pulls: Vec<Pull> = serde_json::from_str(listed).unwrap();
+        assert!(pulls[0].head_is("abc123") && pulls[0].merged_at.is_none());
+        assert_eq!(pulls[0].state.as_deref(), Some("open"));
+        assert!(pulls[1].head_is("def456") && pulls[1].merged_at.is_some());
+        assert!(!pulls[2].head_is("abc123"));
     }
 }

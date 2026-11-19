@@ -4,11 +4,11 @@
 use crate::credentials::{self, Stored};
 use crate::daemon::{self, Timings};
 use crate::envelope::{rfc3339, unix_ms};
-use crate::health;
 use crate::housekeeping;
+use crate::notifier;
 use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Settings, Target};
-use crate::watch::{Client, EnvironmentReport, Heartbeat};
+use crate::watch::Client;
 use serde_json::{json, Value};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,11 +56,14 @@ pub fn view(settings: &Settings) -> Value {
         token = "rejected";
     }
     let hosted = settings.target(signed_in) == Target::Hosted;
+    // What a heartbeat would say now. Built where the daemon builds its own,
+    // so what is shown here is what Watch is told.
+    let beat = daemon::heartbeat(settings, now);
 
     let mut inbox: Vec<(u8, u64, Value)> = Vec::new();
     let mut environments = Vec::new();
-    for environment in &settings.environments {
-        let alive = health::server_alive(environment);
+    for (environment, report) in settings.environments.iter().zip(&beat.environments) {
+        let alive = report.server_alive;
         let mut counts = serde_json::Map::new();
         let mut sessions = store.list(&environment.name);
         sessions.retain(|session| session.status != Status::Ended);
@@ -87,11 +90,19 @@ pub fn view(settings: &Settings) -> Value {
                     "status": session.status.as_str(),
                     "needs_kind": session.needs_kind,
                     "error_kind": session.error_kind,
+                    "limit_resets_at": session.limit_resets_at,
                     "repos": session.repos,
                     "branch": session.branch,
                     "workspace": session.workspace,
                     "started_at": at(session.started_ms),
                     "last_event_at": at(session.last_event_ms),
+                    "outcome": session.outcome.as_ref().map(|outcome| json!({
+                        "reported_at": at(outcome.reported_ms),
+                        "commits": outcome.commits,
+                        "uncommitted_repos": outcome.uncommitted_repos,
+                        "unpushed_commits": outcome.unpushed_commits,
+                        "pull_requests": outcome.pull_requests,
+                    })),
                 }),
             ));
         }
@@ -111,13 +122,19 @@ pub fn view(settings: &Settings) -> Value {
             "name": environment.name,
             "root": environment.root,
             "agent": environment.agent,
+            "agent_version": report.agent_version,
+            "login_expires_at": report.login_expires_at,
             "server_alive": alive,
+            "server_restarts": report.server_restarts,
+            "unsaved": report.unsaved,
+            "last_snapshot_at": report.last_snapshot_at,
             "sessions": counts,
         }));
     }
     inbox.sort_by_key(|item| (item.0, item.1));
 
-    let machine = health::sample(&settings.environments);
+    let machine = &beat.machine;
+    let told = notifier::read_state(&settings.state_dir).unwrap_or_default();
     json!({
         "generated_at": rfc3339(now),
         "machine": {
@@ -126,6 +143,19 @@ pub fn view(settings: &Settings) -> Value {
             "load_1m": machine.load_1m,
             "uptime_s": machine.uptime_s,
             "memory_pressure_pct": machine.memory_pressure_pct,
+            "on_battery": machine.on_battery,
+            "reboot_required": machine.reboot_required,
+            "uncommitted_repos": machine.uncommitted_repos,
+            "unpushed_commits": machine.unpushed_commits,
+            "last_snapshot_at": machine.last_snapshot_at,
+            "paused_until": beat.paused_until,
+        },
+        "notifier": {
+            "on": settings.notify.is_some(),
+            "after_s": settings.notify.as_ref().map(|notify| notify.after.as_secs()),
+            "watch_unreachable_since": told.down_since_ms.map(at),
+            "said_so": told.announced,
+            "sessions_told": told.told.len(),
         },
         "watch": {
             "target": if hosted { "hosted" } else { "none" },
@@ -177,6 +207,52 @@ fn since(stamp: &str, now_ms: u64) -> Option<u64> {
     Some((now_ms / 1000).saturating_sub(then.max(0) as u64))
 }
 
+/// A timestamp this program wrote, as a person reads one: `2026-11-20 03:10 UTC`.
+fn clock(stamp: &str) -> String {
+    match (stamp.get(0..10), stamp.get(11..16)) {
+        (Some(date), Some(time)) => format!("{date} {time} UTC"),
+        _ => stamp.to_string(),
+    }
+}
+
+/// `3 commits`, `1 pull request told`: a count and its noun, and a word after.
+fn counted(n: u64, noun: &str, after: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {noun}{plural} {after}").trim_end().to_string()
+}
+
+/// How much is unsaved, in words, or nothing when both counts are zero or
+/// not known.
+fn unsaved_words(uncommitted: &Value, unpushed: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = uncommitted.as_u64().filter(|n| *n > 0) {
+        parts.push(counted(n, "repo", "with uncommitted changes"));
+    }
+    if let Some(n) = unpushed.as_u64().filter(|n| *n > 0) {
+        parts.push(counted(n, "commit", "not pushed"));
+    }
+    parts.join(" · ")
+}
+
+/// What a session left behind, as its last outcome reported it.
+fn left_behind(outcome: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = outcome["commits"].as_u64() {
+        parts.push(counted(n, "commit", ""));
+    }
+    if let Some(pulls) = outcome["pull_requests"]
+        .as_array()
+        .filter(|p| !p.is_empty())
+    {
+        parts.push(counted(pulls.len() as u64, "pull request", ""));
+    }
+    let unsaved = unsaved_words(&outcome["uncommitted_repos"], &outcome["unpushed_commits"]);
+    if !unsaved.is_empty() {
+        parts.push(unsaved);
+    }
+    parts.join(" · ")
+}
+
 /// The view as text, for a person at the box.
 pub fn render(view: &Value) -> String {
     let now_ms = view["now_ms"].as_u64().unwrap_or(0);
@@ -194,8 +270,21 @@ pub fn render(view: &Value) -> String {
     if let Some(pressure) = machine["memory_pressure_pct"].as_f64() {
         line.push_str(&format!(" · memory pressure {pressure}%"));
     }
+    if machine["on_battery"] == true {
+        line.push_str(" · on battery");
+    }
+    if machine["reboot_required"] == true {
+        line.push_str(" · reboot required");
+    }
     out.push_str(&line);
     out.push('\n');
+    if let Some(until) = machine["paused_until"].as_str() {
+        out.push_str(&format!(
+            "Paused for maintenance until {}. Watch holds its alerts for this box going dark. \
+             nucleated resume ends it.\n",
+            clock(until)
+        ));
+    }
 
     let watch = &view["watch"];
     out.push_str(&match (watch["target"].as_str(), watch["token"].as_str()) {
@@ -240,6 +329,23 @@ pub fn render(view: &Value) -> String {
         Some(true) => "Daemon: running\n",
         _ => "Daemon: not running. Sessions below are as the daemon last saw them.\n",
     });
+    let notifier = &view["notifier"];
+    if notifier["on"] == true {
+        let mut line = "Notifier: on".to_string();
+        if let Some(since) = notifier["watch_unreachable_since"].as_str() {
+            line.push_str(&format!(" · Watch unreachable since {}", clock(since)));
+            line.push_str(match notifier["said_so"].as_bool() {
+                Some(true) => " · said so",
+                _ => " · not said yet",
+            });
+            let told = notifier["sessions_told"].as_u64().unwrap_or(0);
+            if told > 0 {
+                line.push_str(&format!(" · {}", counted(told, "waiting session", "told")));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
 
     let headings = [
         ("needs_input", "Needs you"),
@@ -280,12 +386,18 @@ pub fn render(view: &Value) -> String {
                 .as_array()
                 .map(|repos| repos.iter().map(text).collect())
                 .unwrap_or_default();
+            let resets = item["limit_resets_at"]
+                .as_str()
+                .map(|stamp| format!("limit resets {}", clock(stamp)))
+                .unwrap_or_default();
             let mut line = format!("  {}  {id}", text(&item["environment"]));
             for part in [
                 detail.to_string(),
+                resets,
                 waited,
                 repos.join(", "),
                 text(&item["branch"]),
+                left_behind(&item["outcome"]),
             ] {
                 if !part.is_empty() {
                     line.push_str(&format!("  {part}"));
@@ -305,8 +417,8 @@ pub fn render(view: &Value) -> String {
     } else {
         out.push_str("\nEnvironments\n");
         for environment in environments {
-            out.push_str(&format!(
-                "  {}  agent server {}  {}\n",
+            let mut line = format!(
+                "  {}  agent server {}  {}",
                 text(&environment["name"]),
                 if environment["server_alive"] == true {
                     "alive"
@@ -314,7 +426,43 @@ pub fn render(view: &Value) -> String {
                     "not running"
                 },
                 text(&environment["root"]),
-            ));
+            );
+            if let Some(version) = environment["agent_version"].as_str() {
+                line.push_str(&format!("  agent {version}"));
+            }
+            if let Some(stamp) = environment["login_expires_at"].as_str() {
+                line.push_str(&format!("  login expires {}", clock(stamp)));
+            }
+            if let Some(restarts) = environment["server_restarts"].as_u64() {
+                line.push_str(&format!("  {}", counted(restarts, "restart", "")));
+            }
+            let unsaved = &environment["unsaved"];
+            if unsaved.is_object() {
+                let held =
+                    unsaved_words(&unsaved["uncommitted_repos"], &unsaved["unpushed_commits"]);
+                line.push_str(&format!(
+                    "  {}",
+                    if held.is_empty() {
+                        "nothing unsaved".to_string()
+                    } else {
+                        held
+                    }
+                ));
+                if let Some(seconds) = unsaved["counted_at"]
+                    .as_str()
+                    .and_then(|stamp| since(stamp, now_ms))
+                {
+                    line.push_str(&format!(" (counted {} ago)", ago(seconds)));
+                }
+            }
+            if let Some(seconds) = environment["last_snapshot_at"]
+                .as_str()
+                .and_then(|stamp| since(stamp, now_ms))
+            {
+                line.push_str(&format!("  last snapshot {} ago", ago(seconds)));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
     }
     if let Some(ledger) = view["housekeeping"]
@@ -388,8 +536,10 @@ pub fn check(settings: &Settings) -> (Value, bool) {
             None
         }
     };
-    let mut reports = Vec::new();
-    for environment in &settings.environments {
+    // The same heartbeat the daemon sends: a thinner one would tell Watch
+    // that what it left out is no longer so.
+    let beat = daemon::heartbeat(settings, SystemTime::now());
+    for (environment, report) in settings.environments.iter().zip(&beat.environments) {
         let nucleus = environment.root.join(".repos").is_dir();
         add(
             format!("{}: nucleus", environment.name),
@@ -402,7 +552,7 @@ pub fn check(settings: &Settings) -> (Value, bool) {
                 ),
             },
         );
-        let alive = health::server_alive(environment);
+        let alive = report.server_alive;
         let (known, how) = match &environment.check {
             Some(_) => (true, "check command".to_string()),
             None => (
@@ -422,10 +572,31 @@ pub fn check(settings: &Settings) -> (Value, bool) {
                 (true, false) => format!("{how}: not running"),
             },
         );
-        reports.push(EnvironmentReport {
-            env_id: environment.name.clone(),
-            server_alive: alive,
-        });
+    }
+    if let Some(ups) = settings.ups.as_deref() {
+        add(
+            "ups".to_string(),
+            beat.machine.on_battery.is_some(),
+            match beat.machine.on_battery {
+                Some(true) => format!("{ups}: on battery"),
+                Some(false) => format!("{ups}: on mains"),
+                None => format!("upsc gave no status for {ups}; is NUT running?"),
+            },
+        );
+    }
+    if let Some(notify) = &settings.notify {
+        let usable = notifier::usable(notify);
+        add(
+            "notifier".to_string(),
+            usable.is_ok(),
+            match usable {
+                Ok(()) => format!(
+                    "on: posts when Watch has been unreachable for {}",
+                    ago(notify.after.as_secs())
+                ),
+                Err(why) => why.to_string(),
+            },
+        );
     }
     if let Some(credential) = credential.filter(|_| settings.target(true) == Target::Hosted) {
         let api_url = credential
@@ -435,14 +606,8 @@ pub fn check(settings: &Settings) -> (Value, bool) {
         let sent = Client::new(&api_url, Timings::default().http_timeout)
             .map_err(|error| format!("{error:#}"))
             .and_then(|client| {
-                let heartbeat = Heartbeat {
-                    machine: health::sample(&settings.environments),
-                    environments: reports,
-                    daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                    client_ts: rfc3339(SystemTime::now()),
-                };
                 client
-                    .heartbeat(&credential.token, &heartbeat)
+                    .heartbeat(&credential.token, &beat)
                     .map_err(|failure| failure.to_string())
             });
         add(
@@ -479,5 +644,132 @@ mod tests {
             Some(86_400)
         );
         assert_eq!(since("not a time", 0), None);
+    }
+
+    #[test]
+    fn a_failure_on_a_usage_limit_shows_when_the_limit_resets() {
+        let view = json!({
+            "now_ms": 1_795_089_603_120u64,
+            "machine": { "name": "agentbox", "disk_used_pct": 41.5, "load_1m": 0.6, "uptime_s": 60 },
+            "watch": { "target": "none" },
+            "daemon": { "running": true },
+            "inbox": [{
+                "kind": "session",
+                "attention": "failed",
+                "since": at(1_795_089_600_000),
+                "environment": "client-a",
+                "session_id": "7f3c2a1e-58b4",
+                "status": "failed",
+                "error_kind": "rate_limit",
+                "limit_resets_at": "2026-11-20T03:10:00.000Z",
+                "repos": ["your-org/web"],
+                "branch": "agent/checkout-fix",
+            }],
+            "environments": [{
+                "name": "client-a",
+                "root": "/home/agent/client-a",
+                "server_alive": true,
+                "agent_version": "2.1.0",
+                "login_expires_at": "2026-12-01T09:00:00.000Z",
+            }],
+        });
+        let text = render(&view);
+        assert!(
+            text.contains(
+                "client-a  7f3c2a1e  rate_limit  limit resets 2026-11-20 03:10 UTC  3s  your-org/web  agent/checkout-fix"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "client-a  agent server alive  /home/agent/client-a  agent 2.1.0  login expires 2026-12-01 09:00 UTC"
+            ),
+            "{text}"
+        );
+        // With neither known, the lines are as they were.
+        assert!(!text.contains("Paused") && !text.contains("Notifier"));
+        let mut bare = view.clone();
+        bare["inbox"][0]["limit_resets_at"] = Value::Null;
+        bare["environments"][0]["agent_version"] = Value::Null;
+        bare["environments"][0]["login_expires_at"] = Value::Null;
+        let text = render(&bare);
+        assert!(text.contains("client-a  7f3c2a1e  rate_limit  3s  your-org/web"));
+        assert!(text.contains("client-a  agent server alive  /home/agent/client-a\n"));
+    }
+
+    #[test]
+    fn what_the_box_reports_about_itself_is_shown_in_words() {
+        let now_ms = 1_795_089_603_120u64;
+        let view = json!({
+            "now_ms": now_ms,
+            "machine": {
+                "name": "agentbox", "disk_used_pct": 41.5, "load_1m": 0.6, "uptime_s": 60,
+                "on_battery": true, "reboot_required": true,
+                "paused_until": "2026-11-20T03:10:00.000Z",
+            },
+            "watch": { "target": "none" },
+            "daemon": { "running": true },
+            "notifier": {
+                "on": true, "watch_unreachable_since": "2026-11-19T11:40:00.000Z",
+                "said_so": true, "sessions_told": 1,
+            },
+            "inbox": [{
+                "kind": "session",
+                "attention": "idle",
+                "since": at(now_ms - 3_000),
+                "environment": "client-a",
+                "session_id": "7f3c2a1e-58b4",
+                "status": "idle",
+                "repos": ["your-org/web"],
+                "branch": "agent/checkout-fix",
+                "outcome": {
+                    "commits": 3, "uncommitted_repos": 1, "unpushed_commits": 0,
+                    "pull_requests": ["https://github.com/your-org/web/pull/412"],
+                },
+            }],
+            "environments": [{
+                "name": "client-a",
+                "root": "/home/agent/client-a",
+                "server_alive": true,
+                "server_restarts": 4,
+                "unsaved": {
+                    "uncommitted_repos": 2, "unpushed_commits": 1,
+                    "counted_at": at(now_ms - 240_000),
+                },
+                "last_snapshot_at": at(now_ms - 2_400_000),
+            }],
+        });
+        let text = render(&view);
+        assert!(
+            text.contains("up 1m · on battery · reboot required\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Paused for maintenance until 2026-11-20 03:10 UTC."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Notifier: on · Watch unreachable since 2026-11-19 11:40 UTC · said so · 1 waiting session told\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "agent/checkout-fix  3 commits · 1 pull request · 1 repo with uncommitted changes\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "/home/agent/client-a  4 restarts  2 repos with uncommitted changes · 1 commit not pushed (counted 4m ago)  last snapshot 40m ago\n"
+            ),
+            "{text}"
+        );
+        // Counted, and nothing found.
+        let mut clean = view.clone();
+        clean["environments"][0]["unsaved"]["uncommitted_repos"] = json!(0);
+        clean["environments"][0]["unsaved"]["unpushed_commits"] = json!(0);
+        assert!(render(&clean).contains("4 restarts  nothing unsaved (counted 4m ago)"));
     }
 }

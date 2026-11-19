@@ -206,6 +206,7 @@ pub fn record(
         session_id,
         cwd,
         error_kind,
+        limit_resets_at,
     } = adapter.lifecycle(event, payload)?;
     let environment = named.or_else(|| located(settings, cwd.as_deref()))?;
     let place = place(environment, cwd.as_deref());
@@ -216,6 +217,9 @@ pub fn record(
         repos: place.repos,
         branch: place.branch,
         error_kind,
+        limit_resets_at,
+        // What a session left behind is the reporter's to say, not a hook's.
+        ..Draft::default()
     };
     let record = Record {
         event: Envelope::new(kind, draft, now)?,

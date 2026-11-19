@@ -3,12 +3,13 @@
 //! Everything the box sends goes through this file.
 
 use crate::credentials::Token;
-use crate::envelope::Envelope;
+use crate::envelope::{rfc3339, valid_version, within, Envelope};
+use crate::sessions::ACTIVITY_BEAT;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub const CLIENT_ID: &str = "nucleate";
 pub const SCOPE: &str = "ingest";
@@ -95,16 +96,16 @@ pub fn printable(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(300).collect()
 }
 
-/// Check an API address and trim it. `https` anywhere; `http` only for this
-/// machine, so a token is never sent in the clear across a network.
-pub fn normalize_api_url(url: &str) -> Result<String> {
-    let url = url.trim().trim_end_matches('/');
+/// The scheme and the host of an address, checked: `https` anywhere, `http`
+/// only for this machine, so nothing secret is sent in the clear across a
+/// network, and no name and password inside the address.
+fn check_origin(url: &str) -> Result<()> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow::anyhow!("{url:?} is not an http(s) address"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') || rest.contains(['?', '#']) {
-        bail!("{url:?} is not a plain API address");
+    if authority.is_empty() || authority.contains('@') {
+        bail!("{url:?} is not a plain address");
     }
     let host = if let Some(bracketed) = authority.strip_prefix('[') {
         bracketed.split(']').next().unwrap_or_default()
@@ -115,11 +116,32 @@ pub fn normalize_api_url(url: &str) -> Result<String> {
     };
     let local = matches!(host, "localhost" | "127.0.0.1" | "::1");
     match scheme {
-        "https" => {}
-        "http" if local => {}
-        "http" => bail!("{url:?} is not https; plain http is only for an API on this machine"),
+        "https" => Ok(()),
+        "http" if local => Ok(()),
+        "http" => bail!("{url:?} is not https; plain http is only for an address on this machine"),
         _ => bail!("{url:?} is not an http(s) address"),
     }
+}
+
+/// Check an API address and trim it. `https` anywhere; `http` only for this
+/// machine, so a token is never sent in the clear across a network.
+pub fn normalize_api_url(url: &str) -> Result<String> {
+    let url = url.trim().trim_end_matches('/');
+    if url.contains(['?', '#']) {
+        bail!("{url:?} is not a plain API address");
+    }
+    check_origin(url)?;
+    Ok(url.to_string())
+}
+
+/// Check the address of a webhook the box posts to. The same rule as for the
+/// API, except that a webhook's address may carry a query.
+pub fn normalize_webhook_url(url: &str) -> Result<String> {
+    let url = url.trim();
+    if url.contains('#') || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("{url:?} is not a plain address");
+    }
+    check_origin(url)?;
     Ok(url.to_string())
 }
 
@@ -156,19 +178,142 @@ pub enum TokenPoll {
     Expired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The most Watch takes in a heartbeat's counts.
+pub const MAX_UNCOMMITTED_REPOS: u64 = 10_000;
+pub const MAX_UNPUSHED_COMMITS: u64 = 1_000_000;
+pub const MAX_SERVER_RESTARTS: u64 = 2_147_483_647;
+/// The longest maintenance pause Watch keeps.
+pub const MAX_PAUSE: Duration = Duration::from_secs(86_400);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct MachineHealth {
     pub disk_used_pct: f64,
     pub load_1m: f64,
     pub uptime_s: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure_pct: Option<f64>,
+    /// Whether the box runs from its UPS battery. Nothing on a box with no
+    /// UPS, or when the UPS could not be asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_battery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reboot_required: Option<bool>,
+    /// Unsaved work across the whole box, each nucleus counted once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncommitted_repos: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpushed_commits: Option<u64>,
+    /// Every nucleus has had a good snapshot since this time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_snapshot_at: Option<String>,
+}
+
+impl MachineHealth {
+    /// Add the box's unsaved work: counts, and nothing when either is more
+    /// than Watch takes.
+    pub fn with_unsaved(mut self, counts: Option<(u64, u64)>) -> MachineHealth {
+        let counts = counts.filter(|(uncommitted, unpushed)| {
+            *uncommitted <= MAX_UNCOMMITTED_REPOS && *unpushed <= MAX_UNPUSHED_COMMITS
+        });
+        self.uncommitted_repos = counts.map(|(uncommitted, _)| uncommitted);
+        self.unpushed_commits = counts.map(|(_, unpushed)| unpushed);
+        self
+    }
+
+    pub fn with_snapshot(mut self, at: Option<SystemTime>, now: SystemTime) -> MachineHealth {
+        self.last_snapshot_at = at.map(|at| rfc3339(at.min(now)));
+        self
+    }
+}
+
+/// A login expiry is sent only when it lies this far around now: Watch keeps
+/// nothing outside the same window.
+const LOGIN_EXPIRY_BEHIND: Duration = Duration::from_secs(30 * 86_400);
+const LOGIN_EXPIRY_AHEAD: Duration = Duration::from_secs(400 * 86_400);
+
+/// How much of an environment's work exists only on the box: two counts and
+/// the time they were counted.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct UnsavedReport {
+    pub uncommitted_repos: u64,
+    pub unpushed_commits: u64,
+    pub counted_at: String,
+}
+
+impl UnsavedReport {
+    /// Nothing when a count is more than Watch takes. A time ahead of now,
+    /// from a clock that has since moved back, is sent as now.
+    pub fn new(
+        uncommitted_repos: u64,
+        unpushed_commits: u64,
+        counted_at: SystemTime,
+        now: SystemTime,
+    ) -> Option<UnsavedReport> {
+        (uncommitted_repos <= MAX_UNCOMMITTED_REPOS && unpushed_commits <= MAX_UNPUSHED_COMMITS)
+            .then(|| UnsavedReport {
+                uncommitted_repos,
+                unpushed_commits,
+                counted_at: rfc3339(counted_at.min(now)),
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EnvironmentReport {
     pub env_id: String,
     pub server_alive: bool,
+    /// The supervisor's running count of restarts of the agent server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_restarts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_expires_at: Option<String>,
+    /// When the snapshot job last finished for this environment's nucleus
+    /// with nothing failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_snapshot_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsaved: Option<UnsavedReport>,
+}
+
+impl EnvironmentReport {
+    /// One environment's part of a heartbeat. A version that is not a short
+    /// version string, or an expiry outside what Watch keeps, is left out.
+    pub fn new(
+        env_id: &str,
+        server_alive: bool,
+        agent_version: Option<String>,
+        login_expires_at: Option<SystemTime>,
+        now: SystemTime,
+    ) -> EnvironmentReport {
+        EnvironmentReport {
+            env_id: env_id.to_string(),
+            server_alive,
+            server_restarts: None,
+            agent_version: agent_version.filter(|version| valid_version(version)),
+            login_expires_at: login_expires_at
+                .filter(|at| within(*at, now, LOGIN_EXPIRY_BEHIND, LOGIN_EXPIRY_AHEAD))
+                .map(rfc3339),
+            last_snapshot_at: None,
+            unsaved: None,
+        }
+    }
+
+    pub fn with_restarts(mut self, count: Option<u64>) -> EnvironmentReport {
+        self.server_restarts = count.filter(|count| *count <= MAX_SERVER_RESTARTS);
+        self
+    }
+
+    pub fn with_unsaved(mut self, unsaved: Option<UnsavedReport>) -> EnvironmentReport {
+        self.unsaved = unsaved;
+        self
+    }
+
+    pub fn with_snapshot(mut self, at: Option<SystemTime>, now: SystemTime) -> EnvironmentReport {
+        self.last_snapshot_at = at.map(|at| rfc3339(at.min(now)));
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -176,7 +321,43 @@ pub struct Heartbeat {
     pub machine: MachineHealth,
     pub environments: Vec<EnvironmentReport>,
     pub daemon_version: String,
+    /// A promise: while a working session's tools run, at least one
+    /// `activity` event for it is sent in this many seconds.
+    pub activity_beat_s: u64,
+    /// A maintenance pause announced on the box: until then Watch puts off
+    /// the alerts for this machine going dark.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_until: Option<String>,
     pub client_ts: String,
+}
+
+impl Heartbeat {
+    /// Every heartbeat is built here, so each one makes the same promise. One
+    /// that left `activity_beat_s` out would tell Watch the promise was gone.
+    pub fn new(
+        machine: MachineHealth,
+        environments: Vec<EnvironmentReport>,
+        now: SystemTime,
+    ) -> Heartbeat {
+        Heartbeat {
+            machine,
+            environments,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            activity_beat_s: ACTIVITY_BEAT.as_secs(),
+            paused_until: None,
+            client_ts: rfc3339(now),
+        }
+    }
+
+    /// Say the box is paused for maintenance until `until`. A time that has
+    /// passed is no pause, and one more than a day ahead is sent as a day:
+    /// Watch keeps no more.
+    pub fn with_pause(mut self, until: Option<SystemTime>, now: SystemTime) -> Heartbeat {
+        self.paused_until = until
+            .filter(|until| *until > now)
+            .map(|until| rfc3339(until.min(now + MAX_PAUSE)));
+        self
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +660,167 @@ mod tests {
         assert!(normalize_api_url("ftp://localhost").is_err());
         assert!(normalize_api_url("api.nucarium.com").is_err());
         assert!(normalize_api_url("https://api.nucarium.com/?x=1").is_err());
+    }
+
+    #[test]
+    fn a_webhook_address_may_carry_a_query_and_nothing_secret_in_the_clear() {
+        assert_eq!(
+            normalize_webhook_url(" https://ntfy.sh/your-private-topic ").unwrap(),
+            "https://ntfy.sh/your-private-topic"
+        );
+        assert!(normalize_webhook_url("https://hooks.example.test/x?key=1").is_ok());
+        assert!(normalize_webhook_url("http://localhost:8080/topic").is_ok());
+        assert!(normalize_webhook_url("http://ntfy.example.test/topic").is_err());
+        assert!(normalize_webhook_url("https://user:pass@ntfy.example.test/topic").is_err());
+        assert!(normalize_webhook_url("https://ntfy.sh/a topic").is_err());
+        assert!(normalize_webhook_url("https://ntfy.sh/topic#x").is_err());
+        assert!(normalize_webhook_url("ntfy.sh/topic").is_err());
+    }
+
+    fn at(ms: u64) -> SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_heartbeat_promises_the_activity_beat_and_names_only_what_it_knows() {
+        let now = at(1_795_089_600_000);
+        let machine = MachineHealth {
+            disk_used_pct: 41.5,
+            load_1m: 0.62,
+            uptime_s: 864_000,
+            ..MachineHealth::default()
+        };
+        let report = EnvironmentReport::new("client-a", true, None, None, now);
+        let body = serde_json::to_value(Heartbeat::new(machine, vec![report], now)).unwrap();
+        assert_eq!(body["activity_beat_s"], 300);
+        assert_eq!(body["client_ts"], "2026-11-19T12:00:00.000Z");
+        assert_eq!(
+            body["environments"],
+            json!([{ "env_id": "client-a", "server_alive": true }])
+        );
+        // With nothing more known, the machine says its three numbers and
+        // the heartbeat names no pause.
+        assert_eq!(
+            body["machine"],
+            json!({ "disk_used_pct": 41.5, "load_1m": 0.62, "uptime_s": 864_000 })
+        );
+        assert!(body.get("paused_until").is_none());
+    }
+
+    #[test]
+    fn what_the_box_counted_and_probed_goes_out_as_numbers_times_and_yes_or_no() {
+        let now = at(1_795_089_600_000);
+        let minutes = |n: u64| Duration::from_secs(60 * n);
+        let machine = MachineHealth {
+            disk_used_pct: 41.5,
+            load_1m: 0.62,
+            uptime_s: 864_000,
+            on_battery: Some(false),
+            reboot_required: Some(true),
+            ..MachineHealth::default()
+        }
+        .with_unsaved(Some((2, 5)))
+        .with_snapshot(Some(now - minutes(50)), now);
+        let report = EnvironmentReport::new("client-a", true, None, None, now)
+            .with_restarts(Some(4))
+            .with_unsaved(UnsavedReport::new(2, 5, now - minutes(8), now))
+            .with_snapshot(Some(now - minutes(50)), now);
+        let body = serde_json::to_value(
+            Heartbeat::new(machine, vec![report], now).with_pause(Some(now + minutes(120)), now),
+        )
+        .unwrap();
+        assert_eq!(
+            body["machine"],
+            json!({
+                "disk_used_pct": 41.5, "load_1m": 0.62, "uptime_s": 864_000,
+                "on_battery": false, "reboot_required": true,
+                "uncommitted_repos": 2, "unpushed_commits": 5,
+                "last_snapshot_at": "2026-11-19T11:10:00.000Z",
+            })
+        );
+        assert_eq!(
+            body["environments"],
+            json!([{
+                "env_id": "client-a", "server_alive": true, "server_restarts": 4,
+                "last_snapshot_at": "2026-11-19T11:10:00.000Z",
+                "unsaved": {
+                    "uncommitted_repos": 2, "unpushed_commits": 5,
+                    "counted_at": "2026-11-19T11:52:00.000Z",
+                },
+            }])
+        );
+        assert_eq!(body["paused_until"], "2026-11-19T14:00:00.000Z");
+    }
+
+    #[test]
+    fn a_value_outside_what_watch_takes_is_left_out_of_a_heartbeat() {
+        let now = at(1_795_089_600_000);
+        let day = Duration::from_secs(86_400);
+        assert_eq!(UnsavedReport::new(10_001, 0, now, now), None);
+        assert_eq!(UnsavedReport::new(0, 1_000_001, now, now), None);
+        assert!(UnsavedReport::new(10_000, 1_000_000, now, now).is_some());
+        let machine = MachineHealth::default().with_unsaved(Some((10_001, 0)));
+        assert_eq!(machine.uncommitted_repos, None);
+        assert_eq!(machine.unpushed_commits, None);
+        let report = EnvironmentReport::new("client-a", true, None, None, now);
+        assert_eq!(
+            report
+                .clone()
+                .with_restarts(Some(2_147_483_648))
+                .server_restarts,
+            None
+        );
+        // A time said to be past is never sent as one ahead of the box's clock.
+        let counted = UnsavedReport::new(0, 0, now + day, now).unwrap();
+        assert_eq!(counted.counted_at, "2026-11-19T12:00:00.000Z");
+        assert_eq!(
+            report
+                .with_snapshot(Some(now + day), now)
+                .last_snapshot_at
+                .as_deref(),
+            Some("2026-11-19T12:00:00.000Z")
+        );
+        // A pause that has passed is no pause; one too long is a day.
+        let beat = |until| {
+            Heartbeat::new(MachineHealth::default(), Vec::new(), now)
+                .with_pause(Some(until), now)
+                .paused_until
+        };
+        assert_eq!(beat(now), None);
+        assert_eq!(beat(now - day), None);
+        assert_eq!(
+            beat(now + 3 * day).as_deref(),
+            Some("2026-11-20T12:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn an_environment_reports_a_version_and_a_login_expiry_when_they_fit() {
+        let now = at(1_795_089_600_000);
+        let day = Duration::from_secs(86_400);
+        let report = |version: &str, expires: SystemTime| {
+            serde_json::to_value(EnvironmentReport::new(
+                "client-a",
+                true,
+                Some(version.to_string()),
+                Some(expires),
+                now,
+            ))
+            .unwrap()
+        };
+        let known = report("2.1.0", now + day);
+        assert_eq!(known["agent_version"], "2.1.0");
+        assert_eq!(known["login_expires_at"], "2026-11-20T12:00:00.000Z");
+        // Words where a version belongs, and times Watch would not keep.
+        assert!(report("2.1.0 (Claude Code)", now)
+            .get("agent_version")
+            .is_none());
+        assert!(report("", now).get("agent_version").is_none());
+        let kept = |expires| report("2.1.0", expires).get("login_expires_at").is_some();
+        assert!(kept(now - 30 * day));
+        assert!(!kept(now - 31 * day));
+        assert!(kept(now + 400 * day));
+        assert!(!kept(now + 401 * day));
     }
 
     #[test]

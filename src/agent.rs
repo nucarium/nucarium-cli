@@ -8,12 +8,14 @@
 //! and never held.
 
 use crate::envelope::EventType;
+use crate::settings::Environment;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// What a hook invocation amounts to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,9 @@ pub struct Lifecycle {
     pub cwd: Option<PathBuf>,
     /// For a failure, the agent's short machine-readable kind.
     pub error_kind: Option<String>,
+    /// For a failure on a usage limit, when the agent says the limit resets.
+    /// A time the adapter parsed, never the agent's words for one.
+    pub limit_resets_at: Option<SystemTime>,
 }
 
 pub trait Agent {
@@ -43,6 +48,19 @@ pub trait Agent {
 
     /// The block that registers the hook entry point in the agent's settings.
     fn hooks_block(&self, env: Option<&str>) -> Value;
+
+    /// When this agent's login expires, read from its config folder, or
+    /// nothing when the adapter cannot read one. An adapter answers only from
+    /// a format the agent documents: a guessed time sends a false warning.
+    ///
+    /// Asked at every heartbeat, so it must be cheap: read a small file, start
+    /// nothing, and never touch the network.
+    fn login_expires_at(&self, config_dir: Option<&Path>) -> Option<SystemTime>;
+
+    /// The version of the agent an environment runs, as the agent reports it,
+    /// or nothing when the adapter cannot ask. Asked at every heartbeat, under
+    /// the same rule.
+    fn version(&self, environment: &Environment) -> Option<String>;
 }
 
 pub fn by_name(name: &str) -> Option<&'static dyn Agent> {
@@ -237,6 +255,9 @@ impl Agent for ClaudeCode {
             session_id: common.session_id?,
             cwd: common.cwd.map(PathBuf::from),
             error_kind,
+            // The hook reference names no field for when a limit resets, so
+            // none is read.
+            limit_resets_at: None,
         })
     }
 
@@ -270,6 +291,17 @@ impl Agent for ClaudeCode {
             hooks.insert(event.to_string(), json!([entry]));
         }
         json!({ "hooks": hooks })
+    }
+
+    // Claude Code documents neither a credentials file to read an expiry from
+    // nor a way to ask a running agent server its version. Until it does,
+    // the box says nothing and Watch shows nothing.
+    fn login_expires_at(&self, _config_dir: Option<&Path>) -> Option<SystemTime> {
+        None
+    }
+
+    fn version(&self, _environment: &Environment) -> Option<String> {
+        None
     }
 }
 
@@ -382,6 +414,37 @@ mod tests {
             lifecycle("PostToolUseFailure", payload).unwrap().error_kind,
             None
         );
+    }
+
+    #[test]
+    fn nothing_is_made_up_where_the_agent_gives_no_field() {
+        // Fields named as a reset time might be are not ones the hook
+        // reference documents, so they are not read.
+        let payload = json!({
+            "session_id": "s1",
+            "error": "rate_limit",
+            "limit_resets_at": "2026-11-20T03:10:00.000Z",
+            "resets_at": 1_795_144_200,
+            "retry_after": "in four hours",
+        });
+        let failed = lifecycle("StopFailure", payload).unwrap();
+        assert_eq!(failed.error_kind.as_deref(), Some("rate_limit"));
+        assert_eq!(failed.limit_resets_at, None);
+
+        let config_dir = PathBuf::from("/home/agent/.claude-client-a");
+        assert_eq!(ClaudeCode.login_expires_at(Some(&config_dir)), None);
+        assert_eq!(ClaudeCode.login_expires_at(None), None);
+        let environment = Environment {
+            name: "client-a".into(),
+            root: PathBuf::from("/home/agent/client-a"),
+            unit: "agent-server@client-a.service".into(),
+            check: None,
+            agent: "claude-code".into(),
+            config_dir: Some(config_dir),
+            github_token_file: None,
+            branch_prefix: None,
+        };
+        assert_eq!(ClaudeCode.version(&environment), None);
     }
 
     #[test]

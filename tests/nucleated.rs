@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{git, mode, run, stderr, stdout_json, Home, Mock, Reply, Request, Rig};
+use common::{contract, git, mode, run, stderr, stdout_json, Home, Mock, Reply, Request, Rig};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 fn watch() -> Mock {
     Mock::start(|request: &Request| match request.path.as_str() {
+        // As Watch does, refuse anything the contract does not allow.
+        _ if contract::violation(request).is_some() => Reply::problem(400, "validation_failed"),
         "/v1/heartbeats:ingest" => Reply::json(
             200,
             json!({ "received_at": "2026-11-19T12:00:00.000Z", "heartbeat_interval_s": 60 }),

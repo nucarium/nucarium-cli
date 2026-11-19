@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use nucleate::envelope::rfc3339;
 use nucleate::settings::{self, Settings};
-use nucleate::{agent, config, daemon, hook, housekeeping, status};
+use nucleate::{agent, config, daemon, hook, housekeeping, pause, status};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The box daemon: heartbeat, session events, housekeeping, local status.
 #[derive(Parser)]
@@ -67,6 +68,14 @@ enum Command {
     },
     /// Print the systemd user unit.
     Unit,
+    /// Announce maintenance: until the time is up, Watch holds its alerts for
+    /// this box and its agent servers going dark. It touches no agent.
+    Pause {
+        /// How long, at most a day: "30m", "2h", "24h".
+        duration: String,
+    },
+    /// End a maintenance pause now.
+    Resume,
 }
 
 #[derive(Subcommand)]
@@ -262,6 +271,30 @@ fn run(cli: Cli) -> Result<u8> {
             return Ok(u8::from(!ok));
         }
         Command::Unit => print!("{UNIT}"),
+        Command::Pause { duration } => {
+            let settings = settings::load()?;
+            let now = SystemTime::now();
+            let until = settings::parse_duration(&duration)
+                .and_then(|length| pause::set(&settings.state_dir, length, now));
+            match until {
+                // The running daemon sees the file and says so to Watch at once.
+                Ok(until) => print(&serde_json::json!({
+                    "paused": true,
+                    "until": rfc3339(until),
+                }))?,
+                // Nothing was paused, and the command line is why.
+                Err(error) => {
+                    eprintln!("nucleated: {error:#}");
+                    return Ok(2);
+                }
+            }
+        }
+        Command::Resume => {
+            let settings = settings::load()?;
+            let was_paused = pause::until(&settings.state_dir, SystemTime::now()).is_some();
+            pause::clear(&settings.state_dir)?;
+            print(&serde_json::json!({ "paused": false, "was_paused": was_paused }))?;
+        }
     }
     Ok(0)
 }
