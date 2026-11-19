@@ -37,7 +37,7 @@ fn api() -> (Mock, Arc<Knobs>) {
             other => Reply::problem(other, "internal_error"),
         };
         let reply = match request.path.as_str() {
-            "/v1/ingest/heartbeat" => match seen.heartbeat_status.load(Ordering::SeqCst) {
+            "/v1/heartbeats:ingest" => match seen.heartbeat_status.load(Ordering::SeqCst) {
                 0 => Reply::json(
                     200,
                     json!({
@@ -47,7 +47,7 @@ fn api() -> (Mock, Arc<Knobs>) {
                 ),
                 status => problem(status),
             },
-            "/v1/ingest/events" => match seen.events_status.load(Ordering::SeqCst) {
+            "/v1/events:ingest" => match seen.events_status.load(Ordering::SeqCst) {
                 0 => {
                     let events = request.json()["events"]
                         .as_array()
@@ -124,7 +124,7 @@ fn needs_input(rig: &Rig, session: &str) {
 
 /// The batches of events the API received, in order.
 fn batches(mock: &Mock) -> Vec<Vec<Value>> {
-    mock.to("/v1/ingest/events")
+    mock.to("/v1/events:ingest")
         .iter()
         .map(|request| request.json()["events"].as_array().cloned().unwrap())
         .collect()
@@ -150,7 +150,7 @@ fn the_first_tick_sends_a_heartbeat_with_health_and_live_agent_servers() {
     rig.sign_in(&mock.url);
     daemon(&rig).tick(Instant::now());
 
-    let beats = mock.to("/v1/ingest/heartbeat");
+    let beats = mock.to("/v1/heartbeats:ingest");
     assert_eq!(beats.len(), 1);
     let beat = &beats[0];
     assert_eq!(beat.method, "POST");
@@ -202,7 +202,7 @@ fn an_agent_server_that_is_not_running_is_reported_as_such() {
     rig.configure_with("check = \"false\"", "");
     daemon(&rig).tick(Instant::now());
     assert_eq!(
-        mock.to("/v1/ingest/heartbeat")[0].json()["environments"],
+        mock.to("/v1/heartbeats:ingest")[0].json()["environments"],
         json!([{ "env_id": "client-a", "server_alive": false }])
     );
 }
@@ -215,7 +215,7 @@ fn heartbeats_follow_the_longer_of_the_configured_and_the_servers_interval() {
     rig.sign_in(&mock.url);
     let mut daemon = daemon(&rig);
     let start = Instant::now();
-    let beats = || mock.to("/v1/ingest/heartbeat").len();
+    let beats = || mock.to("/v1/heartbeats:ingest").len();
     daemon.tick(start);
     assert_eq!(beats(), 1);
     // The config says 60 seconds; the account's floor is five minutes.
@@ -233,9 +233,9 @@ fn heartbeats_follow_the_longer_of_the_configured_and_the_servers_interval() {
     let mut daemon = Daemon::new(rig.settings(), timings());
     daemon.tick(start);
     daemon.tick(start + secs(300));
-    assert_eq!(mock.to("/v1/ingest/heartbeat").len(), 1);
+    assert_eq!(mock.to("/v1/heartbeats:ingest").len(), 1);
     daemon.tick(start + secs(600));
-    assert_eq!(mock.to("/v1/ingest/heartbeat").len(), 2);
+    assert_eq!(mock.to("/v1/heartbeats:ingest").len(), 2);
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn a_failed_heartbeat_is_tried_again_before_the_next_one_is_due() {
     rig.sign_in(&mock.url);
     let mut daemon = daemon(&rig);
     let start = Instant::now();
-    let beats = || mock.to("/v1/ingest/heartbeat").len();
+    let beats = || mock.to("/v1/heartbeats:ingest").len();
     daemon.tick(start);
     daemon.tick(start + secs(4));
     assert_eq!(beats(), 1);
@@ -283,7 +283,7 @@ fn a_changed_config_is_picked_up_without_a_restart() {
         rig.root.display()
     ));
     daemon.tick(start + secs(2));
-    let beats = mock.to("/v1/ingest/heartbeat");
+    let beats = mock.to("/v1/heartbeats:ingest");
     assert_eq!(beats.len(), 2);
     assert_eq!(
         beats[1].json()["environments"],
@@ -343,7 +343,7 @@ fn an_event_carries_only_the_envelope() {
     );
     daemon.tick(Instant::now());
 
-    let request = &mock.to("/v1/ingest/events")[0];
+    let request = &mock.to("/v1/events:ingest")[0];
     assert_eq!(
         request.header("authorization"),
         Some(format!("Bearer {TOKEN}").as_str())
@@ -463,7 +463,7 @@ fn a_failed_send_is_retried_with_a_doubling_wait_and_then_replayed_in_order() {
     knobs.events_status.store(503, Ordering::SeqCst);
     emit(&rig, "UserPromptSubmit", "s1", json!({}));
     needs_input(&rig, "s1");
-    let attempts = || mock.to("/v1/ingest/events").len();
+    let attempts = || mock.to("/v1/events:ingest").len();
     // Fails at 0s; retried after 1s, then 2s, then 4s.
     for (at_ms, expected) in [
         (0, 1),
@@ -525,7 +525,7 @@ fn the_wait_between_retries_stops_growing_at_five_minutes() {
     // Keep the heartbeat from succeeding and clearing the wait.
     knobs.heartbeat_status.store(503, Ordering::SeqCst);
     needs_input(&rig, "s1");
-    let attempts = || mock.to("/v1/ingest/events").len();
+    let attempts = || mock.to("/v1/events:ingest").len();
     let mut at = 0;
     for wait in [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300] {
         daemon.tick(start + secs(at));
@@ -629,9 +629,9 @@ fn a_rate_limit_is_waited_out() {
     daemon.tick(start + secs(1));
     knobs.events_status.store(0, Ordering::SeqCst);
     daemon.tick(start + secs(20));
-    assert_eq!(mock.to("/v1/ingest/events").len(), 1);
+    assert_eq!(mock.to("/v1/events:ingest").len(), 1);
     daemon.tick(start + secs(31));
-    assert_eq!(mock.to("/v1/ingest/events").len(), 2);
+    assert_eq!(mock.to("/v1/events:ingest").len(), 2);
     assert!(rig.spooled().is_empty());
 }
 
@@ -649,7 +649,7 @@ fn a_rejected_token_stops_the_sending_and_a_new_login_resumes_it() {
     daemon.tick(start + secs(2));
     daemon.tick(start + secs(30));
     assert_eq!(
-        mock.to("/v1/ingest/events").len(),
+        mock.to("/v1/events:ingest").len(),
         1,
         "kept sending a rejected token"
     );
@@ -696,9 +696,9 @@ fn an_event_watch_refuses_is_set_aside_and_the_rest_are_delivered() {
     assert!(String::from_utf8_lossy(&aside[0].1).contains("poison"));
     assert_eq!(daemon.state(true).events.rejected, 1);
     // It is not sent again.
-    let before = mock.to("/v1/ingest/events").len();
+    let before = mock.to("/v1/events:ingest").len();
     daemon.tick(start + secs(60));
-    assert_eq!(mock.to("/v1/ingest/events").len(), before);
+    assert_eq!(mock.to("/v1/events:ingest").len(), before);
 }
 
 #[test]
@@ -711,7 +711,7 @@ fn an_event_in_the_responses_rejected_list_is_set_aside() {
     emit(&rig, "Stop", "stranger", json!({}));
     needs_input(&rig, "s1");
     daemon.tick(Instant::now());
-    assert_eq!(mock.to("/v1/ingest/events").len(), 1);
+    assert_eq!(mock.to("/v1/events:ingest").len(), 1);
     assert!(rig.spooled().is_empty());
     assert_eq!(
         common::files_under(&rig.spool_dir().join("rejected")).len(),

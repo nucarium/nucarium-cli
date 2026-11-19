@@ -51,7 +51,7 @@ fn api(interval: u64, expires_in: u64, answers: Vec<Reply>) -> Mock {
         "/v1/oauth/device_authorization" => authorization(interval, expires_in),
         "/v1/oauth/token" => answers[request.nth.min(answers.len() - 1)].clone(),
         "/v1/oauth/revoke" => Reply::json(200, json!({})),
-        "/v1/ingest/events" => Reply::problem(400, "validation_failed"),
+        "/v1/events:ingest" => Reply::problem(400, "validation_failed"),
         _ => Reply::problem(404, "not_found"),
     })
 }
@@ -632,8 +632,8 @@ fn whoami_says_who_the_box_reports_as_and_that_the_token_works() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains(TOKEN));
 
     // The check reports nothing: no heartbeat, and a batch with no events.
-    assert!(mock.to("/v1/ingest/heartbeat").is_empty());
-    let probe = &mock.to("/v1/ingest/events")[0];
+    assert!(mock.to("/v1/heartbeats:ingest").is_empty());
+    let probe = &mock.to("/v1/events:ingest")[0];
     assert_eq!(
         probe.header("authorization"),
         Some(format!("Bearer {TOKEN}").as_str())

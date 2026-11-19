@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 fn watch() -> Mock {
     Mock::start(|request: &Request| match request.path.as_str() {
-        "/v1/ingest/heartbeat" => Reply::json(
+        "/v1/heartbeats:ingest" => Reply::json(
             200,
             json!({ "received_at": "2026-11-19T12:00:00.000Z", "heartbeat_interval_s": 60 }),
         ),
-        "/v1/ingest/events" => Reply::json(
+        "/v1/events:ingest" => Reply::json(
             200,
             json!({ "received_at": "2026-11-19T12:00:00.000Z", "accepted": 1, "duplicates": 0, "rejected": [] }),
         ),
@@ -229,7 +229,7 @@ fn the_daemon_reports_a_heartbeat_and_a_waiting_session_then_stops_cleanly() {
         .spawn()
         .unwrap();
     wait_for("the first heartbeat", || {
-        !mock.to("/v1/ingest/heartbeat").is_empty()
+        !mock.to("/v1/heartbeats:ingest").is_empty()
     });
 
     let out = rig.hook(
@@ -238,10 +238,10 @@ fn the_daemon_reports_a_heartbeat_and_a_waiting_session_then_stops_cleanly() {
     );
     assert_eq!(out.status.code(), Some(0));
     let asked = Instant::now();
-    wait_for("the event", || !mock.to("/v1/ingest/events").is_empty());
+    wait_for("the event", || !mock.to("/v1/events:ingest").is_empty());
     // "At once": well inside the ten seconds a routine event would wait.
     assert!(asked.elapsed() < Duration::from_secs(5));
-    let event = mock.to("/v1/ingest/events")[0].json()["events"][0].clone();
+    let event = mock.to("/v1/events:ingest")[0].json()["events"][0].clone();
     assert_eq!(event["type"], "permission_prompt");
     assert_eq!(event["env_id"], "client-a");
     assert_eq!(event["branch"], "workspace/fix-login");
@@ -415,7 +415,7 @@ fn check_passes_on_a_box_that_is_set_up_and_sends_one_heartbeat() {
             "heartbeat"
         ]
     );
-    assert_eq!(mock.to("/v1/ingest/heartbeat").len(), 1);
+    assert_eq!(mock.to("/v1/heartbeats:ingest").len(), 1);
 }
 
 #[test]

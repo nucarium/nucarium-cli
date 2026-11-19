@@ -402,13 +402,13 @@ impl Client {
         token: &Token,
         heartbeat: &Heartbeat,
     ) -> Result<HeartbeatAck, ApiError> {
-        self.ingest("/v1/ingest/heartbeat", token, heartbeat)?
+        self.ingest("/v1/heartbeats:ingest", token, heartbeat)?
             .parse()
     }
 
     /// Send a batch of at most 100 envelopes.
     pub fn events(&self, token: &Token, events: &[&Envelope]) -> Result<EventsAck, ApiError> {
-        self.ingest("/v1/ingest/events", token, &json!({ "events": events }))?
+        self.ingest("/v1/events:ingest", token, &json!({ "events": events }))?
             .parse()
     }
 

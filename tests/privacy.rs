@@ -178,7 +178,7 @@ fn leaks_on_disk(dir: &Path) -> Vec<String> {
 
 fn watch() -> Mock {
     Mock::start(|request: &Request| match request.path.as_str() {
-        "/v1/ingest/heartbeat" => Reply::json(
+        "/v1/heartbeats:ingest" => Reply::json(
             200,
             json!({ "received_at": "2026-11-19T12:00:00.000Z", "heartbeat_interval_s": 60 }),
         ),
@@ -288,7 +288,9 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
     // The wire: every request the daemon makes.
     tick(&rig);
     let sent = mock.everything();
-    assert!(mock.to("/v1/ingest/heartbeat").len() == 1 && !mock.to("/v1/ingest/events").is_empty());
+    assert!(
+        mock.to("/v1/heartbeats:ingest").len() == 1 && !mock.to("/v1/events:ingest").is_empty()
+    );
     assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
 
     // Every field sent is one the envelope names. There is no other.
@@ -304,7 +306,7 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
         "client_ts",
     ];
     let mut types = std::collections::BTreeSet::new();
-    for request in mock.to("/v1/ingest/events") {
+    for request in mock.to("/v1/events:ingest") {
         let body = request.json();
         assert_eq!(body.as_object().unwrap().len(), 1);
         for event in body["events"].as_array().unwrap() {
@@ -328,7 +330,7 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
     ] {
         assert!(types.contains(kind), "no {kind} event was sent");
     }
-    let heartbeat = mock.to("/v1/ingest/heartbeat")[0].json();
+    let heartbeat = mock.to("/v1/heartbeats:ingest")[0].json();
     for key in heartbeat.as_object().unwrap().keys() {
         assert!(["machine", "environments", "daemon_version", "client_ts"].contains(&key.as_str()));
     }
