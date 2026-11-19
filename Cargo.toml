@@ -1,6 +1,6 @@
 [package]
 name = "nucleate"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Multi-repo session workspaces for coding agents, built from bare repositories and git worktrees"
 authors = ["Mataki Labs LLC"]

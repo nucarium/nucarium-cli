@@ -1,8 +1,9 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish a release holding one archive per target.
-# Each archive holds both static Linux binaries, nucleate and nucleated, at its
-# top level, and has its checksum beside it.
+# Push a tag like v0.1.0 to publish a release holding one archive per target:
+# two for Linux (static, for boxes) and two for macOS (for the Homebrew tap).
+# Each archive holds both binaries, nucleate and nucleated, at its top level,
+# and has its checksum beside it.
 on:
   push:
     tags: ["v*"]
@@ -21,6 +22,12 @@ jobs:
           # cross-compiler.
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # Cross-built on the Apple silicon runner; Xcode's toolchain targets
+          # both architectures.
+          - target: x86_64-apple-darwin
+            runner: macos-latest
     runs-on: ${{ matrix.runner }}
     env:
       TARGET: ${{ matrix.target }}
@@ -31,16 +38,18 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
       - name: Install the musl toolchain
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools
-          rustup target add "$TARGET"
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add "$TARGET"
       - run: cargo test
       - run: cargo build --release --target "$TARGET"
       - name: Package
         run: |
           name="nucleate-$GITHUB_REF_NAME-$TARGET"
           tar -C "target/$TARGET/release" -czf "$name.tar.gz" nucleate nucleated
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          # shasum is on both the Linux and the macOS runners, and writes the
+          # same "<hash>  <file>" line that sha256sum does.
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}

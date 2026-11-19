@@ -25,15 +25,23 @@ moment an agent needs you or a box goes dark.
 
 ## Install
 
-Download a release archive for Linux from the
-[releases page](https://github.com/nucarium/nucarium-cli/releases), or build
-from source with `cargo install --path .`. Either way you get both binaries.
-They need `git` on the `PATH`.
+On a Mac, with [Homebrew](https://brew.sh):
 
-An archive is named `nucleate-v<version>-<target>.tar.gz`, for
-`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, with
-`<archive>.sha256` beside it. It holds `nucleate` and `nucleated` at its top
-level, both static.
+```bash
+brew install nucarium/tap/nucleate
+```
+
+On Linux, download a release archive from the
+[releases page](https://github.com/nucarium/nucarium-cli/releases). Or build
+from source anywhere with `cargo install --path .`. Every route gives you both
+binaries. They need `git` on the `PATH`.
+
+An archive is named `nucleate-v<version>-<target>.tar.gz`, with
+`<archive>.sha256` beside it, and holds `nucleate` and `nucleated` at its top
+level. The targets are `x86_64-unknown-linux-musl` and
+`aarch64-unknown-linux-musl` (static, for boxes), and `aarch64-apple-darwin`
+and `x86_64-apple-darwin` (for trying it on a Mac; the Homebrew formula
+installs these).
 
 ## Layout
 

@@ -16,3 +16,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The release also ships macOS archives for the Homebrew tap, so prove both
+  # of those targets still build and the tests pass on macOS.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add x86_64-apple-darwin
+      - run: cargo test
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
