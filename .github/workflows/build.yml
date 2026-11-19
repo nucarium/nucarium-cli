@@ -1,4 +1,4 @@
-name: CI
+name: Build
 
 on:
   push:
@@ -17,7 +17,7 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  # The release also ships macOS archives for the Homebrew tap, so prove both
+  # A release also ships macOS archives for the Homebrew tap, so prove both
   # of those targets still build and the tests pass on macOS.
   macos:
     runs-on: macos-latest

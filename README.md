@@ -592,8 +592,24 @@ drives the daemon's loop through batching, backoff and replay after an outage.
 To run both binaries against a Watch API on this machine, sign in with
 `nucleate login --api-url http://localhost:8787`.
 
-Pushing a tag like `v0.1.0` (matching the version in `Cargo.toml`) publishes a
-release with one archive per target and its checksum.
+### Releases
+
+Nobody tags a release by hand. Three workflows do it:
+
+| Workflow       | Runs on                       | Does                                                                                                   |
+| -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `build.yml`    | Every pull request and `main` | fmt, clippy and the tests on Linux; the tests and both macOS builds on macOS                            |
+| `release.yml`  | Every push to `main`          | Creates the GitHub Release and its tag with semantic-release, from the Conventional Commits since the last tag |
+| `binaries.yml` | A published release           | Builds the four archives with the tag as their version, attaches them to the release, tells the Homebrew tap |
+
+A `fix:` commit makes a patch release and a `feat:` commit a minor one; a
+push with neither makes no release. The version in `Cargo.toml` is a
+placeholder (`0.0.0-dev`): a release build takes its version from the tag, so
+a build from source reports `0.0.0-dev`.
+
+The last step sends the version and the four checksums to
+`nucarium/homebrew-tap`, which rewrites its formula. That needs the Robot App
+(secrets `GH_APP_ID` and `GH_PRIVATE_KEY`) installed on both repositories.
 
 ## Licence
 

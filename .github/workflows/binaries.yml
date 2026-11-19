@@ -1,0 +1,132 @@
+name: Binaries
+
+# When a release is published, build nucleate and nucleated for every target,
+# attach the archives and their checksums to that release, and tell the
+# Homebrew tap so it can rewrite its formula.
+#
+# The version is the release's tag. Cargo.toml carries a placeholder, and this
+# workflow writes the real version into it before building.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binaries-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Built on an arm64 runner, so the C in the TLS stack needs no
+          # cross-compiler.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          # Cross-built on the Apple silicon runner; Xcode's toolchain targets
+          # both architectures.
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      # On a release event the default ref is the release's tag.
+      - uses: actions/checkout@v7
+      - name: Take the version from the tag
+        run: |
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::The release tag \"$TAG\" is not a version like v1.2.3."
+            exit 1
+          fi
+          VERSION=${TAG#v} perl -pi -e 'if (!$done && s/^version = "[^"]*"/version = "$ENV{VERSION}"/) { $done = 1 }' Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
+      - name: Install the musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add "$TARGET"
+      - run: cargo test
+      - run: cargo build --release --target "$TARGET"
+      # The Intel macOS build cannot run on the Apple silicon runner, so it is
+      # the one archive whose version is not read back here.
+      - name: Check the binaries carry the release's version
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          for bin in nucleate nucleated; do
+            out=$("target/$TARGET/release/$bin" --version)
+            test "$out" = "$bin ${TAG#v}" || { echo "::error::$bin reports \"$out\", not ${TAG#v}"; exit 1; }
+          done
+      - name: Package
+        run: |
+          name="nucleate-$TAG-$TARGET"
+          tar -C "target/$TARGET/release" -czf "$name.tar.gz" nucleate nucleated
+          # shasum is on both the Linux and the macOS runners, and writes the
+          # same "<hash>  <file>" line that sha256sum does.
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            nucleate-*.tar.gz
+            nucleate-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Attached once every target has built, so a release never holds half a set.
+  attach:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the archives to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+
+  # Tells nucarium/homebrew-tap the version and the four checksums. Its Update
+  # formula workflow does the rest. The Robot App must be installed on that
+  # repository too; if it is not, this job fails and the release is still whole.
+  tap:
+    needs: attach
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate Robot App token for the tap
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_PRIVATE_KEY }}
+          owner: nucarium
+          repositories: homebrew-tap
+      - name: Tell the tap
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          sum() { cut -d' ' -f1 "dist/nucleate-$TAG-$1.tar.gz.sha256"; }
+          jq -n \
+            --arg version "${TAG#v}" \
+            --arg mac_arm "$(sum aarch64-apple-darwin)" \
+            --arg mac_intel "$(sum x86_64-apple-darwin)" \
+            --arg linux_arm "$(sum aarch64-unknown-linux-musl)" \
+            --arg linux_intel "$(sum x86_64-unknown-linux-musl)" \
+            '{event_type: "nucleate-released", client_payload: {version: $version, sha256: {"aarch64-apple-darwin": $mac_arm, "x86_64-apple-darwin": $mac_intel, "aarch64-unknown-linux-musl": $linux_arm, "x86_64-unknown-linux-musl": $linux_intel}}}' \
+            | gh api repos/nucarium/homebrew-tap/dispatches --input -

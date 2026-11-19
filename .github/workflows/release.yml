@@ -1,75 +1,44 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish a release holding one archive per target:
-# two for Linux (static, for boxes) and two for macOS (for the Homebrew tap).
-# Each archive holds both binaries, nucleate and nucleated, at its top level,
-# and has its checksum beside it.
+# Creates the GitHub Release and nothing else: semantic-release reads the
+# Conventional Commits since the last tag, picks the next version, tags it and
+# publishes the release notes. It does not build or change any file.
+# Publishing the release is what starts binaries.yml, which builds the
+# archives and attaches them.
+
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-          # Built on an arm64 runner, so the C in the TLS stack needs no
-          # cross-compiler.
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-          # Cross-built on the Apple silicon runner; Xcode's toolchain targets
-          # both architectures.
-          - target: x86_64-apple-darwin
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
-    env:
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check the tag matches Cargo.toml
-        run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
-      - name: Install the musl toolchain
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: rustup target add "$TARGET"
-      - run: cargo test
-      - run: cargo build --release --target "$TARGET"
-      - name: Package
-        run: |
-          name="nucleate-$GITHUB_REF_NAME-$TARGET"
-          tar -C "target/$TARGET/release" -czf "$name.tar.gz" nucleate nucleated
-          # shasum is on both the Linux and the macOS runners, and writes the
-          # same "<hash>  <file>" line that sha256sum does.
-          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.target }}
-          path: |
-            nucleate-*.tar.gz
-            nucleate-*.tar.gz.sha256
-          if-no-files-found: error
-
-  # One release, made once every target has built.
   release:
-    needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      # A release created with the default GITHUB_TOKEN does not start other
+      # workflows, so the release is made as the Robot App.
+      - name: Generate Robot App token
+        uses: actions/create-github-app-token@v3
+        id: app-token
         with:
-          path: dist
-          merge-multiple: true
-      - name: Publish
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # Third-party and handed a token that can write to the repository, so
+      # pinned to a commit. Dependabot moves the pin and the version comment
+      # together.
+      - uses: cycjimmy/semantic-release-action@ad51787758d9654d5a75150a89a6fa9b3ccef95e # v8.1.4
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/*
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
