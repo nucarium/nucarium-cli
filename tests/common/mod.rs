@@ -323,12 +323,13 @@ pub fn run(command: &mut Command, stdin: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // A program is free to finish without reading its input, as a hook does
+    // for an event it has no use for. Writing to it then fails with a broken
+    // pipe, which says nothing about the program.
+    match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error}"),
+        _ => {}
+    }
     child.wait_with_output().unwrap()
 }
 
