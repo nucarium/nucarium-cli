@@ -43,6 +43,12 @@ pub fn run(event: &str, env: Option<&str>, agent: Option<&str>) {
                 SystemTime::now(),
             );
         }
+        // Read whatever is left of the payload before leaving. An event this
+        // program has no use for is never read above, and an agent still
+        // writing to a hook that has gone is told its pipe broke. Nothing
+        // read here is kept, and the limit above ends a pipe that never
+        // closes.
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
     });
 }
 

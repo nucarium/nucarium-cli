@@ -117,6 +117,29 @@ fn the_hook_exits_0_whatever_it_is_given() {
 }
 
 #[test]
+fn the_hook_reads_its_input_to_the_end_even_for_an_event_it_has_no_use_for() {
+    use std::io::Write;
+    let rig = Rig::new();
+    // More than a pipe holds, so the write cannot finish unless it is read.
+    let payload = json!({ "session_id": "s1", "filler": "x".repeat(1 << 20) }).to_string();
+    for event in ["SomethingNotInventedYet", "Stop"] {
+        let mut child = rig
+            .nucleated()
+            .args(["hook", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let written = child.stdin.take().unwrap().write_all(payload.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        assert!(written.is_ok(), "{event}: the agent was told {written:?}");
+        assert_eq!(out.status.code(), Some(0), "{event}");
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{event}");
+    }
+}
+
+#[test]
 fn the_hook_exits_0_with_no_config_a_broken_config_or_an_unknown_environment() {
     let home = Home::new();
     let payload = json!({ "session_id": "s1" }).to_string();
