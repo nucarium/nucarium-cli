@@ -113,6 +113,13 @@ branch is usually deleted afterwards. If GitHub can't be reached, the answer is
 treated as "not merged". `remove-session` is all or nothing: one unsaved repo
 keeps the whole session.
 
+`nucleate` removes only what it made. Its own worktrees are the ones under the
+nucleus's `.worktrees/`. A worktree anywhere else that was added from one of
+the nucleus's bare repos, by another tool or by hand, is never removed by
+`remove`, `remove-session` or `hook-remove`, and while a repo holds such a
+worktree its stale worktree records are not pruned, since `git worktree prune`
+would drop that worktree's record too if its folder were away at the time.
+
 `nucleated` counts by this same rule, so what Watch shows as unsaved is what
 `nucleate` would refuse to delete: the worktrees with uncommitted changes, and
 the commits that are on no remote. A new session branch tracks the
@@ -286,13 +293,15 @@ if the box were not signed in.
 
 ## nucleated
 
-The daemon runs as the agent user, never as root. It does eight things:
+The daemon runs as the agent user, never as root. It does ten things:
 
 | Job | What it does |
 |---|---|
 | Heartbeat | Every 60 seconds: disk used, load, uptime, memory pressure, whether the box is on battery and whether it needs a reboot, which configured agent servers are alive and how often each has been restarted, the last count of unsaved work, and how often the daemon passes on a working session's tool activity. |
 | Event forwarding | `nucleated hook <event>` writes the allowlisted fields of an agent hook to a local spool. The daemon sends routine events in batches and "needs input" at once. |
 | Environment discovery | It reads the agent servers on the box from its config and reports each as an environment. |
+| Drivers | For an environment watched through a driver, a tool you run and steer agents with, it asks the driver which agents it has and what each is doing, and reports them as sessions. It reads state and sends the driver no command. See [Drivers](#drivers). |
+| Config sync | With a repository of your own named in the config, it keeps each login's agent settings, instructions and skills at one pinned branch, and each heartbeat says which commit an environment is at. Off by default. See [Config sync](#config-sync). |
 | Unsaved work and outcomes | It counts what exists only on the box, on a schedule, and when a session stops or ends it reports what the session left behind: commits made, work not saved, and the addresses of its open pull requests. See [Unsaved work and outcomes](#unsaved-work-and-outcomes). |
 | Housekeeping | Fetch and prune, remove sessions that are finished and hold nothing unsaved, and snapshot uncommitted work to a hidden ref. These call the same code as `nucleate`. |
 | Maintenance pause | `nucleated pause 2h` tells Watch to hold its alerts for this box going dark while you work on it. See [The maintenance pause](#the-maintenance-pause). |
@@ -310,11 +319,12 @@ pauses or resumes an agent or an agent server. Every probe it runs only asks.
 | Command | What it does |
 |---|---|
 | `nucleated run` | The daemon, in the foreground. This is what the systemd unit starts. Exits 0 on SIGTERM or SIGINT, 1 if its config cannot be read. |
-| `nucleated hook <event> [--env NAME]` | The hook entry point. `<event>` is the agent's own event name, unchanged (`SessionStart`, `Notification`, and so on). Reads the hook's JSON on standard input, prints nothing, and exits 0 within two seconds whatever happens. |
+| `nucleated hook <event> [--env NAME] [--agent NAME]` | The hook entry point. `<event>` is the agent's own event name, unchanged (`SessionStart`, `Notification`, and so on). `--agent` says whose hook it is; without it, the hook is the named environment's agent's, else Claude Code's. Reads the hook's JSON on standard input, prints nothing, and exits 0 within two seconds whatever happens. |
 | `nucleated status [--json] [--watch]` | The local view, as text. `--json` prints the same data as JSON. `--watch` redraws it every five seconds. |
-| `nucleated check` | Validates the config, the token file's permissions, and that each environment's nucleus exists and its agent server can be asked for; when signed in, sends one heartbeat. Prints `{ "ok", "checks": [{ "name", "ok", "detail" }] }`, exits 0 when everything passes and 1 when anything fails. |
+| `nucleated check` | Validates the config, the token file's permissions, and that each environment's nucleus (for a driver, its folder) exists and its agent server can be asked for; when signed in, sends one heartbeat. Prints `{ "ok", "checks": [{ "name", "ok", "detail" }] }`, exits 0 when everything passes and 1 when anything fails. |
 | `nucleated init [--env NAME] [--root PATH] [--unit UNIT] [--config-dir DIR]` | Writes a first config file with one environment. Asks nothing. Prints `{ "config", "created" }` and leaves an existing file alone. |
-| `nucleated hooks print [--env NAME]` | Prints the `hooks` block to merge into that login's `settings.json`. |
+| `nucleated hooks print [--env NAME] [--agent NAME]` | Prints the `hooks` block to merge into that login's agent settings: for `--agent`, else for the named environment's agent, else for Claude Code. |
+| `nucleated config sync [--env NAME] [--dry-run]` | Syncs agent config now, for one environment or all of them. `--dry-run` prints what would change and changes nothing. Exits 1 when `[config_sync]` is not set. See [Config sync](#config-sync). |
 | `nucleated housekeeping run <job> [--env NAME] [--dry-run]` | Runs one job now: `refresh`, `cleanup` or `snapshot`. Prints JSON. `--dry-run` reports what `cleanup` or `snapshot` would do. |
 | `nucleated unit` | Prints the systemd user unit below. |
 | `nucleated pause <duration>` | Announces maintenance for `<duration>`, at most `24h`: `30m`, `2h`. Prints `{ "paused": true, "until" }`. Exits 2, and pauses nothing, for no time at all, more than a day, or anything that is not a duration. Pausing again replaces the pause. |
@@ -326,6 +336,11 @@ pauses or resumes an agent or an agent server. Every probe it runs only asks.
 Every key is optional. With no file at all the daemon runs with no
 environments and no target.
 
+A key no table knows is an error that names it, and never a setting quietly
+left at its default: `allowed-signers` for `allowed_signers` would otherwise
+be a sync that checks no signature. A daemon that is running keeps the config
+it had until the file is fixed, and one that is starting does not start.
+
 ```toml
 # The name suggested for this box at `nucleate login`. Default: the hostname.
 machine = "agentbox"
@@ -336,6 +351,10 @@ target = "hosted"
 
 # Where the daemon keeps its spool and what it knows about sessions.
 # state_dir = "/home/agent/.local/state/nucleated"
+# Where it keeps what may hold content, which the state folder never does:
+# the clone of your config repository and the one copy of what a sync
+# replaced. It may not be inside state_dir.
+# cache_dir = "/home/agent/.cache/nucleated"
 
 [watch]
 # Only for a Watch API on this machine, in development.
@@ -359,7 +378,7 @@ root = "/home/agent/client-a"
 unit = "agent-server@client-a.service"
 # Instead of `unit`: a command that exits 0 while the agent server is alive.
 # check = "tmux has-session -t client-a"
-# Which agent runs here. Default and only value today: "claude-code".
+# Which agent runs here: "claude-code" or "codex". Default: "claude-code".
 agent = "claude-code"
 # That login's agent config folder, so a hook can tell which environment it
 # belongs to (see Hooks).
@@ -367,6 +386,32 @@ config_dir = "/home/agent/.claude-client-a"
 # Per-environment overrides of nucleate's settings. Defaults: nucleate's own.
 # github_token_file = "/run/agent-tokens/client-a"
 # branch_prefix = "workspace"
+
+# An environment watched through a driver (see Drivers). One table per
+# driver's server on the box.
+# [[environment]]
+# name = "t3"
+# The driver: "t3code", "herdr-core", "herdr-tui" or "orca".
+# driver = "t3code"
+# The folder its agents work under. For a driver that makes its own
+# worktrees (Orca) this is the folder it keeps them in, and it may not be,
+# hold or sit inside a nucleus. For the others it may be a nucleus.
+# root = "/home/agent/client-a"
+# The unit that runs the driver's server. Default: the unit the driver's own
+# documentation names, where it names one (t3code.service, orca-serve.service).
+# A driver that names none needs `unit` or `check` here.
+# unit = "t3code.service"
+# How often the driver is asked. Default: 15s (5s for Herdr). "off" keeps the
+# environment and asks nothing.
+# driver_poll = "15s"
+# Each driver reads only the keys its page lists; any other is refused.
+# driver_home = "/home/agent/.t3"                 # the driver's own data folder
+# driver_url = "http://127.0.0.1:3773"            # its server, on this machine only
+# driver_token_file = "/home/agent/.config/nucleated/t3code.token"  # read-only, mode 600
+# driver_socket = "/run/user/1001/herdr-core/default.sock"
+# driver_session = "default"
+# driver_cli = "/opt/orca-server/bin/orca-ide"
+# driver_dirs = ["/srv/more-orca-worktrees"]
 
 [housekeeping]
 # Each takes "hourly", "daily", "weekly" or "off".
@@ -401,11 +446,31 @@ unsaved = "10m"
 # dir = "/home/agent/.local/state/nucleated/spool"
 max_age = "7d"
 max_events = 10000
+
+# Only to keep agent config current from a repository of your own (see
+# Config sync). Left out, nothing is fetched and nothing is written.
+# [config_sync]
+# The repository, as git takes it. It is handed to git on the box and goes
+# nowhere else: not to a log, not to the state folder, not to Watch.
+# repository = "git@github.com:your-org/agent-config.git"
+# The one branch to follow. Required.
+# branch = "main"
+# How often it is fetched: "hourly", "daily", "weekly" or "off".
+# interval = "hourly"
+# An OpenSSH allowed-signers file you keep outside that repository. Naming
+# one turns require_signed on: a commit not signed by a signer in it is
+# refused, and so is one that is not a descendant of the last one applied.
+# allowed_signers = "/home/agent/.config/nucleated/config-signers"
+# require_signed = true
+# What a file changed by hand means when a new commit arrives: "overwrite"
+# replaces it, after keeping one copy on the box; "keep" leaves that
+# environment alone until the change is undone.
+# on_drift = "overwrite"
 ```
 
 Environment variables: `NUCLEATED_CONFIG` (the config file),
 `NUCARIUM_API_URL` (the Watch API, for `nucleate login`),
-`XDG_CONFIG_HOME` and `XDG_STATE_HOME`.
+`XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME`.
 
 Files the daemon keeps, all under `~/.local/state/nucleated/` (or `state_dir`)
 and all mode 600:
@@ -415,7 +480,7 @@ and all mode 600:
 | `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. |
 | `spool/rejected/` | Events Watch refused. Kept for `max_age`, never retried. |
 | `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, and when an event for it was last sent. `nucleated status` reads these. |
-| `daemon.json` | The daemon's last heartbeat and what it has sent. |
+| `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
 | `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times. The heartbeat reads it. |
@@ -423,6 +488,13 @@ and all mode 600:
 | `merged.json` | GitHub's answers to "was this commit merged?", so the count asks about a commit once an hour at most and never again once it was merged. |
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
+| `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, and, for a claim in doubt, its key and since when. No title, message or path. |
+| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `config-sync.json` | Per environment: the commit its config was applied from, whether a synced file was changed by hand, one fixed word for how the sync stands, and two times. No address, branch, path or name. Only with `[config_sync]` set. |
+
+One folder is kept outside it, because it holds content: `~/.cache/nucleated/`
+(or `cache_dir`), with the clone of your config repository and the one copy
+of what a sync replaced. Nothing in it is ever sent.
 
 ### The systemd user unit
 
@@ -500,6 +572,36 @@ the only one configured. A hook that matches no environment does nothing. Two
 logins that share a nucleus cannot be told apart by folder: give each its
 `config_dir`, or register its hooks with `--env`.
 
+Whose hook it is comes before where it lands, and nothing is guessed about
+it. A hook is the agent's that its command names with `--agent`, else the
+agent of the environment `--env` names, else Claude Code's. Another agent's
+block, printed with `nucleated hooks print --agent NAME`, carries `--agent
+NAME` in every command, and its payload is read only by that agent's adapter.
+The environment is then looked for among those that run that agent, by that
+agent's own config-folder variable or by folder. An environment watched
+through a driver takes any agent's hooks that are run from inside its folder.
+
+Each agent has one adapter, in a file of its own under `src/agent/`:
+
+| `agent` | Adapter | Its page |
+|---|---|---|
+| `claude-code` | `src/agent/claude_code.rs` | This section. |
+| `codex` | `src/agent/codex.rs` | [docs/codex.md](docs/codex.md) |
+
+Codex keeps its hooks in a `hooks.json` of their own, and `nucleated hooks
+print --agent codex` prints the whole of that file, not a block to merge.
+There are two places for it. Per login, it goes in that login's
+`$CODEX_HOME/hooks.json`, printed with `--env NAME`; Codex runs nothing from
+it until that login has opened Codex, run `/hooks` and approved it, and asks
+again whenever a command in it changes. Box-wide, it goes in
+`/etc/codex/hooks.json` as root, printed without `--env`; each hook is then
+placed by its login's `CODEX_HOME`, so every Codex environment needs its
+`config_dir`. `nucleated` writes neither file.
+`contrib/systemd/codex-server@.service` is an example user unit for one
+Codex login's agent server, for the environment's `unit` to name; nothing
+installs or starts it. [docs/codex.md](docs/codex.md) has both routes, the
+events read and what Codex gives the box no way to report.
+
 What each event becomes:
 
 | Claude Code event | Sent as | The session becomes |
@@ -541,13 +643,184 @@ Three more facts have a place in what the box sends, and Claude Code gives the
 box none of them to read, so today the daemon sends none: when a usage limit
 resets (`limit_resets_at` on a failed stop), when an environment's login
 expires (`login_expires_at` on the heartbeat) and the agent's version
-(`agent_version` on the heartbeat). Each is read by the agent's adapter in
-`src/agent.rs`, and an adapter answers only from a field or a file the agent
+(`agent_version` on the heartbeat). Each is read by the agent's adapter under
+`src/agent/`, and an adapter answers only from a field or a file the agent
 documents. The daemon does not guess: Watch says "paused on a usage limit"
 without a time, and warns of no expiry it was not told about.
 
 The hook never blocks a session. It prints nothing, exits 0, gives up after two
 seconds, and needs neither the daemon nor the network: it only writes a file.
+
+### Drivers
+
+A driver is a tool you run and steer agents with on the box: T3 Code, Herdr,
+Orca. It calls no hook, so the daemon asks it, on a thread of its own that a
+heartbeat never waits for. An environment with `driver` set is watched this
+way. Each agent the driver lists becomes a session of that environment, under
+the driver's own id for it, and each change in what the agent is doing becomes
+the same lifecycle event a hook would have recorded.
+
+| `driver` | Adapter | Its page |
+|---|---|---|
+| `t3code` | `src/driver/t3code.rs` | [docs/t3code.md](docs/t3code.md) |
+| `herdr-core`, `herdr-tui` | `src/driver/herdr_core.rs`, `src/driver/herdr_tui.rs` | [docs/herdr.md](docs/herdr.md) |
+| `orca` | `src/driver/orca.rs` | [docs/orca.md](docs/orca.md) |
+
+What holds for every driver, whatever its adapter:
+
+- **State only.** No driver offers its agents' state without their content
+  beside it: titles, messages, prompts, terminal text. An adapter reads a
+  driver's answer into a list of named fields and skips every other field
+  unread. Nothing skipped is held, logged, written down or sent. What comes
+  out of an adapter is an id, what the agent is doing, a short kind for a
+  failure, a time, a counter, and a folder that is used on the box to find a
+  repo's name and a branch and goes no further.
+- **Observe only.** An adapter sends its driver the read calls its page names
+  and no other. Nothing in the daemon starts, stops or steers an agent, and
+  nothing sends a driver a command.
+- **A driver that is not there costs nothing.** Absent, slow, refusing or
+  speaking a newer protocol, it is no look at all: no event is made, no
+  session is ended, and whether the environment's server is alive is still
+  asked of its supervisor (`unit` or `check`) and of nothing else. `nucleated
+  status` shows one fixed word for why, and since when: `absent`,
+  `unreachable`, `timeout`, `rejected`, `no_token`, `unsupported`, `error` or
+  `bad_reply`. `error` is a driver that answered the call with an error of
+  its own, or whose program ran and said it failed; what the error says is
+  never read. The word is shown on the box and is not in the heartbeat: to
+  Watch, a driver that has stopped answering is a live server whose sessions
+  have stopped moving. A driver that keeps not answering is asked ever less
+  often, up to once a minute.
+- **The hook wins.** An agent that runs inside a driver and also has
+  `nucleated`'s hooks is seen twice. The hook notes which of the driver's
+  sessions it is running in, and for as long as the hook's session lives the
+  driver's view of that agent is not reported. A hook that has stopped
+  speaking does not win for ever: an agent killed without its `SessionEnd`
+  leaves a session that never ends, and must not hide whatever runs in its
+  place. So when the hook has said nothing for two minutes and the driver
+  then sees the session at work or waiting on its owner while the hook's
+  session is not, for two minutes more with still no word from the hook, the
+  note is dropped and the driver's view is reported. A session at rest
+  contradicts nothing, and a hook that speaks again wins again. How a hook
+  knows where it is
+  running is each driver's own, from the variables the driver documents or
+  from the folder, and is on its page. For Herdr it holds only when the
+  socket the hook's terminal names is the environment's own; for Orca it is
+  per worktree and kind of agent, so a Claude Code hook stands in for the
+  Claude Code agents in its worktree and not for a Codex beside them.
+- **What is idle when a driver is first seen is history.** It is remembered
+  and nothing is said of it until it does something. If it goes away without
+  ever doing anything, nothing is said of that either: a session Watch never
+  heard of is not reported as ended. A session that turns up later has just
+  started, and is reported as started.
+- **A session is ended when the driver says so, or stops listing it** in two
+  looks in a row. One look can catch a driver between two states.
+- **Housekeeping leaves a driver's own worktrees alone.** For a driver that
+  makes and removes its own worktrees (Orca), no job runs for its
+  environment, by schedule or by hand, and no job over a nucleus beside it
+  snapshots, removes or prunes anything under its folders. Its unsaved work
+  is counted by the same rule as a nucleus's, which only reads.
+- **And any other worktree it did not make.** That does not rest on the
+  config naming a folder. A nucleus's own worktrees are the ones under its
+  `.worktrees/`; a worktree a driver made anywhere else from one of the
+  nucleus's repos (a T3 Code thread's, an Orca worktree outside its named
+  folders) is not snapshotted and not removed, and its repo's worktree
+  records are not pruned. Its unsaved work is still counted with the
+  nucleus's, which only reads.
+- **A driver's unsaved count is all of its worktrees or nothing.** While a
+  driver that owns its worktrees lists one that is in none of the folders
+  the count is made from, no count is sent for its environment, and so none
+  for the box. `nucleated status` says how many are outside.
+
+The heartbeat names the driver an environment is watched through, and, where
+the driver's own apps take a link to one session, the driver's id for the
+installation that the link needs, once Watch has said it takes those two
+fields (see [Fields Watch has to ask for](#fields-watch-has-to-ask-for)).
+Watch builds the link; the box sends no address. A link's template has `{driver_ref}` and `{session_id}` in it, each
+one segment of a path. Whoever fills it in percent-encodes each value as a
+whole segment, leaving only letters, digits, `-` and `_` as they are: `.` and
+`:`, which both values may hold, are encoded too.
+
+### Config sync
+
+With `[config_sync]` set, the daemon keeps each login's agent config at one
+branch of a git repository you name. It fetches on its interval, checks the
+newest commit, and writes that commit's settings, instructions and skills
+into the config folder of every environment that has a `config_dir` and runs
+Claude Code, the one agent whose config folder the sync knows the layout of.
+An environment of another agent is passed over, and an environment watched
+through a driver is not one login and is not synced. A `config_dir` that is
+not a folder is not created: that environment's sync stands at `failed`.
+[docs/config-sync.md](docs/config-sync.md) says what is synced, how your
+settings are laid under the entries `nucleate` and `nucleated` own, and what
+is never touched.
+
+- **Pulled by the box, never pushed by Watch.** Watch has no way to send a
+  box its config. It is told which commit an environment is at, and nothing
+  about what the commit holds.
+- **Nothing is applied for the first time until you have looked.** `nucleated
+  config sync --dry-run` prints what would change in an environment. Until
+  that has been run for it, a new environment's sync stands at `pending`.
+- **One copy of what a sync replaces is kept on the box**, in the cache
+  folder.
+- **A change made by hand is put back by the next commit**, or by `nucleated
+  config sync` run by hand, and by nothing else: the scheduled pass notices
+  it and reports it, and writes nothing while the branch stands still.
+- **Git's own words for an error are shown nowhere**: not in the log, not in
+  the state folder, and not by `nucleated config sync` at a terminal. They
+  can quote the repository's address. The command gives one fixed word, and
+  the same fetch run with git gives the rest.
+- **Credentials are never read and never written.**
+
+Each heartbeat says three things about an environment's config and no more:
+`config_commit`, the commit its config folder was last applied from;
+`config_modified`, whether a file the sync wrote has been changed by hand
+since; and `config_state`, one fixed word for how the sync stands. They go to
+a Watch that has said it takes them (see
+[Fields Watch has to ask for](#fields-watch-has-to-ask-for)); `nucleated
+status` shows them either way.
+
+| `config_state` | Means |
+|---|---|
+| `ok` | The config folder is at the newest commit the box has fetched. |
+| `pending` | A commit is there to apply and waits for your dry run. |
+| `held` | A newer commit is held back by a change made by hand, with `on_drift = "keep"`. |
+| `unreachable` | The repository could not be fetched. |
+| `rejected` | The newest commit was refused: not signed by a named signer, not a descendant of the last, or holding something the sync will not write. |
+| `failed` | The commit was accepted and could not be written on the box. |
+
+Why exactly, in one more fixed word, is in `nucleated status` and stays on
+the box: for `unreachable`, whether git refused the fetch, the fetch ran over
+its minute, or there is no git to fetch with. A dry run changes nothing,
+`config-sync.json` included, so what `nucleated status` says of an
+environment's config is from the daemon's last pass or the last run without
+`--dry-run`. What a check last found is passed on for ten minutes and no longer:
+a sync that has stopped checking says nothing rather than something old.
+
+### Fields Watch has to ask for
+
+Five fields of a heartbeat are newer than the contract every Watch holds:
+`driver`, `driver_ref`, `config_commit`, `config_modified` and
+`config_state`. Watch refuses a heartbeat that carries a field it does not
+name, and a refused heartbeat is a box gone dark, with every environment on
+it looking down and no event sent. So the daemon sends none of the five on a
+guess.
+
+- Every heartbeat carries what every Watch takes. Watch's answer to a
+  heartbeat may name, in `accepts`, the newer fields it takes; the daemon
+  then sends those, starting at the next turn of its loop and not a whole
+  interval later. A Watch that names none is sent none.
+- What the box knows and has not sent stays on the box. `nucleated status`
+  shows the values, and names the fields held back; `nucleated check` says
+  the same in its `heartbeat` line.
+- If Watch refuses a heartbeat that carried a field it had named, the daemon
+  sends the same heartbeat without the newer fields in the same breath, and
+  sends none of them for an hour. The box stays in sight throughout.
+- Signing in again starts from nothing named.
+
+Until the Watch you report to names them, an environment watched through a
+driver is reported like any other: its server, its sessions and their
+events, with no link into the driver, and config sync runs on the box with
+nothing said of it to Watch.
 
 ### What leaves the box
 
@@ -557,10 +830,10 @@ Every payload is built from named fields. This is the whole list.
 |---|---|
 | `event_id` | Made on the box: a UUIDv7. |
 | `env_id` | The environment's `name` in the config. |
-| `session_id` | The hook's `session_id`. |
+| `session_id` | The hook's `session_id`. For a session a driver lists, the driver's own id for it. |
 | `bridge_session_id` | `CLAUDE_CODE_BRIDGE_SESSION_ID`, when the agent sets it. |
 | `type` | The table above. |
-| `repos` | The session's repos, as `owner/name` from each remote, else the folder name. |
+| `repos` | The session's repos, as `owner/name` from each remote, else the name of the folder the repository lives in. For a linked worktree outside a nucleus that is the folder of the repository it was added from, never the worktree's own, which a tool that makes a worktree per task names after the task. |
 | `branch` | The session's branch. |
 | `error_kind` | The hook's `error`, for `StopFailure` only, and only when it is a short kind such as `rate_limit`. |
 | `limit_resets_at` | When the agent says a usage limit resets, for `StopFailure` only: a timestamp, kept only from a minute before to eight days after the event. Claude Code's hook gives none, so none is sent. |
@@ -572,6 +845,8 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, about the box | `on_battery`, yes or no, from NUT, only with `[ups]` set. `reboot_required`, yes or no, on Debian and Ubuntu, where `/var/run/reboot-required` says so. `uncommitted_repos`, `unpushed_commits` and `last_snapshot_at`: the box's unsaved work with each nucleus counted once, and the time since which every nucleus has had a good snapshot. `paused_until`, a timestamp, only while a maintenance pause is set. |
 | Heartbeat, per environment | `server_restarts`, systemd's running count of restarts of the agent server's unit. `unsaved`: `uncommitted_repos`, `unpushed_commits` and `counted_at`, two numbers and a time. `last_snapshot_at`, when the snapshot job last finished for that nucleus with nothing failed. |
 | Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
+| Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
+| Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |
 
 Each value is checked against the shape Watch accepts before it is written
 down or sent. One that does not fit is left out. A time is built from a time
@@ -595,6 +870,17 @@ status` names the files that changed, and that answer is read for whether it is
 empty and then dropped. From GitHub's list of pull requests it reads four
 fields: the address, the state, whether it was merged and the head commit.
 
+Never read from a driver, never written to disk, never sent: thread and
+session titles, messages, prompts, goals, terminal contents and previews, tool
+names and input, error text, command lines, labels, and the names of other
+machines. A driver hands these over beside the state, and the adapter's parser
+skips them unread. A folder a driver names is read to find the session's repos
+and branch, and goes no further.
+
+Never sent from a config sync: the repository's address, its branch, a
+commit's subject, author or signer, any file's name or content, and git's own
+words for an error.
+
 Two things leave the box for somewhere other than Watch, and neither goes to
 Nucarium. The hourly snapshot pushes uncommitted work, which is code, to
 `refs/wip/<branch>` on the repository's own remote: your Git host, under your
@@ -612,6 +898,18 @@ describes its pull request with the sentinel in the title, the body, the branch
 and the author, and what leaves is counts, times and one address. It lists
 every field an event and a heartbeat may carry, and fails if one is sent that
 is not on the list.
+
+Every adapter for a third party adds its own part of the gate, in its own
+test file, built from the same pieces (`tests/common/gate.rs`): the sentinel,
+the one list of fields, the scanner, the stand-in for Watch, and a way to run
+the daemon itself as a process with a `PATH` the test chooses, for proving it
+starts no third party's program. The scanner looks at what every file under
+the state folder holds and at what every file and folder there is called. An
+adapter's fixture is its third party's own answer with the sentinel in every
+field that carries content, in fields where a short word belongs, and in
+fields that do not exist yet. `tests/codex.rs`, `tests/t3code.rs`, `tests/herdr.rs`,
+`tests/orca.rs` and `tests/config_sync.rs` are each part of the gate: if one
+fails, do not release.
 
 ### Spool and replay
 
@@ -646,7 +944,10 @@ nucleus, and writes two numbers and a time to `unsaved.json`. The heartbeat
 reads that file. It runs no git, however many worktrees there are, so a
 heartbeat costs the same on a box with one session as with a hundred. Two
 logins that share a nucleus report the same counts, and the box's own totals
-count that nucleus once. A worktree git cannot read makes its nucleus's count
+count that nucleus once. The count covers every worktree of the nucleus's
+repos, including one another tool added outside `.worktrees/`, except those
+in the folders of a driver that owns its worktrees, which are counted under
+that driver's environment. A worktree git cannot read makes its nucleus's count
 unknown, and nothing is sent in place of it. `"off"` stops the count and
 removes the last one.
 
@@ -766,6 +1067,14 @@ removes nothing on a system without it. Where two logins share one nucleus,
 each job runs over it once, and a session is live while an agent session of
 either login is working in it.
 
+No job runs for an environment whose driver owns its worktrees, and no job
+reaches into that driver's folders from a nucleus beside them: a worktree
+there is not snapshotted, not removed, and its record in a shared repository
+is not pruned. The same holds for every worktree of a nucleus's repos that is
+not under the nucleus's `.worktrees/`, whoever made it and wherever it is:
+`snapshot` reports it as skipped, and `cleanup` does not prune the worktree
+records of a repo that holds one. See [Drivers](#drivers).
+
 ## Assumptions
 
 Choices this repository makes where the product spec leaves room:
@@ -825,6 +1134,10 @@ cargo test -- --ignored    # also runs the one test that calls the GitHub API
 cargo clippy --all-targets -- -D warnings
 ```
 
+The suite needs `git` and OpenSSH's `ssh-keygen` on `PATH`. The tests of the
+config sync's signature check make their own keys, and fail on a machine that
+cannot make one: a check that did not run is not reported as passed.
+
 Nothing in the suite talks to Watch or to GitHub. `tests/common` starts a
 stand-in for the Watch API on a local port; `tests/login.rs` drives the sign-in
 against it through every device-flow error, a slow API and a dead one, and
@@ -841,6 +1154,10 @@ value outside its pattern or range, is answered with `validation_failed`.
 When the contract changes, that module changes with it.
 `tests/privacy.rs` is the release gate described under
 [What leaves the box](#what-leaves-the-box): if it fails, do not release.
+`tests/seam.rs` covers what holds for every agent and every driver whichever
+adapter is asked: whose hook a hook is, where it lands, and that housekeeping
+never touches what a driver owns. Each adapter's own tests, and its part of
+the gate, are in a file named for it.
 
 To run both binaries against a Watch API on this machine, sign in with
 `nucleate login --api-url http://localhost:8787`.

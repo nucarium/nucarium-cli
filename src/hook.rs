@@ -6,6 +6,7 @@
 //! 0 within two seconds: nothing here may ever hold up a session.
 
 use crate::agent::{self, Agent, Lifecycle};
+use crate::driver;
 use crate::envelope::{unix_ms, Draft, Envelope};
 use crate::github;
 use crate::settings::{self, Environment, Settings};
@@ -20,7 +21,9 @@ use std::time::{Duration, SystemTime};
 pub const GIVE_UP_AFTER: Duration = Duration::from_secs(2);
 
 /// Run the hook entry point. Never fails, never prints, never takes long.
-pub fn run(event: &str, env: Option<&str>) {
+/// `agent` is the `--agent` a hook's command names; with none, the hook is
+/// the default agent's.
+pub fn run(event: &str, env: Option<&str>, agent: Option<&str>) {
     // Whatever happens below — a pipe that never closes, a slow disk — the
     // process is gone within the limit, and it leaves with success.
     std::thread::spawn(|| {
@@ -31,10 +34,11 @@ pub fn run(event: &str, env: Option<&str>) {
     std::panic::set_hook(Box::new(|_| {}));
     let _ = std::panic::catch_unwind(|| {
         if let Ok(settings) = settings::load() {
-            let _ = record(
+            let _ = record_as(
                 &settings,
                 event,
                 env,
+                agent,
                 &mut std::io::stdin().lock(),
                 SystemTime::now(),
             );
@@ -47,34 +51,54 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     resolve(a) == resolve(b)
 }
 
+/// True when a hook of `agent` may belong to this environment: the agent is
+/// the one the environment runs, or the environment is watched through a
+/// driver, which runs agents of every kind.
+fn takes(environment: &Environment, agent: &dyn Agent) -> bool {
+    environment.agent == agent.name() || environment.driver.is_some()
+}
+
 /// The environment a hook names outright: `--env`, else the one whose
 /// `config_dir` is the agent's config folder for this process.
-fn named<'a>(settings: &'a Settings, flag: Option<&str>) -> Option<&'a Environment> {
+fn named<'a>(
+    settings: &'a Settings,
+    flag: Option<&str>,
+    agent: &dyn Agent,
+) -> Option<&'a Environment> {
     if let Some(name) = flag {
         return settings.environment(name);
     }
+    let actual = std::env::var_os(agent.config_dir_var())?;
     settings.environments.iter().find(|env| {
-        let Some(config_dir) = &env.config_dir else {
-            return false;
-        };
-        agent::by_name(&env.agent)
-            .and_then(|agent| std::env::var_os(agent.config_dir_var()))
-            .is_some_and(|actual| same_dir(Path::new(&actual), config_dir))
+        env.agent == agent.name()
+            && env
+                .config_dir
+                .as_ref()
+                .is_some_and(|config_dir| same_dir(Path::new(&actual), config_dir))
     })
 }
 
-/// The environment a hook belongs to by where it is running: the one whose
-/// nucleus holds the session's folder, else the only one there is.
-fn located<'a>(settings: &'a Settings, cwd: Option<&Path>) -> Option<&'a Environment> {
+/// The environment a hook belongs to by where it is running: among those
+/// that take this agent's hooks, the one whose nucleus holds the session's
+/// folder, else the only one there is.
+fn located<'a>(
+    settings: &'a Settings,
+    agent: &dyn Agent,
+    cwd: Option<&Path>,
+) -> Option<&'a Environment> {
+    let candidates: Vec<&Environment> = settings
+        .environments
+        .iter()
+        .filter(|env| takes(env, agent))
+        .collect();
     let inside = cwd.and_then(|cwd| {
         let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let mut holding: Vec<(usize, &Environment)> = settings
-            .environments
+        let mut holding: Vec<(usize, &Environment)> = candidates
             .iter()
             .filter_map(|env| {
                 let root = env.root.canonicalize().ok()?;
                 cwd.starts_with(&root)
-                    .then_some((root.components().count(), env))
+                    .then_some((root.components().count(), *env))
             })
             .collect();
         // The deepest nucleus wins. Two logins sharing that nucleus cannot be
@@ -86,8 +110,8 @@ fn located<'a>(settings: &'a Settings, cwd: Option<&Path>) -> Option<&'a Environ
             _ => None,
         }
     });
-    inside.or(match settings.environments.as_slice() {
-        [only] => Some(only),
+    inside.or(match candidates.as_slice() {
+        [only] => Some(*only),
         _ => None,
     })
 }
@@ -95,10 +119,10 @@ fn located<'a>(settings: &'a Settings, cwd: Option<&Path>) -> Option<&'a Environ
 /// Where a session is working: its repos, its branch, and its nucleus session
 /// folder if it has one.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Place {
-    repos: Vec<String>,
-    branch: Option<String>,
-    workspace: Option<String>,
+pub(crate) struct Place {
+    pub(crate) repos: Vec<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) workspace: Option<String>,
 }
 
 /// A nucleus session: the manifest names its repos and its branch.
@@ -137,8 +161,28 @@ fn origin_url(config: &str) -> Option<String> {
     None
 }
 
+/// The name of the folder a repository lives in, from its git folder: for
+/// `<name>/.git`, `<name>`, and for a bare `<name>.git`, `<name>`. Nothing
+/// for a git folder that is neither.
+fn repository_folder(common: &Path) -> Option<String> {
+    let common = common.canonicalize().ok()?;
+    let name = common.file_name()?.to_string_lossy().to_string();
+    if name == ".git" {
+        return Some(common.parent()?.file_name()?.to_string_lossy().to_string());
+    }
+    name.strip_suffix(".git")
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Any other checkout: read the branch and the remote from git's own files,
 /// without running git, so this cannot hang.
+///
+/// A repository on GitHub is named as GitHub names it. Any other is named by
+/// the folder it lives in. For a linked worktree that is the folder of the
+/// repository it was added from, never the worktree's own: a tool that makes
+/// a worktree per task names the folder after the task, and a task's name is
+/// not a repo's.
 fn checkout_place(cwd: &Path) -> Option<Place> {
     let top = cwd.ancestors().find(|dir| dir.join(".git").exists())?;
     let dot_git = top.join(".git");
@@ -156,16 +200,23 @@ fn checkout_place(cwd: &Path) -> Option<Place> {
                 .strip_prefix("ref: refs/heads/")
                 .map(str::to_string)
         });
-    let common = match fs::read_to_string(git_dir.join("commondir")) {
-        Ok(relative) => git_dir.join(relative.trim()),
-        Err(_) => git_dir,
+    // A linked worktree's git folder names the repository's own.
+    let (common, linked) = match fs::read_to_string(git_dir.join("commondir")) {
+        Ok(relative) => (git_dir.join(relative.trim()), true),
+        Err(_) => (git_dir, false),
     };
     let label = fs::read_to_string(common.join("config"))
         .ok()
         .and_then(|config| origin_url(&config))
         .and_then(|url| github::slug(&url))
         .map(|(owner, repo)| format!("{owner}/{repo}"))
-        .or_else(|| top.file_name().map(|n| n.to_string_lossy().to_string()));
+        .or_else(|| {
+            if linked {
+                repository_folder(&common)
+            } else {
+                top.file_name().map(|n| n.to_string_lossy().to_string())
+            }
+        });
     Some(Place {
         repos: label.into_iter().collect(),
         branch,
@@ -173,7 +224,9 @@ fn checkout_place(cwd: &Path) -> Option<Place> {
     })
 }
 
-fn place(environment: &Environment, cwd: Option<&Path>) -> Place {
+/// Where a session working in `cwd` is: a hook's session, or one a driver
+/// listed. The folder is read on the box and goes no further than this.
+pub(crate) fn place(environment: &Environment, cwd: Option<&Path>) -> Place {
     let Some(cwd) = cwd else {
         return Place::default();
     };
@@ -192,15 +245,33 @@ pub fn record(
     payload: &mut dyn Read,
     now: SystemTime,
 ) -> Option<PathBuf> {
-    let named = named(settings, env);
-    if env.is_some() && named.is_none() {
+    record_as(settings, event, env, None, payload, now)
+}
+
+/// As [`record`], for a hook whose command names its agent with `--agent`.
+///
+/// Whose payload this is comes first, and nothing is guessed about it: the
+/// agent the command names, else the agent of the environment it names, else
+/// the default agent. Only then is the environment found, among those that
+/// take that agent's hooks.
+pub fn record_as(
+    settings: &Settings,
+    event: &str,
+    env: Option<&str>,
+    agent: Option<&str>,
+    payload: &mut dyn Read,
+    now: SystemTime,
+) -> Option<PathBuf> {
+    let by_flag = env.and_then(|name| settings.environment(name));
+    if env.is_some() && by_flag.is_none() {
         return None;
     }
     let adapter: &dyn Agent = agent::by_name(
-        named
-            .or(settings.environments.first())
-            .map(|env| env.agent.as_str())?,
+        agent
+            .or(by_flag.map(|env| env.agent.as_str()))
+            .unwrap_or(agent::DEFAULT),
     )?;
+    let named = named(settings, env, adapter);
     let Lifecycle {
         event: kind,
         session_id,
@@ -208,7 +279,7 @@ pub fn record(
         error_kind,
         limit_resets_at,
     } = adapter.lifecycle(event, payload)?;
-    let environment = named.or_else(|| located(settings, cwd.as_deref()))?;
+    let environment = named.or_else(|| located(settings, adapter, cwd.as_deref()))?;
     let place = place(environment, cwd.as_deref());
     let draft = Draft {
         env_id: environment.name.clone(),
@@ -231,12 +302,121 @@ pub fn record(
     if spool.holds_at_least(settings.spool_max_events.saturating_mul(2)) {
         return None;
     }
-    spool.write(&record).ok()
+    let written = spool.write(&record).ok()?;
+    // If this agent runs inside a driver's session, the driver lists it too.
+    // Say so, and the driver's adapter stands aside: the hook wins.
+    driver::note_claims(
+        settings,
+        &record.event.env_id,
+        adapter.name(),
+        &record.event.session_id,
+        cwd.as_deref(),
+        &|name| std::env::var(name).ok(),
+    );
+    Some(written)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repository with one commit and no GitHub remote, and a linked
+    /// worktree of it in a folder named for a task.
+    fn linked(dir: &Path, repository: &str, bare: bool) -> PathBuf {
+        let git = |at: &Path, args: &[&str]| {
+            let done = std::process::Command::new("git")
+                .args(args)
+                .current_dir(at)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "git {args:?}");
+        };
+        let source = dir.join("source");
+        fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let repository = dir.join(repository);
+        let from = source.to_str().unwrap();
+        let to = repository.to_str().unwrap();
+        if bare {
+            git(dir, &["clone", "-q", "--bare", from, to]);
+        } else {
+            git(dir, &["clone", "-q", from, to]);
+        }
+        git(
+            &repository,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://git.example.test/team/web.git",
+            ],
+        );
+        let worktree = dir.join("worktrees").join("fix the login page");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task/login",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        worktree
+    }
+
+    #[test]
+    fn a_linked_worktree_is_named_for_its_repository_and_never_for_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hosted somewhere other than GitHub, so the name is a folder's.
+        let worktree = linked(dir.path(), "web", false);
+        let inside = worktree.join("src");
+        fs::create_dir_all(&inside).unwrap();
+        let place = checkout_place(&inside).unwrap();
+        assert_eq!(place.repos, ["web"]);
+        assert_eq!(place.branch.as_deref(), Some("task/login"));
+        // The repository's own checkout is named by its folder, as before.
+        let own = checkout_place(&dir.path().join("web")).unwrap();
+        assert_eq!(own.repos, ["web"]);
+        assert_eq!(own.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_worktree_of_a_bare_repository_is_named_for_it_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = linked(dir.path(), "api.git", true);
+        assert_eq!(checkout_place(&worktree).unwrap().repos, ["api"]);
+        // A bare repository in a folder with no such name has no name to
+        // give, and the task's is not given in its place.
+        let other = tempfile::tempdir().unwrap();
+        let worktree = linked(other.path(), "storage", true);
+        let place = checkout_place(&worktree).unwrap();
+        assert_eq!(place.repos, Vec::<String>::new());
+        assert_eq!(place.branch.as_deref(), Some("task/login"));
+    }
+
+    #[test]
+    fn the_folder_a_repository_lives_in_is_read_from_its_git_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        for (git_dir, name) in [
+            ("web/.git", Some("web")),
+            ("api.git", Some("api")),
+            ("storage", None),
+        ] {
+            let path = dir.path().join(git_dir);
+            fs::create_dir_all(&path).unwrap();
+            assert_eq!(repository_folder(&path).as_deref(), name, "{git_dir}");
+        }
+        assert_eq!(repository_folder(&dir.path().join("gone/.git")), None);
+    }
 
     #[test]
     fn the_origin_url_is_read_from_a_git_config() {

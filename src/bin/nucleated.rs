@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use nucleate::envelope::rfc3339;
 use nucleate::settings::{self, Settings};
-use nucleate::{agent, config, daemon, hook, housekeeping, pause, status};
+use nucleate::{agent, config, config_sync, daemon, hook, housekeeping, pause, status};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +29,10 @@ enum Command {
         /// The environment this hook belongs to.
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+        /// The agent whose hook this is. Default: the environment's agent,
+        /// else claude-code.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -66,6 +70,11 @@ enum Command {
         #[command(subcommand)]
         command: HousekeepingCommand,
     },
+    /// Agent config kept current from a repository of your own.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Print the systemd user unit.
     Unit,
     /// Announce maintenance: until the time is up, Watch holds its alerts for
@@ -80,10 +89,29 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HooksCommand {
-    /// Print the hooks block to merge into that login's settings.json.
+    /// Print the hooks block to merge into that login's agent settings.
     Print {
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+        /// The agent to print for. Default: the environment's agent, else
+        /// claude-code.
+        #[arg(long, value_name = "NAME")]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Sync now: fetch the pinned branch and apply it to each environment's
+    /// config folder.
+    Sync {
+        /// Only this environment. Default: all of them.
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+        /// Print what would change, and change nothing. Nothing is applied to
+        /// an environment for the first time until this has been run for it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -246,21 +274,38 @@ fn run(cli: Cli) -> Result<u8> {
             config_dir,
         } => print(&init(env, root, unit, config_dir)?)?,
         Command::Hooks {
-            command: HooksCommand::Print { env },
+            command: HooksCommand::Print { env, agent },
         } => {
             let settings = settings::load()?;
-            let agent_name = match &env {
-                Some(name) => settings
-                    .environment(name)
-                    .map(|environment| environment.agent.clone())
-                    .ok_or_else(|| {
-                        anyhow!("no environment named {name} in {}", settings.path.display())
-                    })?,
-                None => "claude-code".to_string(),
+            let of_environment = match &env {
+                Some(name) => Some(
+                    settings
+                        .environment(name)
+                        .map(|environment| environment.agent.clone())
+                        .ok_or_else(|| {
+                            anyhow!("no environment named {name} in {}", settings.path.display())
+                        })?,
+                ),
+                None => None,
             };
-            let agent = agent::by_name(&agent_name)
-                .ok_or_else(|| anyhow!("no such agent: {agent_name}"))?;
+            let agent_name = agent
+                .or(of_environment)
+                .unwrap_or_else(|| agent::DEFAULT.to_string());
+            let agent = agent::by_name(&agent_name).ok_or_else(|| {
+                anyhow!(
+                    "no such agent: {agent_name}; the agents are {}",
+                    agent::NAMES.join(", ")
+                )
+            })?;
             print(&agent.hooks_block(env.as_deref()))?;
+        }
+        Command::Config {
+            command: ConfigCommand::Sync { env, dry_run },
+        } => {
+            let settings = settings::load()?;
+            let (report, ok) = config_sync::run_now(&settings, env.as_deref(), dry_run)?;
+            print(&report)?;
+            return Ok(u8::from(!ok));
         }
         Command::Housekeeping {
             command: HousekeepingCommand::Run { job, env, dry_run },
@@ -303,8 +348,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // The hook entry point comes first and stands apart: whatever happens in
     // it, the agent's session sees success.
-    if let Command::Hook { event, env } = &cli.command {
-        hook::run(event, env.as_deref());
+    if let Command::Hook { event, env, agent } = &cli.command {
+        hook::run(event, env.as_deref(), agent.as_deref());
         return ExitCode::SUCCESS;
     }
     match run(cli) {

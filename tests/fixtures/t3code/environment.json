@@ -1,0 +1,19 @@
+{
+  "environmentId": "env_5b1f0c7e-2d9a",
+  "label": "ZZLEAKZZ label the user typed this",
+  "platform": {
+    "os": "linux",
+    "arch": "x64"
+  },
+  "serverVersion": "0.1.10-ZZLEAKZZ_serverVersion",
+  "orchestrationProtocolVersion": 2,
+  "capabilities": {
+    "shellThreadFamilies": true,
+    "shellOlderSettled": true,
+    "agentActivityPublishing": true,
+    "serverInstallation": {
+      "prefix": "/home/agent/ZZLEAKZZ_serverInstallation"
+    }
+  },
+  "owner": "ZZLEAKZZ owner, a field that does not exist yet the user typed this"
+}

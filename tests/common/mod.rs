@@ -2,6 +2,8 @@
 //! in a home folder of their own.
 #![allow(dead_code)]
 
+pub mod gate;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -115,6 +117,10 @@ impl Reply {
 
 pub struct Mock {
     pub url: String,
+    /// The fields ahead of the contract that this stand-in says it takes, and
+    /// so may be sent: names from [`contract::AHEAD`]. None, unless whoever
+    /// started it says otherwise, as for Watch today.
+    pub ahead: &'static [&'static str],
     requests: Arc<Mutex<Vec<Request>>>,
     server: Arc<tiny_http::Server>,
     thread: Option<JoinHandle<()>>,
@@ -165,6 +171,7 @@ impl Mock {
         });
         Mock {
             url: format!("http://127.0.0.1:{port}"),
+            ahead: &[],
             requests,
             server,
             thread: Some(thread),
@@ -268,6 +275,11 @@ impl Home {
 
     pub fn state_dir(&self) -> PathBuf {
         self.dir.join(".local/state/nucleated")
+    }
+
+    /// Where the daemon keeps what may hold content, outside the state folder.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.dir.join(".cache/nucleated")
     }
 
     pub fn write_config(&self, text: &str) {
@@ -420,9 +432,10 @@ impl Rig {
             None => (extra, ""),
         };
         self.home.write_config(&format!(
-            "machine = \"agentbox\"\nstate_dir = \"{state}\"\n{top}\n\
+            "machine = \"agentbox\"\nstate_dir = \"{state}\"\ncache_dir = \"{cache}\"\n{top}\n\
              [[environment]]\nname = \"client-a\"\nroot = \"{root}\"\n{environment}\n\n{tables}\n",
             state = self.home.state_dir().display(),
+            cache = self.home.cache_dir().display(),
             root = self.root.display(),
         ));
     }
@@ -518,6 +531,13 @@ pub fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 /// value outside its pattern or range, is refused. The stand-in APIs answer
 /// through this, so a daemon that sends what Watch would refuse fails here
 /// first.
+///
+/// Five fields of a heartbeat's environment are ahead of 0.5.0: `driver`,
+/// `driver_ref`, `config_commit`, `config_modified` and `config_state`. Watch
+/// as it is refuses each of them, and so does this, unless a stand-in is
+/// started as a later Watch that names them in `accepts` in its answer to a
+/// heartbeat: [`Mock::ahead`]. A box sends one only to a Watch that has named
+/// it.
 pub mod contract {
     use super::{Mock, Reply, Request};
     use serde_json::{Map, Value};
@@ -541,6 +561,26 @@ pub mod contract {
         value.chars().next().is_some_and(lower)
             && chars(value, 1, 64, |c| lower(c) || "._-".contains(c))
     }
+
+    /// `^([0-9a-f]{40}|[0-9a-f]{64})$`
+    fn commit(value: &str) -> bool {
+        [40, 64].contains(&value.len())
+            && value
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    }
+
+    /// The fields of a heartbeat's environment that are ahead of 0.5.0.
+    pub const AHEAD: [&str; 5] = [
+        "driver",
+        "driver_ref",
+        "config_commit",
+        "config_modified",
+        "config_state",
+    ];
+
+    /// The fixed words for how a config sync stands.
+    const CONFIG_STATES: [&str; 6] = ["ok", "pending", "held", "unreachable", "rejected", "failed"];
 
     /// `^[0-9A-Za-z.+-]{1,32}$`
     fn version(value: &str) -> bool {
@@ -658,8 +698,14 @@ pub mod contract {
         value.is_boolean()
     }
 
-    /// `HeartbeatRequest`.
+    /// `HeartbeatRequest`, as 0.5.0 has it.
     pub fn heartbeat(body: &Value) -> Check {
+        heartbeat_taking(body, &[])
+    }
+
+    /// `HeartbeatRequest`, as a Watch that also takes the `ahead` fields
+    /// would have it.
+    pub fn heartbeat_taking(body: &Value, ahead: &[&str]) -> Check {
         let top = object(body, "heartbeat")?;
         closed(
             top,
@@ -713,18 +759,48 @@ pub mod contract {
         let mut seen = Vec::new();
         for entry in environments {
             let environment = object(entry, "environment")?;
+            let mut optional = vec![
+                "server_restarts",
+                "agent_version",
+                "login_expires_at",
+                "last_snapshot_at",
+                "unsaved",
+            ];
+            optional.extend(AHEAD.iter().filter(|field| ahead.contains(field)));
             closed(
                 environment,
                 "environment",
                 &["env_id", "server_alive"],
-                &[
-                    "server_restarts",
-                    "agent_version",
-                    "login_expires_at",
-                    "last_snapshot_at",
-                    "unsaved",
-                ],
+                &optional,
             )?;
+            field(
+                environment,
+                "environment",
+                "driver",
+                string(|v| v.len() <= 32 && env_key(v)),
+            )?;
+            field(
+                environment,
+                "environment",
+                "driver_ref",
+                string(|v| chars(v, 1, 128, |c| word(c) || c == ':')),
+            )?;
+            field(environment, "environment", "config_commit", string(commit))?;
+            field(environment, "environment", "config_modified", boolean)?;
+            field(
+                environment,
+                "environment",
+                "config_state",
+                string(|v| CONFIG_STATES.contains(&v)),
+            )?;
+            for (needs, beside) in [
+                ("driver_ref", "driver"),
+                ("config_modified", "config_commit"),
+            ] {
+                if environment.contains_key(needs) && !environment.contains_key(beside) {
+                    return Err(format!("environment has {needs} and no {beside}"));
+                }
+            }
             field(environment, "environment", "env_id", string(env_key))?;
             field(environment, "environment", "server_alive", boolean)?;
             field(
@@ -872,18 +948,25 @@ pub mod contract {
         events.iter().try_for_each(envelope)
     }
 
-    /// What the contract has against a request to an ingest route, if anything.
+    /// What the contract, as 0.5.0 has it, has against a request to an
+    /// ingest route, if anything.
     pub fn violation(request: &Request) -> Option<String> {
-        let (limit, check): (usize, fn(&Value) -> Check) = match request.path.as_str() {
-            HEARTBEATS => (32 * 1024, heartbeat),
-            EVENTS => (256 * 1000, events),
+        violation_taking(request, &[])
+    }
+
+    /// As [`violation`], for a Watch that also takes the `ahead` fields.
+    pub fn violation_taking(request: &Request, ahead: &[&str]) -> Option<String> {
+        let limit = match request.path.as_str() {
+            HEARTBEATS => 32 * 1024,
+            EVENTS => 256 * 1000,
             _ => return None,
         };
         if request.body.len() > limit {
             return Some(format!("{} is over its {limit} byte limit", request.path));
         }
         match serde_json::from_str::<Value>(&request.body) {
-            Ok(body) => check(&body).err(),
+            Ok(body) if request.path == HEARTBEATS => heartbeat_taking(&body, ahead).err(),
+            Ok(body) => events(&body).err(),
             Err(_) => Some(format!("{} was not sent JSON", request.path)),
         }
     }
@@ -893,8 +976,12 @@ pub mod contract {
         violation(request).map(|_| Reply::problem(400, "validation_failed"))
     }
 
-    /// Everything the mock was sent that Watch would have refused.
+    /// Everything the mock was sent that the Watch it stands in for would
+    /// have refused: Watch as it is, unless the mock says it takes more.
     pub fn violations(mock: &Mock) -> Vec<String> {
-        mock.requests().iter().filter_map(violation).collect()
+        mock.requests()
+            .iter()
+            .filter_map(|request| violation_taking(request, mock.ahead))
+            .collect()
     }
 }

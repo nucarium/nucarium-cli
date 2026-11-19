@@ -18,6 +18,7 @@
 
 mod common;
 
+use common::gate::{leaks_on_disk, only_listed_fields, tick, watch, MARK};
 use common::{contract, files_under, run, Mock, Reply, Request, Rig};
 use nucleate::daemon::{Daemon, Timings};
 use nucleate::envelope::rfc3339;
@@ -27,85 +28,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Every field an event may carry. There is no other.
-const EVENT_FIELDS: [&str; 14] = [
-    "event_id",
-    "env_id",
-    "session_id",
-    "bridge_session_id",
-    "type",
-    "repos",
-    "branch",
-    "error_kind",
-    "limit_resets_at",
-    "commits",
-    "uncommitted_repos",
-    "unpushed_commits",
-    "pull_requests",
-    "client_ts",
-];
-
-/// Every field a heartbeat may carry, at its top, about the machine, about
-/// an environment and about an environment's unsaved work.
-const HEARTBEAT_FIELDS: [&str; 6] = [
-    "machine",
-    "environments",
-    "daemon_version",
-    "activity_beat_s",
-    "paused_until",
-    "client_ts",
-];
-const MACHINE_FIELDS: [&str; 9] = [
-    "disk_used_pct",
-    "load_1m",
-    "uptime_s",
-    "memory_pressure_pct",
-    "on_battery",
-    "reboot_required",
-    "uncommitted_repos",
-    "unpushed_commits",
-    "last_snapshot_at",
-];
-const ENVIRONMENT_FIELDS: [&str; 7] = [
-    "env_id",
-    "server_alive",
-    "server_restarts",
-    "agent_version",
-    "login_expires_at",
-    "last_snapshot_at",
-    "unsaved",
-];
-const UNSAVED_FIELDS: [&str; 3] = ["uncommitted_repos", "unpushed_commits", "counted_at"];
-
-/// Every key of every object the box sent is one this file lists.
-fn only_listed_fields(mock: &Mock) {
-    let listed = |what: &str, object: &Value, fields: &[&str]| {
-        for key in object.as_object().expect("an object").keys() {
-            assert!(fields.contains(&key.as_str()), "{what} carried {key}");
-        }
-    };
-    for request in mock.to(contract::EVENTS) {
-        let body = request.json();
-        assert_eq!(body.as_object().unwrap().len(), 1);
-        for event in body["events"].as_array().unwrap() {
-            listed("an event", event, &EVENT_FIELDS);
-        }
-    }
-    for request in mock.to(contract::HEARTBEATS) {
-        let body = request.json();
-        listed("the heartbeat", &body, &HEARTBEAT_FIELDS);
-        listed("the machine", &body["machine"], &MACHINE_FIELDS);
-        for environment in body["environments"].as_array().unwrap() {
-            listed("an environment", environment, &ENVIRONMENT_FIELDS);
-            if let Some(unsaved) = environment.get("unsaved") {
-                listed("unsaved", unsaved, &UNSAVED_FIELDS);
-            }
-        }
-    }
-}
-
-/// The sentinel. It appears in every value that must stay on the box.
-const MARK: &str = "ZZLEAKZZ";
+// The sentinel, the lists of every field an event and a heartbeat may carry,
+// the scanner and the stand-in for Watch are in `common::gate`, where each
+// adapter's own gate test finds them too.
 
 const SESSION: &str = "7f3c2a1e-58b4-4d0c-9a6e-2b1f0c9d8e7a";
 
@@ -265,45 +190,6 @@ fn hook(rig: &Rig, event: &str, payload: &Value) {
         "the hook printed something for {event}"
     );
     assert!(out.stderr.is_empty(), "the hook complained for {event}");
-}
-
-/// Everywhere the sentinel turns up among the files under `dir`.
-fn leaks_on_disk(dir: &Path) -> Vec<String> {
-    files_under(dir)
-        .into_iter()
-        .filter(|(_, bytes)| String::from_utf8_lossy(bytes).contains(MARK))
-        .map(|(path, bytes)| format!("{}: {}", path.display(), String::from_utf8_lossy(&bytes)))
-        .collect()
-}
-
-fn watch() -> Mock {
-    Mock::start(|request: &Request| match request.path.as_str() {
-        // As Watch does, refuse anything the contract does not allow.
-        _ if contract::violation(request).is_some() => Reply::problem(400, "validation_failed"),
-        "/v1/heartbeats:ingest" => Reply::json(
-            200,
-            json!({ "received_at": "2026-11-19T12:00:00.000Z", "heartbeat_interval_s": 60 }),
-        ),
-        _ => Reply::json(
-            200,
-            json!({ "received_at": "2026-11-19T12:00:00.000Z", "accepted": 0, "duplicates": 0, "rejected": [] }),
-        ),
-    })
-}
-
-fn tick(rig: &Rig) -> Daemon {
-    let mut daemon = Daemon::new(
-        rig.settings(),
-        Timings {
-            jitter: false,
-            ..Timings::default()
-        },
-    );
-    daemon.tick(Instant::now());
-    // Routine events wait for a batch; a later tick sends them.
-    daemon.tick(Instant::now() + Duration::from_secs(30));
-    daemon.write_state(true);
-    daemon
 }
 
 /// A box whose nucleus sits under a folder named with the sentinel, with a

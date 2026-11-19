@@ -6,7 +6,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-fn home() -> Option<PathBuf> {
+/// The agent user's home folder, where an adapter looks for a third party's
+/// files when the config names no other place.
+pub fn home() -> Option<PathBuf> {
     env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
@@ -34,6 +36,13 @@ pub fn daemon_config_dir() -> Result<PathBuf> {
 /// The daemon's state folder: `~/.local/state/nucleated`.
 pub fn state_dir() -> Result<PathBuf> {
     Ok(xdg("XDG_STATE_HOME", &[".local", "state"])?.join("nucleated"))
+}
+
+/// The daemon's cache folder: `~/.cache/nucleated`. What is kept here may
+/// hold content, a clone of the owner's config repository say, and so it is
+/// outside the state folder, which holds none.
+pub fn cache_dir() -> Result<PathBuf> {
+    Ok(xdg("XDG_CACHE_HOME", &[".cache"])?.join("nucleated"))
 }
 
 /// Create a folder only its owner can enter. An existing folder is left as it is.

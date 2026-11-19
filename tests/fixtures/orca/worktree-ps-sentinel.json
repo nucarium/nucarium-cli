@@ -1,0 +1,1116 @@
+{
+  "id": "ZZLEAKZZ reply id the user typed this",
+  "ok": true,
+  "result": {
+    "worktrees": [
+      {
+        "workspaceKind": "git",
+        "worktreeId": "ZZLEAKZZ repoId::@WORKSPACES@/ZZLEAKZZ-task-1",
+        "repoId": "ZZLEAKZZ repoId the user typed this",
+        "identity": "ZZLEAKZZ identity the user typed this",
+        "repo": "ZZLEAKZZ repo the user typed this",
+        "path": "@WORKSPACES@/ZZLEAKZZ-task-1",
+        "priorWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_prior"
+        ],
+        "branch": "ZZLEAKZZ branch the user typed this",
+        "isArchived": false,
+        "isMainWorktree": false,
+        "hasHostSidebarActivity": true,
+        "parentWorktreeId": "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_parent",
+        "childWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_child"
+        ],
+        "displayName": "ZZLEAKZZ worktree displayName the user typed this",
+        "workspaceStatus": "ZZLEAKZZ workspaceStatus the user typed this",
+        "sortOrder": 1,
+        "linkedIssue": 7,
+        "linkedPR": {
+          "number": 12,
+          "state": "open",
+          "title": "ZZLEAKZZ linkedPR title the user typed this",
+          "url": "https://github.com/acme/web/pull/12?ZZLEAKZZ_linkedPR_url"
+        },
+        "linkedLinearIssue": "ZZLEAKZZ linkedLinearIssue the user typed this",
+        "linkedGitLabMR": null,
+        "linkedGitLabIssue": null,
+        "linkedItems": [
+          {
+            "kind": "issue",
+            "title": "ZZLEAKZZ linkedItems title the user typed this",
+            "url": "https://example.com/ZZLEAKZZ_linkedItems_url"
+          }
+        ],
+        "comment": "ZZLEAKZZ comment the user typed this",
+        "isPinned": false,
+        "isActive": true,
+        "unread": true,
+        "liveTerminalCount": 10,
+        "hasAttachedPty": true,
+        "lastOutputAt": 1795089660000,
+        "preview": "ZZLEAKZZ preview of the terminal the user typed this",
+        "status": "working",
+        "agents": [
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "claude",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "11111111-1111-4111-8111-111111111111",
+            "mainAgent": {
+              "state": "working",
+              "stateStartedAt": 1795089600000,
+              "summary": "ZZLEAKZZ mainAgent summary the user typed this"
+            }
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "ZZLEAKZZ state the user typed this",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "claude",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "22222222-2222-4222-8222-222222222222"
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "done",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "gemini",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "33333333-3333-4333-8333-333333333333",
+            "mainAgent": {
+              "state": "done",
+              "outcome": "ZZLEAKZZ outcome the user typed this",
+              "stateStartedAt": 1
+            }
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "claude",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "ZZLEAKZZ orcaSessionId the user typed this"
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "claude",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "ZZLEAKZZ"
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "gemini",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "ZZLEAKZZ-not-a-uuid-but-shaped-like-an-id"
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "waiting",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "ZZLEAKZZ agentType the user typed this",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "55555555-5555-4555-8555-555555555555"
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "gemini",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "66666666-6666-4666-8666-666666666666",
+            "mainAgent": {
+              "state": "ZZLEAKZZ mainAgent state the user typed this"
+            }
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "done",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "opencode",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "77777777-7777-4777-8777-777777777777",
+            "mainAgent": {
+              "state": "done",
+              "outcome": "failure",
+              "error": "ZZLEAKZZ mainAgent error the user typed this"
+            }
+          },
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "amp",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": "ZZLEAKZZ updatedAt the user typed this",
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "88888888-8888-4888-8888-888888888888",
+            "restoredUnconfirmed": "ZZLEAKZZ restoredUnconfirmed the user typed this"
+          }
+        ],
+        "removalError": "ZZLEAKZZ removalError the user typed this",
+        "bot": "ZZLEAKZZ bot the user typed this",
+        "automationName": "ZZLEAKZZ automationName the user typed this",
+        "recipeEnvironment": {
+          "name": "ZZLEAKZZ recipeEnvironment name the user typed this"
+        },
+        "terminalVerdict": "live",
+        "notes": "ZZLEAKZZ notes the user typed this",
+        "files": [
+          "src/ZZLEAKZZ_file.rs"
+        ]
+      },
+      {
+        "workspaceKind": "git",
+        "worktreeId": "ZZLEAKZZ repoId::@WORKSPACES@/ZZLEAKZZ-task-2",
+        "repoId": "ZZLEAKZZ repoId the user typed this",
+        "identity": "ZZLEAKZZ identity the user typed this",
+        "repo": "ZZLEAKZZ repo the user typed this",
+        "path": "@WORKSPACES@/ZZLEAKZZ-task-2",
+        "priorWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_prior"
+        ],
+        "branch": "ZZLEAKZZ branch the user typed this",
+        "isArchived": false,
+        "isMainWorktree": false,
+        "hasHostSidebarActivity": true,
+        "parentWorktreeId": "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_parent",
+        "childWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_child"
+        ],
+        "displayName": "ZZLEAKZZ worktree displayName the user typed this",
+        "workspaceStatus": "ZZLEAKZZ workspaceStatus the user typed this",
+        "sortOrder": 1,
+        "linkedIssue": 7,
+        "linkedPR": {
+          "number": 12,
+          "state": "open",
+          "title": "ZZLEAKZZ linkedPR title the user typed this",
+          "url": "https://github.com/acme/web/pull/12?ZZLEAKZZ_linkedPR_url"
+        },
+        "linkedLinearIssue": "ZZLEAKZZ linkedLinearIssue the user typed this",
+        "linkedGitLabMR": null,
+        "linkedGitLabIssue": null,
+        "linkedItems": [
+          {
+            "kind": "issue",
+            "title": "ZZLEAKZZ linkedItems title the user typed this",
+            "url": "https://example.com/ZZLEAKZZ_linkedItems_url"
+          }
+        ],
+        "comment": "ZZLEAKZZ comment the user typed this",
+        "isPinned": false,
+        "isActive": true,
+        "unread": true,
+        "liveTerminalCount": 1,
+        "hasAttachedPty": true,
+        "lastOutputAt": 1795089660000,
+        "preview": "ZZLEAKZZ preview of the terminal the user typed this",
+        "status": "working",
+        "agents": [
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "codex",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "99999999-9999-4999-8999-999999999999"
+          }
+        ],
+        "removalError": "ZZLEAKZZ removalError the user typed this",
+        "bot": "ZZLEAKZZ bot the user typed this",
+        "automationName": "ZZLEAKZZ automationName the user typed this",
+        "recipeEnvironment": {
+          "name": "ZZLEAKZZ recipeEnvironment name the user typed this"
+        },
+        "terminalVerdict": "live",
+        "notes": "ZZLEAKZZ notes the user typed this",
+        "files": [
+          "src/ZZLEAKZZ_file.rs"
+        ]
+      },
+      {
+        "workspaceKind": "ZZLEAKZZ workspaceKind the user typed this",
+        "worktreeId": "ZZLEAKZZ repoId::@WORKSPACES@/ZZLEAKZZ-task-1",
+        "repoId": "ZZLEAKZZ repoId the user typed this",
+        "identity": "ZZLEAKZZ identity the user typed this",
+        "repo": "ZZLEAKZZ repo the user typed this",
+        "path": "@WORKSPACES@/ZZLEAKZZ-task-1",
+        "priorWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_prior"
+        ],
+        "branch": "ZZLEAKZZ branch the user typed this",
+        "isArchived": false,
+        "isMainWorktree": false,
+        "hasHostSidebarActivity": true,
+        "parentWorktreeId": "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_parent",
+        "childWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_child"
+        ],
+        "displayName": "ZZLEAKZZ worktree displayName the user typed this",
+        "workspaceStatus": "ZZLEAKZZ workspaceStatus the user typed this",
+        "sortOrder": 1,
+        "linkedIssue": 7,
+        "linkedPR": {
+          "number": 12,
+          "state": "open",
+          "title": "ZZLEAKZZ linkedPR title the user typed this",
+          "url": "https://github.com/acme/web/pull/12?ZZLEAKZZ_linkedPR_url"
+        },
+        "linkedLinearIssue": "ZZLEAKZZ linkedLinearIssue the user typed this",
+        "linkedGitLabMR": null,
+        "linkedGitLabIssue": null,
+        "linkedItems": [
+          {
+            "kind": "issue",
+            "title": "ZZLEAKZZ linkedItems title the user typed this",
+            "url": "https://example.com/ZZLEAKZZ_linkedItems_url"
+          }
+        ],
+        "comment": "ZZLEAKZZ comment the user typed this",
+        "isPinned": false,
+        "isActive": true,
+        "unread": true,
+        "liveTerminalCount": 1,
+        "hasAttachedPty": true,
+        "lastOutputAt": 1795089660000,
+        "preview": "ZZLEAKZZ preview of the terminal the user typed this",
+        "status": "working",
+        "agents": [
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "gemini",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+          }
+        ],
+        "removalError": "ZZLEAKZZ removalError the user typed this",
+        "bot": "ZZLEAKZZ bot the user typed this",
+        "automationName": "ZZLEAKZZ automationName the user typed this",
+        "recipeEnvironment": {
+          "name": "ZZLEAKZZ recipeEnvironment name the user typed this"
+        },
+        "terminalVerdict": "live",
+        "notes": "ZZLEAKZZ notes the user typed this",
+        "files": [
+          "src/ZZLEAKZZ_file.rs"
+        ]
+      },
+      {
+        "workspaceKind": "git",
+        "worktreeId": "ZZLEAKZZ repoId::ZZLEAKZZ path the user typed this",
+        "repoId": "ZZLEAKZZ repoId the user typed this",
+        "identity": "ZZLEAKZZ identity the user typed this",
+        "repo": "ZZLEAKZZ repo the user typed this",
+        "path": "ZZLEAKZZ path the user typed this",
+        "priorWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_prior"
+        ],
+        "branch": "ZZLEAKZZ branch the user typed this",
+        "isArchived": false,
+        "isMainWorktree": false,
+        "hasHostSidebarActivity": true,
+        "parentWorktreeId": "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_parent",
+        "childWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_child"
+        ],
+        "displayName": "ZZLEAKZZ worktree displayName the user typed this",
+        "workspaceStatus": "ZZLEAKZZ workspaceStatus the user typed this",
+        "sortOrder": 1,
+        "linkedIssue": 7,
+        "linkedPR": {
+          "number": 12,
+          "state": "open",
+          "title": "ZZLEAKZZ linkedPR title the user typed this",
+          "url": "https://github.com/acme/web/pull/12?ZZLEAKZZ_linkedPR_url"
+        },
+        "linkedLinearIssue": "ZZLEAKZZ linkedLinearIssue the user typed this",
+        "linkedGitLabMR": null,
+        "linkedGitLabIssue": null,
+        "linkedItems": [
+          {
+            "kind": "issue",
+            "title": "ZZLEAKZZ linkedItems title the user typed this",
+            "url": "https://example.com/ZZLEAKZZ_linkedItems_url"
+          }
+        ],
+        "comment": "ZZLEAKZZ comment the user typed this",
+        "isPinned": false,
+        "isActive": true,
+        "unread": true,
+        "liveTerminalCount": 1,
+        "hasAttachedPty": true,
+        "lastOutputAt": 1795089660000,
+        "preview": "ZZLEAKZZ preview of the terminal the user typed this",
+        "status": "working",
+        "agents": [
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "blocked",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "gemini",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+          }
+        ],
+        "removalError": "ZZLEAKZZ removalError the user typed this",
+        "bot": "ZZLEAKZZ bot the user typed this",
+        "automationName": "ZZLEAKZZ automationName the user typed this",
+        "recipeEnvironment": {
+          "name": "ZZLEAKZZ recipeEnvironment name the user typed this"
+        },
+        "terminalVerdict": "live",
+        "notes": "ZZLEAKZZ notes the user typed this",
+        "files": [
+          "src/ZZLEAKZZ_file.rs"
+        ]
+      },
+      {
+        "workspaceKind": "folder-workspace",
+        "worktreeId": "ZZLEAKZZ repoId::@WORKSPACES@/ZZLEAKZZ-notes",
+        "repoId": "ZZLEAKZZ repoId the user typed this",
+        "identity": "ZZLEAKZZ identity the user typed this",
+        "repo": "ZZLEAKZZ repo the user typed this",
+        "path": "@WORKSPACES@/ZZLEAKZZ-notes",
+        "priorWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_prior"
+        ],
+        "branch": "ZZLEAKZZ branch the user typed this",
+        "isArchived": false,
+        "isMainWorktree": false,
+        "hasHostSidebarActivity": true,
+        "parentWorktreeId": "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_parent",
+        "childWorktreeIds": [
+          "ZZLEAKZZ repoId::/home/agent/ZZLEAKZZ_child"
+        ],
+        "displayName": "ZZLEAKZZ worktree displayName the user typed this",
+        "workspaceStatus": "ZZLEAKZZ workspaceStatus the user typed this",
+        "sortOrder": 1,
+        "linkedIssue": 7,
+        "linkedPR": {
+          "number": 12,
+          "state": "open",
+          "title": "ZZLEAKZZ linkedPR title the user typed this",
+          "url": "https://github.com/acme/web/pull/12?ZZLEAKZZ_linkedPR_url"
+        },
+        "linkedLinearIssue": "ZZLEAKZZ linkedLinearIssue the user typed this",
+        "linkedGitLabMR": null,
+        "linkedGitLabIssue": null,
+        "linkedItems": [
+          {
+            "kind": "issue",
+            "title": "ZZLEAKZZ linkedItems title the user typed this",
+            "url": "https://example.com/ZZLEAKZZ_linkedItems_url"
+          }
+        ],
+        "comment": "ZZLEAKZZ comment the user typed this",
+        "isPinned": false,
+        "isActive": true,
+        "unread": true,
+        "liveTerminalCount": 1,
+        "hasAttachedPty": true,
+        "lastOutputAt": 1795089660000,
+        "preview": "ZZLEAKZZ preview of the terminal the user typed this",
+        "status": "working",
+        "agents": [
+          {
+            "paneKey": "ZZLEAKZZ paneKey the user typed this",
+            "address": "ZZLEAKZZ address the user typed this",
+            "parentPaneKey": "ZZLEAKZZ parentPaneKey the user typed this",
+            "state": "working",
+            "workingMode": "ZZLEAKZZ workingMode the user typed this",
+            "agentType": "pi",
+            "prompt": "ZZLEAKZZ prompt the user typed this",
+            "taskTitle": "ZZLEAKZZ taskTitle the user typed this",
+            "displayName": "ZZLEAKZZ displayName the user typed this",
+            "conversationName": "ZZLEAKZZ conversationName the user typed this",
+            "lastAssistantMessage": "ZZLEAKZZ lastAssistantMessage the user typed this",
+            "toolName": "ZZLEAKZZ toolName the user typed this",
+            "toolInput": "ZZLEAKZZ toolInput the user typed this",
+            "interrupted": false,
+            "agentWait": {
+              "kind": "question",
+              "prompt": "ZZLEAKZZ agentWait prompt the user typed this",
+              "options": [
+                "ZZLEAKZZ agentWait option the user typed this"
+              ]
+            },
+            "stateStartedAt": 1795089600000,
+            "updatedAt": 1795089660000,
+            "children": [
+              {
+                "id": "ZZLEAKZZ child id the user typed this",
+                "title": "ZZLEAKZZ child title the user typed this",
+                "lastMessage": "ZZLEAKZZ child lastMessage the user typed this"
+              }
+            ],
+            "subagents": [
+              {
+                "id": "ZZLEAKZZ subagent id the user typed this",
+                "prompt": "ZZLEAKZZ subagent prompt the user typed this"
+              }
+            ],
+            "programStatus": {
+              "state": "working",
+              "msg": "ZZLEAKZZ programStatus msg the user typed this"
+            },
+            "activity": {
+              "verdict": "ZZLEAKZZ activity verdict the user typed this"
+            },
+            "transcript": [
+              {
+                "role": "user",
+                "text": "ZZLEAKZZ transcript text the user typed this"
+              }
+            ],
+            "errorMessage": "ZZLEAKZZ errorMessage the user typed this",
+            "title": "ZZLEAKZZ title the user typed this",
+            "cwd": "/home/agent/ZZLEAKZZ_cwd",
+            "orcaSessionId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+          }
+        ],
+        "removalError": "ZZLEAKZZ removalError the user typed this",
+        "bot": "ZZLEAKZZ bot the user typed this",
+        "automationName": "ZZLEAKZZ automationName the user typed this",
+        "recipeEnvironment": {
+          "name": "ZZLEAKZZ recipeEnvironment name the user typed this"
+        },
+        "terminalVerdict": "live",
+        "notes": "ZZLEAKZZ notes the user typed this",
+        "files": [
+          "src/ZZLEAKZZ_file.rs"
+        ]
+      }
+    ],
+    "totalCount": 5,
+    "truncated": false,
+    "hostScope": {
+      "host": "ZZLEAKZZ hostScope host the user typed this"
+    },
+    "installationId": "ZZLEAKZZ installationId the user typed this",
+    "otherBots": [
+      {
+        "name": "ZZLEAKZZ otherBots name the user typed this"
+      }
+    ]
+  },
+  "_meta": {
+    "runtimeId": "ZZLEAKZZ runtimeId the user typed this"
+  }
+}

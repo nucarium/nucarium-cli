@@ -24,7 +24,7 @@ use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
 use crate::workspace::{RepoInfo, Workspace};
-use crate::{git, github, paths};
+use crate::{driver, git, github, paths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -61,6 +61,10 @@ pub struct Nucleus {
     /// When the snapshot job last finished here with nothing failed.
     #[serde(default)]
     pub last_snapshot_ms: Option<u64>,
+    /// True for the worktrees of a driver that owns them, which is no
+    /// nucleus: its unsaved work is counted, and it is never snapshotted.
+    #[serde(default)]
+    pub driver: bool,
 }
 
 /// What `unsaved.json` holds: the last count, for the heartbeat to read.
@@ -232,11 +236,17 @@ impl Reporter {
         if !environment.root.is_dir() {
             return None;
         }
-        let workspace = self.workspace(settings, environment);
+        let workspace = self
+            .workspace(settings, environment)
+            .leaving_alone(driver::protected_roots(settings));
         let mut counted = Counted::default();
         for item in workspace.available().ok()? {
             for worktree in Workspace::worktrees(&item.bare).ok()? {
-                if !worktree.is_dir() {
+                // A worktree in a driver's own folders is counted once,
+                // under the driver. Any other worktree of the nucleus's
+                // repos is counted here, the nucleus's own or not: counting
+                // only reads.
+                if !worktree.is_dir() || workspace.under_a_driver(&worktree) {
                     continue;
                 }
                 let unsaved = workspace.unsaved(&worktree).ok()?;
@@ -247,9 +257,47 @@ impl Reporter {
         Some(counted)
     }
 
-    /// Count every nucleus now, each once however many environments share it.
+    /// The unsaved work in the worktrees a driver owns, by the same rule as
+    /// a nucleus's: the driver's adapter says where they are, and
+    /// [`Workspace::unsaved`] says what each holds. It only reads them.
+    /// Nothing when a folder cannot be read, or while the driver itself
+    /// lists a worktree that is in none of them.
+    fn count_driver(&self, settings: &Settings, environment: &Environment) -> Option<Counted> {
+        let adapter = environment.driver_adapter()?;
+        let worktrees = adapter.worktrees(environment)?;
+        // The driver's own last answer listed a worktree that looking in
+        // its folders does not find. A number that leaves it out would read
+        // as all there is, so there is none until its folder is named.
+        let left_out = driver::read_memory(&settings.state_dir, &environment.name)
+            .filter(|memory| memory.driver == adapter.name())
+            .is_some_and(|memory| memory.uncounted_worktrees > 0);
+        if left_out {
+            return None;
+        }
+        let workspace = self.workspace(settings, environment);
+        let mut counted = Counted::default();
+        for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
+            let unsaved = workspace.unsaved(worktree).ok()?;
+            counted.uncommitted_repos += u64::from(unsaved.uncommitted);
+            counted.unpushed_commits += u64::from(unsaved.unpushed);
+        }
+        Some(counted)
+    }
+
+    /// Count every nucleus now, each once however many environments share
+    /// it, and then the worktrees of each driver that owns its own.
     pub fn count(&self, settings: &Settings, now: SystemTime) -> Counts {
         let ledger = housekeeping::read_ledger(&settings.state_dir);
+        let owned = settings
+            .environments
+            .iter()
+            .filter(|environment| environment.driver_owns_worktrees())
+            .map(|environment| Nucleus {
+                environments: vec![environment.name.clone()],
+                unsaved: self.count_driver(settings, environment),
+                last_snapshot_ms: None,
+                driver: true,
+            });
         let nuclei = housekeeping::one_per_nucleus(settings)
             .into_iter()
             .map(|environment| Nucleus {
@@ -261,7 +309,9 @@ impl Reporter {
                     .get(&format!("{}/snapshot", environment.name))
                     .and_then(|last| last.good_at_s)
                     .map(|seconds| seconds.saturating_mul(1_000)),
+                driver: false,
             })
+            .chain(owned)
             .collect();
         Counts {
             counted_at_ms: unix_ms(now),
@@ -480,6 +530,7 @@ mod tests {
                         unpushed_commits: 5,
                     }),
                     last_snapshot_ms: None,
+                    driver: false,
                 },
                 Nucleus {
                     environments: vec!["ops".into()],

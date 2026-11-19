@@ -263,6 +263,15 @@ pub fn valid_version(value: &str) -> bool {
     })
 }
 
+/// `^([0-9a-f]{40}|[0-9a-f]{64})$`: a git commit id, and nothing a word or a
+/// branch name could pass for.
+pub fn valid_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
 /// `^https://github\.com/<owner>/<name>/pull/[1-9][0-9]{0,9}$`, at most 240
 /// characters: an owner, a name and a number, with no query and no fragment.
 /// Answers with the `owner/name` the address is on.
@@ -407,6 +416,12 @@ mod tests {
         assert!(!valid_version("2.1.0 (Claude Code)"));
         assert!(!valid_version(""));
         assert!(!valid_version(&"1".repeat(33)));
+        assert!(valid_commit_id(&"a1".repeat(20)));
+        assert!(valid_commit_id(&"0f".repeat(32)));
+        assert!(!valid_commit_id(&"A1".repeat(20)));
+        assert!(!valid_commit_id(&"g1".repeat(20)));
+        assert!(!valid_commit_id("main"));
+        assert!(!valid_commit_id(&"a".repeat(41)));
         assert!(valid_timestamp("2026-11-20T03:10:00.000Z"));
         assert!(!valid_timestamp("2026-11-20T03:10:00Z"));
         assert!(!valid_timestamp("tomorrow at ten past three"));

@@ -1,0 +1,3101 @@
+{
+  "schemaVersion": 1,
+  "snapshotSequence": 4812,
+  "threads": [
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-idle",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-idle"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "idle",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-working",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": "__WORKTREE__",
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-working"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-permission",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-permission"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "command",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-input",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-input"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "user_input",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true,
+        "userOnly": false
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-elicitation",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-elicitation"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "mcp-elicitation",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-failed",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-failed"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "failed",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": "usage_limit",
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": "__RESET_AT__",
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-settled",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-settled"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "completed",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": "settled",
+      "settledAt": "2026-11-20T10:00:00.000Z",
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-deleted",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-deleted"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": "2026-11-20T10:00:00.000Z",
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-checkout",
+      "projectId": "project-checkout",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-checkout"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-nowhere",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": "/nonexistent/ZZLEAKZZ_worktreePath/project",
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-nowhere"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-parent",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-parent"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "completed",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "monitor",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "server",
+      "id": "thread:subagent:9f2c",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": "thread-parent",
+        "relationshipToParent": "subagent",
+        "rootThreadId": "thread-parent"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": "run-1",
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "file-change",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-side-chat",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": "thread-idle",
+        "relationshipToParent": null,
+        "rootThreadId": "thread-idle",
+        "sideChat": true
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "ZZLEAKZZ id is a sentence where a word belongs",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "ZZLEAKZZ id is a sentence where a word belongs"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-status",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-status"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "ZZLEAKZZ status is a sentence where a word belongs",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-activity",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-activity"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "ZZLEAKZZ activityRunStatus is a sentence where a word belongs",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-kind",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-kind"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "ZZLEAKZZ pendingRuntimeRequest.kind is a sentence where a word belongs",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-class",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-class"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "failed",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": "ZZLEAKZZ lastErrorClass is a sentence where a word belongs",
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": "ZZLEAKZZ usageLimitResetAt is a sentence where a word belongs",
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-reset",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-reset"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "failed",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": "usage_limit",
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": "ZZLEAKZZ usageLimitResetAt is a sentence where a word belongs",
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-settled",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-settled"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": null,
+      "status": "idle",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": "ZZLEAKZZ settledOverride is a sentence where a word belongs",
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-lineage",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": "ZZLEAKZZ lineage.parentThreadId is a sentence where a word belongs",
+        "relationshipToParent": "ZZLEAKZZ lineage.relationshipToParent is a sentence where a word belongs",
+        "rootThreadId": "ZZLEAKZZ lineage.rootThreadId is a sentence where a word belongs",
+        "sideChat": "ZZLEAKZZ lineage.sideChat is a sentence where a word belongs"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-project",
+      "projectId": "ZZLEAKZZ projectId is a sentence where a word belongs",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-project"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": null,
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "ZZLEAKZZ creationSource is a sentence where a word belongs",
+      "id": "thread-odd-source",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": "thread-idle",
+        "relationshipToParent": "subagent",
+        "rootThreadId": "thread-idle"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "command",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": {
+        "source": "ZZLEAKZZ creationSource as an object the user typed this"
+      },
+      "id": "thread-odd-shapes",
+      "projectId": [
+        "ZZLEAKZZ projectId as a list the user typed this"
+      ],
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": {
+        "path": "/home/agent/ZZLEAKZZ_worktreePath_as_an_object"
+      },
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": "ZZLEAKZZ lineage as a sentence the user typed this",
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": [
+        "ZZLEAKZZ activityRunStatus as a list the user typed this"
+      ],
+      "status": {
+        "word": "running",
+        "why": [
+          "ZZLEAKZZ status as an object the user typed this"
+        ]
+      },
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": {
+        "class": "ZZLEAKZZ lastErrorClass as an object the user typed this"
+      },
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": [
+        "ZZLEAKZZ usageLimitResetAt as a list the user typed this"
+      ],
+      "pendingRuntimeRequest": "ZZLEAKZZ pendingRuntimeRequest as a sentence the user typed this",
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": {
+        "tasks": "ZZLEAKZZ pendingBackgroundTasks as an object the user typed this"
+      },
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": "ZZLEAKZZ itemCount as a sentence the user typed this",
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": [
+        "ZZLEAKZZ settledOverride as a list the user typed this"
+      ],
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-odd-request",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-odd-request"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "waiting",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": {
+          "kind": "ZZLEAKZZ kind as an object the user typed this"
+        },
+        "userOnly": "ZZLEAKZZ userOnly as a sentence the user typed this"
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        "ZZLEAKZZ a task that is a sentence the user typed this",
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": [
+            "ZZLEAKZZ task kind as a list the user typed this"
+          ],
+          "awaited": "ZZLEAKZZ awaited as a sentence the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": null,
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    },
+    {
+      "id": {
+        "id": "ZZLEAKZZ id as an object the user typed this"
+      },
+      "status": "running",
+      "title": "ZZLEAKZZ title the user typed this"
+    }
+  ],
+  "archivedThreads": [
+    {
+      "createdBy": "user",
+      "creationSource": "web",
+      "id": "thread-archived-ZZLEAKZZ",
+      "projectId": "project-app",
+      "title": "ZZLEAKZZ title the user typed this",
+      "providerInstanceId": "claude-main",
+      "modelSelection": {
+        "instanceId": "claude-main",
+        "model": "ZZLEAKZZ modelSelection.model the user typed this"
+      },
+      "runtimeMode": "approval-required",
+      "interactionMode": "default",
+      "branch": "ZZLEAKZZ_branch",
+      "worktreePath": null,
+      "linkedPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/linkedPullRequest",
+        "number": 7,
+        "url": "https://github.example/acme/app/pull/7?ZZLEAKZZ_linkedPullRequest_url"
+      },
+      "pullRequests": [
+        {
+          "host": "github.example",
+          "repository": "ZZLEAKZZ/pullRequests",
+          "number": 8,
+          "url": "https://github.example/acme/app/pull/8?ZZLEAKZZ_pullRequests_url",
+          "source": "agent"
+        }
+      ],
+      "branchPullRequest": {
+        "projectId": "project-app",
+        "repository": "ZZLEAKZZ/branchPullRequest",
+        "number": 9,
+        "url": "https://github.example/acme/app/pull/9?ZZLEAKZZ_branchPullRequest_url"
+      },
+      "issues": [
+        {
+          "projectId": "project-app",
+          "url": "https://tracker.example/ZZLEAKZZ_issues_url",
+          "source": "manual",
+          "linkedAt": "2026-11-20T10:00:00.000Z",
+          "displayKey": "ZZLEAKZZ-12",
+          "title": "ZZLEAKZZ issues.title the user typed this"
+        }
+      ],
+      "lineage": {
+        "parentThreadId": null,
+        "relationshipToParent": null,
+        "rootThreadId": "thread-archived-ZZLEAKZZ"
+      },
+      "forkedFrom": null,
+      "activeProviderThreadId": "provider-thread-ZZLEAKZZ",
+      "linkOrigin": {
+        "sessionId": "mcp-session-ZZLEAKZZ",
+        "label": "ZZLEAKZZ linkOrigin.label the user typed this"
+      },
+      "latestRunId": "run-1",
+      "latestRunStopRequested": false,
+      "activeRunId": null,
+      "activityRunStatus": "running",
+      "status": "running",
+      "lastError": "ZZLEAKZZ lastError the user typed this",
+      "lastErrorClass": null,
+      "lastErrorCode": "ZZLEAKZZ lastErrorCode the user typed this",
+      "usageLimitResetAt": null,
+      "pendingRuntimeRequest": {
+        "id": "request-ZZLEAKZZ",
+        "kind": "command",
+        "createdAt": "2026-11-20T10:00:00.000Z",
+        "blocking": true
+      },
+      "latestVisibleMessage": {
+        "id": "message-1",
+        "role": "assistant",
+        "text": "ZZLEAKZZ latestVisibleMessage.text the user typed this",
+        "updatedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "latestUserMessageAt": "2026-11-20T10:00:00.000Z",
+      "hasActionableProposedPlan": false,
+      "pendingBackgroundTasks": [
+        {
+          "taskId": "ZZLEAKZZ_taskId",
+          "kind": "command",
+          "command": "ZZLEAKZZ pendingBackgroundTasks.command the user typed this",
+          "description": "ZZLEAKZZ pendingBackgroundTasks.description the user typed this"
+        }
+      ],
+      "providerInstanceHistory": [
+        "claude-main"
+      ],
+      "goal": {
+        "objective": "ZZLEAKZZ goal.objective the user typed this",
+        "status": "active",
+        "lastCheck": "ZZLEAKZZ goal.lastCheck the user typed this"
+      },
+      "itemCount": 12,
+      "visibleItemCount": 12,
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z",
+      "archivedAt": "2026-11-20T10:00:00.000Z",
+      "settledOverride": null,
+      "settledAt": null,
+      "tags": [
+        "ZZLEAKZZ tags the user typed this"
+      ],
+      "titleRegeneration": {
+        "requestId": "ZZLEAKZZ_titleRegeneration",
+        "startedAt": "2026-11-20T10:00:00.000Z"
+      },
+      "deletedAt": null,
+      "transcript": [
+        {
+          "role": "user",
+          "text": "ZZLEAKZZ transcript, a field that does not exist yet the user typed this"
+        }
+      ],
+      "summary": "ZZLEAKZZ summary, a field that does not exist yet the user typed this"
+    }
+  ],
+  "projects": [
+    {
+      "id": "project-app",
+      "title": "ZZLEAKZZ project.title the user typed this",
+      "hasCustomTitle": true,
+      "workspaceRoot": "/nonexistent/ZZLEAKZZ_workspaceRoot/app",
+      "repositoryIdentity": {
+        "canonicalKey": "github.example/ZZLEAKZZ/repositoryIdentity",
+        "locator": {
+          "source": "git-remote",
+          "remoteName": "origin",
+          "remoteUrl": "git@github.example:ZZLEAKZZ/remoteUrl.git"
+        },
+        "rootPath": "/home/agent/ZZLEAKZZ_rootPath",
+        "displayName": "ZZLEAKZZ displayName the user typed this"
+      },
+      "defaultModelSelection": null,
+      "faviconPath": "/home/agent/ZZLEAKZZ_faviconPath/favicon.ico",
+      "scripts": [
+        {
+          "id": "dev",
+          "name": "ZZLEAKZZ scripts.name the user typed this",
+          "command": "ZZLEAKZZ scripts.command the user typed this",
+          "icon": "play",
+          "runOnWorktreeCreate": false
+        }
+      ],
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z"
+    },
+    {
+      "id": "project-checkout",
+      "title": "ZZLEAKZZ project.title the user typed this",
+      "workspaceRoot": "__CHECKOUT__",
+      "defaultModelSelection": null,
+      "scripts": [],
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z"
+    },
+    {
+      "id": "ZZLEAKZZ project.id is a sentence where a word belongs",
+      "title": "ZZLEAKZZ project.title the user typed this",
+      "workspaceRoot": {
+        "path": "/home/agent/ZZLEAKZZ_workspaceRoot_as_an_object"
+      },
+      "defaultModelSelection": null,
+      "scripts": [],
+      "createdAt": "2026-11-20T10:00:00.000Z",
+      "updatedAt": "2026-11-20T10:00:00.000Z"
+    }
+  ],
+  "olderSettled": {
+    "before": "2026-11-20T10:00:00.000Z",
+    "asOfSequence": 4812,
+    "counts": [
+      {
+        "projectId": "ZZLEAKZZ_olderSettled",
+        "count": 3
+      }
+    ]
+  },
+  "projectIdentities": "ZZLEAKZZ_projectIdentities",
+  "drafts": [
+    {
+      "text": "ZZLEAKZZ drafts, a field that does not exist yet the user typed this"
+    }
+  ]
+}

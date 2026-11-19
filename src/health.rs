@@ -245,6 +245,7 @@ mod tests {
             unit: "agent-server@client-a.service".into(),
             check: check.map(str::to_string),
             agent: "claude-code".into(),
+            driver: None,
             config_dir: None,
             github_token_file: None,
             branch_prefix: None,

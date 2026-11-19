@@ -220,6 +220,226 @@ fn the_first_tick_sends_a_heartbeat_with_health_and_live_agent_servers() {
     assert!(stamp.ends_with('Z'));
 }
 
+/// A box with more to say than the contract has fields for: a second
+/// environment watched through a driver whose links need its id, and a
+/// config sync waiting for its first dry run.
+fn box_with_more_to_say() -> Rig {
+    let rig = Rig::new();
+    rig.configure(&format!(
+        "[[environment]]\nname = \"t3\"\nroot = \"{root}\"\ndriver = \"t3code\"\n\
+         check = \"true\"\ndriver_home = \"{home}\"\ndriver_poll = \"off\"\n\n\
+         [config_sync]\nrepository = \"{repository}\"\nbranch = \"main\"\ninterval = \"off\"\n",
+        root = rig.root.display(),
+        home = rig.home.dir.join("no-t3-here").display(),
+        repository = rig.home.dir.join("no-repository-here").display(),
+    ));
+    let state = rig.home.state_dir();
+    std::fs::create_dir_all(state.join("drivers")).unwrap();
+    std::fs::write(
+        state.join("drivers/t3.json"),
+        json!({ "driver": "t3code", "condition": "ok", "link_ref": "env_01HZX" }).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("config-sync.json"),
+        json!({ "environments": { "client-a": {
+            "state": "pending",
+            "checked_at_ms": unix_ms(SystemTime::now()),
+        } } })
+        .to_string(),
+    )
+    .unwrap();
+    rig
+}
+
+/// The fields ahead of the contract that a heartbeat carried, over all of
+/// its environments.
+fn ahead_in(beat: &Request) -> Vec<String> {
+    let body = beat.json();
+    let mut found: Vec<String> = body["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|environment| environment.as_object().unwrap().keys().cloned())
+        .filter(|key| contract::AHEAD.contains(&key.as_str()))
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn watch_as_it_is_refuses_nothing_from_a_box_with_drivers_and_config_sync() {
+    let rig = box_with_more_to_say();
+    // Watch as it is: any field its contract does not name is a 400.
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    needs_input(&rig, "s1");
+    let mut daemon = daemon(&rig);
+    let start = Instant::now();
+    daemon.tick(start);
+    daemon.tick(start + secs(61));
+    daemon.write_state(true);
+
+    // Every heartbeat was one Watch takes, so the box is in sight...
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 2);
+    for beat in &beats {
+        assert_eq!(ahead_in(beat), Vec::<String>::new());
+        let named: Vec<Value> = beat.json()["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|environment| environment["env_id"].clone())
+            .collect();
+        assert_eq!(named, [json!("client-a"), json!("t3")]);
+    }
+    let state = daemon.state(true);
+    assert_eq!(state.heartbeat.last_error, None);
+    assert!(state.heartbeat.last_ok_at.is_some());
+    // ...and what waits on its owner has left it.
+    assert_eq!(types(&batches(&mock)[0]), ["permission_prompt"]);
+    // What stayed behind is said on the box, by name.
+    assert_eq!(
+        state.heartbeat.withheld,
+        ["config_state", "driver", "driver_ref"]
+    );
+    let shown = common::gate::status_shown(&rig);
+    assert_eq!(
+        shown["watch"]["withheld"],
+        json!(["config_state", "driver", "driver_ref"])
+    );
+    assert_eq!(shown["environments"][1]["driver"]["link_ref"], "env_01HZX");
+    assert_eq!(shown["environments"][0]["config"]["state"], "pending");
+    // `nucleated check` holds to the same rule, and says what stayed.
+    let check = common::stdout_json(&common::run(rig.nucleated().arg("check"), ""));
+    let heartbeat = check["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "heartbeat")
+        .unwrap();
+    assert_eq!(heartbeat["ok"], true, "{heartbeat}");
+    assert!(
+        heartbeat["detail"].as_str().unwrap().contains("driver"),
+        "{heartbeat}"
+    );
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+}
+
+#[test]
+fn a_watch_that_says_it_takes_the_newer_fields_is_sent_them_without_waiting_a_beat() {
+    let rig = box_with_more_to_say();
+    let mock = common::gate::watch_ahead();
+    rig.sign_in(&mock.url);
+    let mut daemon = daemon(&rig);
+    let start = Instant::now();
+    daemon.tick(start);
+    // Nothing is sent on a guess: the first heartbeat is one every Watch takes.
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 1);
+    assert_eq!(ahead_in(&beats[0]), Vec::<String>::new());
+    // Its answer named the fields, so the rest follows at the next turn of
+    // the loop, and then at the usual pace.
+    daemon.tick(start + Duration::from_millis(500));
+    daemon.tick(start + secs(30));
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 2);
+    assert_eq!(
+        ahead_in(&beats[1]),
+        ["config_state", "driver", "driver_ref"]
+    );
+    let said = beats[1].json();
+    assert_eq!(said["environments"][0]["config_state"], "pending");
+    assert_eq!(said["environments"][1]["driver"], "t3code");
+    assert_eq!(said["environments"][1]["driver_ref"], "env_01HZX");
+    assert_eq!(daemon.state(true).heartbeat.withheld, Vec::<String>::new());
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    daemon.tick(start + secs(61));
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 3);
+    assert_eq!(ahead_in(&beats[2]), ahead_in(&beats[1]));
+
+    // A Watch that takes some of them is sent those and no other.
+    let rig = box_with_more_to_say();
+    let mock = common::gate::watch_taking(&["driver"]);
+    rig.sign_in(&mock.url);
+    common::gate::tick(&rig);
+    assert_eq!(
+        ahead_in(mock.to(contract::HEARTBEATS).last().unwrap()),
+        ["driver"]
+    );
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+}
+
+#[test]
+fn a_watch_that_refuses_a_field_it_said_it_takes_still_hears_from_the_box() {
+    let rig = box_with_more_to_say();
+    // It names every newer field, and then will not have `driver_ref`.
+    let mock = Mock::start(|request: &Request| match request.path.as_str() {
+        contract::HEARTBEATS if request.body.contains("driver_ref") => {
+            Reply::problem(400, "validation_failed")
+        }
+        contract::HEARTBEATS => Reply::json(
+            200,
+            json!({
+                "received_at": "2026-11-19T12:00:00.000Z",
+                "heartbeat_interval_s": 60,
+                "accepts": contract::AHEAD,
+            }),
+        ),
+        _ => Reply::json(
+            200,
+            json!({ "received_at": "2026-11-19T12:00:00.000Z", "accepted": 1, "duplicates": 0, "rejected": [] }),
+        ),
+    });
+    rig.sign_in(&mock.url);
+    needs_input(&rig, "s1");
+    let mut daemon = Daemon::new(
+        rig.settings(),
+        Timings {
+            ahead_hold: secs(600),
+            ..timings()
+        },
+    );
+    let start = Instant::now();
+    daemon.tick(start);
+    daemon.tick(start + Duration::from_millis(500));
+    // Plain, then in full and refused, then plain again in the same breath.
+    let refused = |beats: &[Request]| -> Vec<bool> {
+        beats
+            .iter()
+            .map(|beat| beat.body.contains("driver_ref"))
+            .collect()
+    };
+    let beats = mock.to(contract::HEARTBEATS);
+    assert_eq!(refused(&beats), [false, true, false]);
+    assert_eq!(ahead_in(&beats[2]), Vec::<String>::new());
+    let state = daemon.state(true);
+    assert_eq!(state.heartbeat.last_error, None);
+    assert_eq!(
+        state.heartbeat.withheld,
+        ["config_state", "driver", "driver_ref"]
+    );
+    // The box never went dark, and what waits on its owner left it.
+    assert_eq!(mock.to(contract::EVENTS).len(), 1);
+    // The refused field is not tried at every beat...
+    daemon.tick(start + secs(61));
+    daemon.tick(start + secs(122));
+    assert_eq!(
+        refused(&mock.to(contract::HEARTBEATS)),
+        [false, true, false, false, false]
+    );
+    // ...but it is tried again later, in case Watch has changed its mind,
+    // and a second refusal costs the box nothing either.
+    daemon.tick(start + secs(700));
+    assert_eq!(
+        refused(&mock.to(contract::HEARTBEATS)),
+        [false, true, false, false, false, true, false]
+    );
+    assert_eq!(daemon.state(true).heartbeat.last_error, None);
+}
+
 #[test]
 fn an_agent_server_that_is_not_running_is_reported_as_such() {
     let rig = Rig::new();
@@ -633,6 +853,42 @@ fn the_stand_in_api_holds_the_contract_as_watch_does() {
         })),
         Ok(())
     );
+    // Each field ahead of the contract is one Watch refuses as it is, and
+    // one a Watch that names it takes, in its shape and beside what it
+    // belongs to.
+    let ahead = |field: &str, value: Value, taking: &[&str]| {
+        let mut body = heartbeat();
+        body["environments"][0][field] = value;
+        contract::heartbeat_taking(&body, taking)
+    };
+    for (field, value) in [
+        ("driver", json!("t3code")),
+        ("config_commit", json!("a1".repeat(20))),
+        ("config_state", json!("pending")),
+    ] {
+        assert!(ahead(field, value.clone(), &[]).is_err(), "{field}");
+        assert_eq!(ahead(field, value.clone(), &[field]), Ok(()), "{field}");
+        assert!(ahead(field, value, &["another"]).is_err(), "{field}");
+        assert!(
+            ahead(field, json!("words, not a value"), &[field]).is_err(),
+            "{field}"
+        );
+    }
+    for (field, beside) in [
+        ("driver_ref", "driver"),
+        ("config_modified", "config_commit"),
+    ] {
+        let value = if field == "driver_ref" {
+            json!("env_01HZX")
+        } else {
+            json!(true)
+        };
+        assert!(ahead(field, value.clone(), &[]).is_err(), "{field}");
+        assert!(
+            ahead(field, value, &[field, beside]).is_err(),
+            "{field} with no {beside}"
+        );
+    }
     let spoiled = |change: &dyn Fn(&mut Value)| {
         let mut body = heartbeat();
         change(&mut body);

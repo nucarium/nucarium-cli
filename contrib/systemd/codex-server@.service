@@ -1,0 +1,50 @@
+# An example, not something nucleated installs or starts.
+#
+# One Codex login's agent server, as a systemd user unit, so that nucleated
+# has something to report as alive: `systemctl --user is-active
+# codex-server@client-a.service` is what the heartbeat asks. The instance
+# name is the environment's name.
+#
+#   systemctl --user enable --now codex-server@client-a.service
+#
+# and in nucleated's config:
+#
+#   [[environment]]
+#   name = "client-a"
+#   root = "/home/agent/client-a"
+#   agent = "codex"
+#   config_dir = "/home/agent/.codex-client-a"
+#   unit = "codex-server@client-a.service"
+#
+# This rests on a Codex command its own reference labels experimental:
+# `codex remote-control --no-daemon` runs an app server in the foreground
+# until it is stopped. A Codex update may change or remove it. Codex's own
+# managed daemon (`codex remote-control start`) is a detached process that
+# systemd does not supervise, so it cannot stand behind this unit. OpenAI
+# documents no systemd setup for Codex.
+#
+# Active means the process is up. It does not mean a phone is paired or
+# connected: nucleated does not ask Codex anything.
+
+[Unit]
+Description=Codex agent server for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# That login's Codex config folder. It must exist. Codex's hooks inherit it,
+# and it is how nucleated tells one login's hooks from another's: keep it the
+# same as the environment's `config_dir`.
+Environment=CODEX_HOME=%h/.codex-%i
+# The environment's nucleus.
+WorkingDirectory=%h/%i
+# Put the folder `codex` is installed in on this unit's PATH, or write its
+# full path here.
+ExecStart=/usr/bin/env codex remote-control --no-daemon
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

@@ -18,8 +18,10 @@ use crate::reporter::{self, Counts};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
 use crate::spool::Spool;
-use crate::watch::{ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, UnsavedReport};
-use crate::{agent, housekeeping, paths, pause};
+use crate::watch::{
+    ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
+};
+use crate::{agent, config_sync, driver, housekeeping, paths, pause};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +47,9 @@ pub struct Timings {
     /// Spread retries by up to a fifth, so boxes do not retry in step.
     pub jitter: bool,
     pub http_timeout: Duration,
+    /// After Watch refuses a heartbeat carrying a field it had said it
+    /// takes, no such field is sent for this long.
+    pub ahead_hold: Duration,
 }
 
 impl Default for Timings {
@@ -58,6 +63,7 @@ impl Default for Timings {
             backoff_max: Duration::from_secs(300),
             jitter: true,
             http_timeout: Duration::from_secs(15),
+            ahead_hold: Duration::from_secs(3_600),
         }
     }
 }
@@ -75,6 +81,10 @@ pub struct HeartbeatState {
     /// A short word such as `unreachable`. Never text from the network.
     pub last_error: Option<String>,
     pub interval_s: u64,
+    /// The fields the box knows and did not send, because this Watch has not
+    /// said it takes them: names from [`crate::watch::AHEAD`].
+    #[serde(default)]
+    pub withheld: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -144,15 +154,26 @@ fn at_ms(ms: u64) -> SystemTime {
 
 /// What a heartbeat says about one environment: whether its agent server is
 /// alive and how often its supervisor has restarted it, what the reporter
-/// last counted in its nucleus, and whatever its agent's adapter can read
-/// about the login and the version. Where a thing is not known, an adapter
-/// that cannot read it or a count not yet made, the heartbeat says nothing.
+/// last counted in its nucleus, whatever its agent's adapter can read about
+/// the login and the version, the driver it is watched through, and where
+/// its config stands. Where a thing is not known, an adapter that cannot
+/// read it or a count not yet made, the heartbeat says nothing.
+///
+/// Nothing here asks a driver or runs git: what the driver thread and the
+/// config sync last wrote down is read from two small files.
 fn environment_report(
+    settings: &Settings,
     environment: &Environment,
     counts: Option<&Counts>,
+    synced: Option<&config_sync::Status>,
     now: SystemTime,
 ) -> EnvironmentReport {
-    let adapter = agent::by_name(&environment.agent);
+    // An environment watched through a driver is not one login, so there is
+    // no one version and no one login expiry to report for it.
+    let adapter = match environment.driver {
+        Some(_) => None,
+        None => agent::by_name(&environment.agent),
+    };
     let nucleus = counts.and_then(|counts| counts.nucleus(&environment.name));
     let counted_at = counts.map(|counts| at_ms(counts.counted_at_ms));
     let unsaved = nucleus
@@ -161,6 +182,12 @@ fn environment_report(
         .and_then(|(counted, at)| {
             UnsavedReport::new(counted.uncommitted_repos, counted.unpushed_commits, at, now)
         });
+    let driver_ref = environment
+        .driver
+        .as_ref()
+        .and_then(|_| driver::read_memory(&settings.state_dir, &environment.name))
+        .filter(|memory| Some(&memory.driver) == environment.driver.as_ref().map(|d| &d.name))
+        .and_then(|memory| memory.link_ref);
     EnvironmentReport::new(
         &environment.name,
         health::server_alive(environment),
@@ -176,6 +203,14 @@ fn environment_report(
             .map(at_ms),
         now,
     )
+    .with_driver(
+        environment
+            .driver
+            .as_ref()
+            .map(|driver| driver.name.as_str()),
+        driver_ref,
+    )
+    .with_config(&config_sync::report(synced, &environment.name, now))
 }
 
 /// The whole box's unsaved work, each nucleus counted once, and the time
@@ -205,10 +240,17 @@ fn machine_totals(settings: &Settings, counts: &Counts) -> (Option<(u64, u64)>, 
             })
         },
     );
-    let snapshot = nuclei
-        .iter()
-        .map(|nucleus| nucleus.last_snapshot_ms)
-        .try_fold(u64::MAX, |oldest, at| at.map(|at| oldest.min(at)));
+    // A driver's worktrees are never snapshotted, so they neither have a
+    // time nor hold back the box's.
+    let snapshot = Some(&nuclei)
+        .filter(|nuclei| nuclei.iter().any(|nucleus| !nucleus.driver))
+        .and_then(|nuclei| {
+            nuclei
+                .iter()
+                .filter(|nucleus| !nucleus.driver)
+                .map(|nucleus| nucleus.last_snapshot_ms)
+                .try_fold(u64::MAX, |oldest, at| at.map(|at| oldest.min(at)))
+        });
     (unsaved, snapshot)
 }
 
@@ -228,10 +270,13 @@ pub fn heartbeat(settings: &Settings, now: SystemTime) -> Heartbeat {
     let machine = health::sample(&settings.environments, settings.ups.as_deref())
         .with_unsaved(unsaved)
         .with_snapshot(snapshot.map(at_ms), now);
+    let synced = config_sync::read_status(settings);
     let environments = settings
         .environments
         .iter()
-        .map(|environment| environment_report(environment, counts.as_ref(), now))
+        .map(|environment| {
+            environment_report(settings, environment, counts.as_ref(), synced.as_ref(), now)
+        })
         .collect();
     Heartbeat::new(machine, environments, now)
         .with_pause(pause::until(&settings.state_dir, now), now)
@@ -260,6 +305,13 @@ pub struct Daemon {
     /// The environments an accepted heartbeat has named. Watch refuses an
     /// event for any other.
     named: BTreeSet<String>,
+    /// The fields ahead of the contract that Watch, in its last answer to a
+    /// heartbeat, said it takes. None until it says so, and none again when
+    /// the token changes: nothing Watch would refuse is sent on a guess.
+    taken: Taken,
+    /// Watch refused a heartbeat that carried such a field. Until this time
+    /// none is sent, whatever Watch says it takes.
+    ahead_held_until: Option<Instant>,
     heartbeat: HeartbeatState,
     environments: Vec<EnvironmentState>,
     machine: Option<MachineHealth>,
@@ -308,6 +360,8 @@ impl Daemon {
             heartbeat_failures: 0,
             server_interval: None,
             named: BTreeSet::new(),
+            taken: Taken::default(),
+            ahead_held_until: None,
             environments: Vec::new(),
             machine: None,
             pending: BTreeMap::new(),
@@ -391,6 +445,8 @@ impl Daemon {
         self.api_url = api_url;
         self.token_rejected = false;
         self.named.clear();
+        self.taken = Taken::default();
+        self.ahead_held_until = None;
         self.next_heartbeat = None;
         self.retry_at = None;
         self.backoff = self.timings.backoff_min;
@@ -412,12 +468,26 @@ impl Daemon {
         }
     }
 
+    /// The fields ahead of the contract that may go in a heartbeat now: what
+    /// Watch last said it takes, and nothing while a refusal is being sat out.
+    fn taken_now(&self, now: Instant) -> Taken {
+        match self.ahead_held_until {
+            Some(until) if now < until => Taken::default(),
+            _ => self.taken.clone(),
+        }
+    }
+
     /// Sample the machine and its agent servers and, when signed in, tell Watch.
+    ///
+    /// What is sampled is everything the box knows. What is sent is that,
+    /// less any field ahead of the contract that Watch has not said it
+    /// takes: Watch refuses a heartbeat for one field it does not name, and
+    /// a box must never look dark for having more to say.
     fn beat(&mut self, now: Instant) {
         let wall = SystemTime::now();
         let stamp = rfc3339(wall);
-        let body = heartbeat(&self.settings, wall);
-        self.environments = body
+        let known = heartbeat(&self.settings, wall);
+        self.environments = known
             .environments
             .iter()
             .map(|report| EnvironmentState {
@@ -426,11 +496,28 @@ impl Daemon {
                 checked_at: stamp.clone(),
             })
             .collect();
-        self.machine = Some(body.machine.clone());
+        self.machine = Some(known.machine.clone());
+        self.heartbeat.withheld.clear();
         let mut wait = self.interval();
         if let (true, Some(client), Some(token)) = (self.hosted(), &self.client, &self.token) {
             self.heartbeat.last_attempt_at = Some(stamp.clone());
-            match client.heartbeat(token, &body) {
+            let mut body = known.only(&self.taken_now(now));
+            let mut answer = client.heartbeat(token, &body);
+            if matches!(answer, Err(ApiError::Refused { .. })) && !body.ahead().is_empty() {
+                // Watch said it takes these and then refused them. Say at
+                // once what every Watch takes, and leave the rest for later.
+                log("Watch refused a heartbeat with a newer field in it; sending without them");
+                self.ahead_held_until = Some(now + self.timings.ahead_hold);
+                body = known.only(&Taken::default());
+                answer = client.heartbeat(token, &body);
+            }
+            let sent = body.ahead();
+            self.heartbeat.withheld = known
+                .ahead()
+                .difference(&sent)
+                .map(|field| field.to_string())
+                .collect();
+            match answer {
                 Ok(ack) => {
                     if self.heartbeat.last_error.is_some() || self.heartbeat.last_ok_at.is_none() {
                         log("heartbeat accepted");
@@ -448,6 +535,13 @@ impl Daemon {
                         self.notifier.heartbeat_accepted(now, wall);
                     }
                     wait = self.interval();
+                    // Watch has just said it takes more than it was sent:
+                    // say the rest now, not a whole interval from now.
+                    self.taken = Taken::from_names(&ack.accepts);
+                    let next = known.only(&self.taken_now(now)).ahead();
+                    if next.difference(&sent).next().is_some() {
+                        wait = Duration::ZERO;
+                    }
                 }
                 Err(failure) => {
                     if self.heartbeat.last_error.as_deref() != Some(failure.kind()) {
@@ -837,6 +931,19 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
         let path = settings.path.clone();
         std::thread::spawn(move || reporter::run_schedule(&path, &stop))
     };
+    // Drivers are asked, and the owner's config repository is fetched, on
+    // threads of their own too: neither a driver that does not answer nor a
+    // git host that does not is ever waited on by a heartbeat.
+    let drivers = {
+        let stop = stop.clone();
+        let path = settings.path.clone();
+        std::thread::spawn(move || driver::run_schedule(&path, &stop))
+    };
+    let config = {
+        let stop = stop.clone();
+        let path = settings.path.clone();
+        std::thread::spawn(move || config_sync::run_schedule(&path, &stop))
+    };
     let timings = Timings::default();
     let tick = timings.tick;
     let mut daemon = Daemon::new(settings, timings);
@@ -852,5 +959,7 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
     // left half-written.
     drop(keeper);
     drop(reporter);
+    drop(drivers);
+    drop(config);
     Ok(())
 }

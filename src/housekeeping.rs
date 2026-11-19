@@ -10,6 +10,7 @@
 //! of its own on top; it never takes a shortcut around it.
 
 use crate::config;
+use crate::driver;
 use crate::envelope::{rfc3339, unix_ms};
 use crate::git;
 use crate::paths;
@@ -77,10 +78,14 @@ pub(crate) fn sharing_nucleus(settings: &Settings, environment: &Environment) ->
 }
 
 /// One environment per nucleus: where two logins share a nucleus, a job over
-/// it runs once, under the first of them.
+/// it runs once, under the first of them. An environment whose driver owns
+/// its worktrees has no nucleus, and no job ever runs over it.
 pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
     let mut chosen: Vec<&Environment> = Vec::new();
     for environment in &settings.environments {
+        if environment.driver_owns_worktrees() {
+            continue;
+        }
         if !chosen
             .iter()
             .any(|seen| same_folder(&seen.root, &environment.root))
@@ -106,10 +111,22 @@ pub fn run_job(
     job: Job,
     dry_run: bool,
 ) -> Result<Value> {
+    // Asked for by hand or not, no job runs where a driver owns the worktrees.
+    if let Some(owner) = environment
+        .driver_adapter()
+        .filter(|adapter| adapter.owns_worktrees())
+    {
+        bail!(
+            "{} owns the worktrees of {}; housekeeping leaves them alone",
+            owner.name(),
+            environment.name
+        );
+    }
     if !environment.root.is_dir() {
         bail!("{} is not a folder", environment.root.display());
     }
-    let workspace = workspace(environment);
+    // And no job reaches into a driver's folders from a nucleus beside them.
+    let workspace = workspace(environment).leaving_alone(driver::protected_roots(settings));
     let mut report = match job {
         Job::Refresh => json!({ "repos": workspace.refresh()? }),
         Job::Cleanup => {
@@ -437,6 +454,16 @@ fn snapshot(
     for item in workspace.available()? {
         for worktree in Workspace::worktrees(&item.bare).unwrap_or_default() {
             if !worktree.is_dir() {
+                continue;
+            }
+            // A snapshot writes objects into the repository and pushes a
+            // ref. In a worktree that is not the nucleus's own, a driver's
+            // or one made by hand, that is a change, so it is not made.
+            if let Some(why) = workspace.left_alone_because(&worktree) {
+                report.push(json!({
+                    "repo": item.repo, "worktree": worktree,
+                    "action": "skipped", "reason": why,
+                }));
                 continue;
             }
             report.push(

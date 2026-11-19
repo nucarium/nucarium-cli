@@ -54,6 +54,11 @@ pub struct Workspace {
     /// Where GitHub's answers to "was this commit merged?" are remembered,
     /// for a caller that asks on a schedule.
     merges: Option<PathBuf>,
+    /// Folders that belong to something else, a driver that makes and
+    /// removes its own worktrees. Nothing under one is removed, pruned,
+    /// snapshotted or counted here. See [`Workspace::left_alone_because`]
+    /// for the rule that does not depend on this list.
+    protected: Vec<PathBuf>,
 }
 
 /// What a worktree holds that exists nowhere else. This is the one rule:
@@ -157,7 +162,67 @@ impl Workspace {
             sessions_dir: root.join(".worktrees"),
             seeds_dir: root.join(".seeds"),
             merges: None,
+            protected: Vec::new(),
         }
+    }
+
+    /// Leave everything under these folders alone. The daemon names the
+    /// folders of every driver that owns its worktrees.
+    pub fn leaving_alone(mut self, folders: Vec<PathBuf>) -> Self {
+        self.protected = folders;
+        self
+    }
+
+    /// A path with as much of it resolved as exists. A worktree whose folder
+    /// is gone still has a place: the rest is kept as written.
+    fn resolved(path: &Path) -> PathBuf {
+        path.ancestors()
+            .find_map(|above| {
+                let below = path.strip_prefix(above).ok()?;
+                Some(above.canonicalize().ok()?.join(below))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
+    }
+
+    /// True for a path under a folder this workspace was told belongs to a
+    /// driver that owns its worktrees.
+    pub fn under_a_driver(&self, path: &Path) -> bool {
+        let resolved = Self::resolved(path);
+        self.protected
+            .iter()
+            .any(|folder| resolved.starts_with(folder))
+    }
+
+    /// Why a worktree is not this nucleus's own to change, or nothing when
+    /// it is. Ownership is decided positively: the nucleus's own worktrees
+    /// are the ones under its `.worktrees/`, where `nucleate` puts every one
+    /// it makes. Anything else registered in one of its bare repos was made
+    /// by a driver or by hand, whether or not the config names its folder.
+    pub fn left_alone_because(&self, path: &Path) -> Option<&'static str> {
+        if self.under_a_driver(path) {
+            return Some("owned by a driver");
+        }
+        let resolved = Self::resolved(path);
+        let sessions = Self::resolved(&self.sessions_dir);
+        (resolved == sessions || !resolved.starts_with(&sessions))
+            .then_some("not under this nucleus's .worktrees")
+    }
+
+    /// True for a worktree that is not this nucleus's own: it is never
+    /// removed or snapshotted, and git's record of it is never pruned.
+    pub fn leaves_alone(&self, path: &Path) -> bool {
+        self.left_alone_because(path).is_some()
+    }
+
+    /// True when every worktree registered in a bare repo is this nucleus's
+    /// own, so that pruning its records can drop nobody else's. Where git
+    /// cannot say, it might not be.
+    fn holds_only_its_own(&self, bare: &Path) -> bool {
+        Self::worktrees(bare).is_ok_and(|registered| {
+            registered
+                .iter()
+                .all(|worktree| !self.leaves_alone(worktree))
+        })
     }
 
     /// Remember GitHub's answers in `file`, so that counting unsaved work on
@@ -361,10 +426,14 @@ impl Workspace {
         found
     }
 
-    /// Drop git's records of worktrees whose folders are gone.
+    /// Drop git's records of worktrees whose folders are gone. A prune
+    /// drops every such record in a repo, so a repo that also holds a
+    /// worktree that is not this nucleus's own is not pruned at all.
     pub fn prune_worktrees(&self) -> Result<()> {
         for item in self.available()? {
-            let _ = git::try_bare(&item.bare, &["worktree", "prune"]);
+            if self.holds_only_its_own(&item.bare) {
+                let _ = git::try_bare(&item.bare, &["worktree", "prune"]);
+            }
         }
         Ok(())
     }
@@ -684,6 +753,9 @@ impl Workspace {
     }
 
     fn remove_one(&self, name: &str, info: &RepoInfo, force: bool) -> Result<()> {
+        if let Some(why) = self.left_alone_because(&info.path) {
+            bail!("{name}: its worktree is {why}");
+        }
         if info.path.exists() {
             let reasons = self.unsafe_reasons(&info.path)?;
             if !reasons.is_empty() && !force {
@@ -729,7 +801,11 @@ impl Workspace {
         let manifest = Self::load_manifest(session)?;
         let mut problems = Vec::new();
         for (name, info) in &manifest.repos {
-            if info.path.exists() {
+            // All of the session or none of it: one worktree that is not
+            // ours to remove keeps the whole session.
+            if let Some(why) = self.left_alone_because(&info.path) {
+                problems.push(format!("{name}: its worktree is {why}"));
+            } else if info.path.exists() {
                 let reasons = self.unsafe_reasons(&info.path)?;
                 if !reasons.is_empty() {
                     problems.push(format!("{name}: {}", reasons.join("; ")));
@@ -746,7 +822,9 @@ impl Workspace {
             self.remove_one(name, info, false)?;
         }
         for info in manifest.repos.values() {
-            let _ = git::try_bare(&info.bare, &["worktree", "prune"]);
+            if self.holds_only_its_own(&info.bare) {
+                let _ = git::try_bare(&info.bare, &["worktree", "prune"]);
+            }
         }
         fs::remove_dir_all(session)?;
         Ok(json!({ "removed_session": session }))
@@ -826,6 +904,11 @@ impl Workspace {
         let path = Path::new(path)
             .canonicalize()
             .unwrap_or_else(|_| PathBuf::from(path));
+        // Every worktree this hook is asked to remove is one `hook-create`
+        // made, under `.worktrees/`. Any other is somebody else's.
+        if let Some(why) = self.left_alone_because(&path) {
+            bail!("refusing to remove {}: {why}", path.display());
+        }
         if path.join(MANIFEST).is_file() {
             self.remove_session(&path)?;
             return Ok(());

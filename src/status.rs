@@ -1,14 +1,16 @@
 //! `nucleated status` and `nucleated check`: what Watch would show, read from
 //! the box itself, for a box with no account or no network.
 
+use crate::config_sync;
 use crate::credentials::{self, Stored};
 use crate::daemon::{self, Timings};
+use crate::driver;
 use crate::envelope::{rfc3339, unix_ms};
 use crate::housekeeping;
 use crate::notifier;
 use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Settings, Target};
-use crate::watch::Client;
+use crate::watch::{Client, Heartbeat, Taken};
 use serde_json::{json, Value};
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -59,6 +61,8 @@ pub fn view(settings: &Settings) -> Value {
     // What a heartbeat would say now. Built where the daemon builds its own,
     // so what is shown here is what Watch is told.
     let beat = daemon::heartbeat(settings, now);
+
+    let synced = config_sync::read_status(settings);
 
     let mut inbox: Vec<(u8, u64, Value)> = Vec::new();
     let mut environments = Vec::new();
@@ -118,10 +122,40 @@ pub fn view(settings: &Settings) -> Value {
                 }),
             ));
         }
+        // What the driver thread last found, and where the config sync
+        // stands: fixed words, ids and times, read from the box's own files.
+        let watched = environment.driver.as_ref().map(|configured| {
+            let memory = driver::read_memory(&settings.state_dir, &environment.name)
+                .filter(|memory| memory.driver == configured.name);
+            json!({
+                "name": configured.name,
+                "poll_s": configured.poll.map(|every| every.as_secs()),
+                "condition": memory.as_ref().map(|memory| memory.condition.as_str()),
+                "since": memory.as_ref().map(|memory| at(memory.since_ms)),
+                "looked_at": memory.as_ref().map(|memory| at(memory.looked_at_ms)),
+                "last_good_at": memory.as_ref().and_then(|memory| memory.good_at_ms).map(at),
+                "uncounted_worktrees": memory.as_ref().map(|memory| memory.uncounted_worktrees),
+                "link_ref": report.driver_ref,
+                "link_template": environment
+                    .driver_adapter()
+                    .and_then(|adapter| adapter.link_template()),
+            })
+        });
+        let config = config_sync::report(synced.as_ref(), &environment.name, now);
+        let config = (config != config_sync::Report::default()).then(|| {
+            json!({
+                "commit": config.commit,
+                "modified": config.modified,
+                "state": config.state.map(config_sync::State::as_str),
+                "detail": config.detail,
+            })
+        });
         environments.push(json!({
             "name": environment.name,
             "root": environment.root,
             "agent": environment.agent,
+            "driver": watched,
+            "config": config,
             "agent_version": report.agent_version,
             "login_expires_at": report.login_expires_at,
             "server_alive": alive,
@@ -165,6 +199,8 @@ pub fn view(settings: &Settings) -> Value {
             "account_name": login.as_ref().and_then(|l| l.account_name.clone()),
             "last_heartbeat_at": state.as_ref().and_then(|s| s.heartbeat.last_ok_at.clone()),
             "heartbeat_error": state.as_ref().and_then(|s| s.heartbeat.last_error.clone()),
+            // What the box knows and this Watch has not said it takes.
+            "withheld": state.as_ref().map(|s| s.heartbeat.withheld.clone()).unwrap_or_default(),
             "pending_events": state.as_ref().map_or(0, |s| s.events.pending),
             "rejected_events": state.as_ref().map_or(0, |s| s.events.rejected),
             "events_error": state.as_ref().and_then(|s| s.events.last_error.clone()),
@@ -253,6 +289,53 @@ fn left_behind(outcome: &Value) -> String {
     parts.join(" · ")
 }
 
+/// How an environment's driver was last found: its name, and, when the last
+/// look found nothing, the fixed word for why and since when.
+fn driver_words(driver: &Value) -> String {
+    let Some(name) = driver["name"].as_str() else {
+        return String::new();
+    };
+    let found = match (driver["poll_s"].is_null(), driver["condition"].as_str()) {
+        (true, _) => ": not asked, driver_poll is off".to_string(),
+        (false, None) => ": not asked yet".to_string(),
+        (false, Some("ok")) => String::new(),
+        (false, Some(condition)) => match driver["since"].as_str() {
+            Some(stamp) => format!(": {condition} since {}", clock(stamp)),
+            None => format!(": {condition}"),
+        },
+    };
+    // Why no unsaved count is shown for it, when that is why.
+    let left_out = match driver["uncounted_worktrees"].as_u64() {
+        None | Some(0) => String::new(),
+        Some(1) => " · 1 worktree outside its folders, unsaved work not counted".to_string(),
+        Some(count) => {
+            format!(" · {count} worktrees outside its folders, unsaved work not counted")
+        }
+    };
+    format!("  driver {name}{found}{left_out}")
+}
+
+/// Where an environment's config stands: the short commit, whether a synced
+/// file was changed by hand, and the sync's state when it is not "ok".
+fn config_words(config: &Value) -> String {
+    if !config.is_object() {
+        return String::new();
+    }
+    let mut words = match config["commit"].as_str() {
+        Some(commit) => format!("  config {}", commit.chars().take(8).collect::<String>()),
+        None => "  config not applied yet".to_string(),
+    };
+    if config["modified"] == true {
+        words.push_str(", changed by hand");
+    }
+    match (config["state"].as_str(), config["detail"].as_str()) {
+        (None | Some("ok"), _) => {}
+        (Some(state), Some(detail)) => words.push_str(&format!(" ({state}: {detail})")),
+        (Some(state), None) => words.push_str(&format!(" ({state})")),
+    }
+    words
+}
+
 /// The view as text, for a person at the box.
 pub fn render(view: &Value) -> String {
     let now_ms = view["now_ms"].as_u64().unwrap_or(0);
@@ -316,6 +399,18 @@ pub fn render(view: &Value) -> String {
             let pending = watch["pending_events"].as_u64().unwrap_or(0);
             if pending > 0 {
                 line.push_str(&format!(" · {pending} events waiting to send"));
+            }
+            let withheld: Vec<&str> = watch["withheld"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !withheld.is_empty() {
+                line.push_str(&format!(
+                    " · not sent, Watch does not take it yet: {}",
+                    withheld.join(", ")
+                ));
             }
             line
         }
@@ -461,6 +556,8 @@ pub fn render(view: &Value) -> String {
             {
                 line.push_str(&format!("  last snapshot {} ago", ago(seconds)));
             }
+            line.push_str(&driver_words(&environment["driver"]));
+            line.push_str(&config_words(&environment["config"]));
             out.push_str(&line);
             out.push('\n');
         }
@@ -540,18 +637,32 @@ pub fn check(settings: &Settings) -> (Value, bool) {
     // that what it left out is no longer so.
     let beat = daemon::heartbeat(settings, SystemTime::now());
     for (environment, report) in settings.environments.iter().zip(&beat.environments) {
-        let nucleus = environment.root.join(".repos").is_dir();
-        add(
-            format!("{}: nucleus", environment.name),
-            nucleus,
-            match nucleus {
-                true => environment.root.display().to_string(),
-                false => format!(
-                    "{} is not a nucleus; nucleate init --root creates one",
-                    environment.root.display()
-                ),
-            },
-        );
+        if environment.driver.is_some() {
+            // A driver keeps its agents where it likes. The folder has to
+            // be there; it does not have to be a nucleus.
+            let folder = environment.root.is_dir();
+            add(
+                format!("{}: folder", environment.name),
+                folder,
+                match folder {
+                    true => environment.root.display().to_string(),
+                    false => format!("{} is not a folder", environment.root.display()),
+                },
+            );
+        } else {
+            let nucleus = environment.root.join(".repos").is_dir();
+            add(
+                format!("{}: nucleus", environment.name),
+                nucleus,
+                match nucleus {
+                    true => environment.root.display().to_string(),
+                    false => format!(
+                        "{} is not a nucleus; nucleate init --root creates one",
+                        environment.root.display()
+                    ),
+                },
+            );
+        }
         let alive = report.server_alive;
         let (known, how) = match &environment.check {
             Some(_) => (true, "check command".to_string()),
@@ -603,18 +714,37 @@ pub fn check(settings: &Settings) -> (Value, bool) {
             .login
             .map(|login| login.api_url)
             .unwrap_or_else(|| settings.login_api_url(None));
+        // Sent as the daemon sends it: first what every Watch takes, and
+        // then, in full, whatever more this Watch answers that it takes.
         let sent = Client::new(&api_url, Timings::default().http_timeout)
             .map_err(|error| format!("{error:#}"))
             .and_then(|client| {
-                client
-                    .heartbeat(&credential.token, &beat)
-                    .map_err(|failure| failure.to_string())
+                let send = |body: &Heartbeat| {
+                    client
+                        .heartbeat(&credential.token, body)
+                        .map_err(|failure| failure.to_string())
+                };
+                let plain = beat.only(&Taken::default());
+                let taken = Taken::from_names(&send(&plain)?.accepts);
+                let full = beat.only(&taken);
+                if full != plain {
+                    send(&full)?;
+                }
+                Ok(beat
+                    .ahead()
+                    .difference(&full.ahead())
+                    .copied()
+                    .collect::<Vec<_>>())
             });
         add(
             "heartbeat".to_string(),
             sent.is_ok(),
             match sent {
-                Ok(_) => format!("accepted by {api_url}"),
+                Ok(withheld) if withheld.is_empty() => format!("accepted by {api_url}"),
+                Ok(withheld) => format!(
+                    "accepted by {api_url}; it does not take {} yet, so that stays on this box",
+                    withheld.join(", ")
+                ),
                 Err(why) => why,
             },
         );

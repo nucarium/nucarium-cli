@@ -3,9 +3,13 @@
 //! envelope and the Watch credential.
 
 pub mod agent;
+pub mod allowlist;
+pub mod bounded;
 pub mod config;
+pub mod config_sync;
 pub mod credentials;
 pub mod daemon;
+pub mod driver;
 pub mod envelope;
 pub mod git;
 pub mod github;

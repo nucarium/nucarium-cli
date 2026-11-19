@@ -2,12 +2,16 @@
 //!
 //! Everything the box sends goes through this file.
 
+use crate::config_sync;
 use crate::credentials::Token;
-use crate::envelope::{rfc3339, valid_version, within, Envelope};
+use crate::envelope::{
+    rfc3339, valid_commit_id, valid_env_key, valid_session_id, valid_version, within, Envelope,
+};
 use crate::sessions::ACTIVITY_BEAT;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
@@ -258,6 +262,42 @@ impl UnsavedReport {
     }
 }
 
+/// The fields of a heartbeat's environment that are ahead of the contract
+/// every Watch holds. Watch refuses a heartbeat that carries a field it does
+/// not name, and to its owner a refused heartbeat is a machine gone dark, so
+/// none of these is sent until Watch has said it takes it: in `accepts`, in
+/// its answer to a heartbeat. Until then each stays on the box, where
+/// `nucleated status` shows it.
+pub const AHEAD: [&str; 5] = [
+    "driver",
+    "driver_ref",
+    "config_commit",
+    "config_modified",
+    "config_state",
+];
+
+/// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
+/// says so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Taken(BTreeSet<&'static str>);
+
+impl Taken {
+    /// What Watch named. A name that is not one of [`AHEAD`] is a field this
+    /// program does not have, and is passed over.
+    pub fn from_names(names: &[String]) -> Taken {
+        Taken(
+            AHEAD
+                .into_iter()
+                .filter(|field| names.iter().any(|name| name == field))
+                .collect(),
+        )
+    }
+
+    pub fn takes(&self, field: &str) -> bool {
+        self.0.contains(field)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EnvironmentReport {
     pub env_id: String,
@@ -275,6 +315,24 @@ pub struct EnvironmentReport {
     pub last_snapshot_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsaved: Option<UnsavedReport>,
+    /// The driver the environment is watched through: its config name, one
+    /// of a fixed few. It tells Watch which link template opens a session
+    /// there, and that its sessions come from a state source that may report
+    /// no tool activity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// The driver's own id for this installation, for its link template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_ref: Option<String>,
+    /// The commit the environment's config folder was last applied from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_commit: Option<String>,
+    /// Whether a synced file has been changed by hand since that commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_modified: Option<bool>,
+    /// How the sync stands: one of [`config_sync::State`]'s fixed words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_state: Option<String>,
 }
 
 impl EnvironmentReport {
@@ -297,7 +355,34 @@ impl EnvironmentReport {
                 .map(rfc3339),
             last_snapshot_at: None,
             unsaved: None,
+            driver: None,
+            driver_ref: None,
+            config_commit: None,
+            config_modified: None,
+            config_state: None,
         }
+    }
+
+    /// Name the driver an environment is watched through, and the driver's
+    /// own id for the installation when it has one. A name that is not a
+    /// short lower-case word is left out, and so is an id that is not an id;
+    /// an id never goes without the name it belongs to.
+    pub fn with_driver(mut self, name: Option<&str>, reference: Option<String>) -> Self {
+        self.driver = name
+            .filter(|name| name.len() <= 32 && valid_env_key(name))
+            .map(str::to_string);
+        self.driver_ref = reference.filter(|id| self.driver.is_some() && valid_session_id(id));
+        self
+    }
+
+    /// Say where an environment's config stands. A commit that is not a
+    /// commit id is left out, and the hand-change flag with it: there is no
+    /// room here for a branch name, a subject or a sentence.
+    pub fn with_config(mut self, config: &config_sync::Report) -> Self {
+        self.config_commit = config.commit.clone().filter(|id| valid_commit_id(id));
+        self.config_modified = config.modified.filter(|_| self.config_commit.is_some());
+        self.config_state = config.state.map(|state| state.as_str().to_string());
+        self
     }
 
     pub fn with_restarts(mut self, count: Option<u64>) -> EnvironmentReport {
@@ -313,6 +398,43 @@ impl EnvironmentReport {
     pub fn with_snapshot(mut self, at: Option<SystemTime>, now: SystemTime) -> EnvironmentReport {
         self.last_snapshot_at = at.map(|at| rfc3339(at.min(now)));
         self
+    }
+
+    /// The report as a Watch that takes `taken` would accept it: every field
+    /// of the contract, and of the [`AHEAD`] fields only those. A field that
+    /// only means something beside one that is left out is left out too.
+    pub fn only(&self, taken: &Taken) -> EnvironmentReport {
+        let mut report = self.clone();
+        if !taken.takes("driver") {
+            report.driver = None;
+        }
+        if !taken.takes("driver_ref") || report.driver.is_none() {
+            report.driver_ref = None;
+        }
+        if !taken.takes("config_commit") {
+            report.config_commit = None;
+        }
+        if !taken.takes("config_modified") || report.config_commit.is_none() {
+            report.config_modified = None;
+        }
+        if !taken.takes("config_state") {
+            report.config_state = None;
+        }
+        report
+    }
+
+    /// The [`AHEAD`] fields this report carries.
+    fn ahead(&self) -> impl Iterator<Item = &'static str> {
+        [
+            self.driver.is_some(),
+            self.driver_ref.is_some(),
+            self.config_commit.is_some(),
+            self.config_modified.is_some(),
+            self.config_state.is_some(),
+        ]
+        .into_iter()
+        .zip(AHEAD)
+        .filter_map(|(carried, field)| carried.then_some(field))
     }
 }
 
@@ -358,12 +480,49 @@ impl Heartbeat {
             .map(|until| rfc3339(until.min(now + MAX_PAUSE)));
         self
     }
+
+    /// The heartbeat as a Watch that takes `taken` would accept it. With
+    /// nothing taken, that is the heartbeat every Watch accepts.
+    pub fn only(&self, taken: &Taken) -> Heartbeat {
+        Heartbeat {
+            environments: self
+                .environments
+                .iter()
+                .map(|report| report.only(taken))
+                .collect(),
+            ..self.clone()
+        }
+    }
+
+    /// The [`AHEAD`] fields this heartbeat carries, for any environment.
+    pub fn ahead(&self) -> BTreeSet<&'static str> {
+        self.environments
+            .iter()
+            .flat_map(EnvironmentReport::ahead)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatAck {
     #[serde(default)]
     pub heartbeat_interval_s: Option<u64>,
+    /// The [`AHEAD`] fields this Watch takes, by name. A Watch that says
+    /// nothing takes none of them.
+    #[serde(default, deserialize_with = "names")]
+    pub accepts: Vec<String>,
+}
+
+/// A list of names, read without ever failing the answer it is part of: what
+/// is not a list is no names, and what is not a string in it is passed over.
+fn names<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str().map(str::to_string))
+        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -821,6 +980,123 @@ mod tests {
         assert!(!kept(now - 31 * day));
         assert!(kept(now + 400 * day));
         assert!(!kept(now + 401 * day));
+    }
+
+    #[test]
+    fn a_driver_and_a_config_commit_go_out_as_a_name_an_id_and_fixed_words() {
+        let now = at(1_795_089_600_000);
+        let report = || EnvironmentReport::new("t3", true, None, None, now);
+        let commit = "a1".repeat(20);
+        let known = report()
+            .with_driver(Some("t3code"), Some("env_01HZX".into()))
+            .with_config(&config_sync::Report {
+                commit: Some(commit.clone()),
+                modified: Some(true),
+                state: Some(config_sync::State::Rejected),
+                detail: Some("unverified".into()),
+            });
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            json!({
+                "env_id": "t3", "server_alive": true,
+                "driver": "t3code", "driver_ref": "env_01HZX",
+                "config_commit": commit, "config_modified": true, "config_state": "rejected",
+            })
+        );
+        // Words where a name, an id or a commit belongs are left out, and
+        // what only means something beside them goes too.
+        let wordy = report()
+            .with_driver(Some("T3 Code, the desktop app"), Some("env_01HZX".into()))
+            .with_config(&config_sync::Report {
+                commit: Some("the commit that fixed the login page".into()),
+                modified: Some(true),
+                state: None,
+                detail: Some("unverified".into()),
+            });
+        assert_eq!(
+            serde_json::to_value(wordy).unwrap(),
+            json!({ "env_id": "t3", "server_alive": true })
+        );
+        let no_ref = report().with_driver(Some("orca"), Some("an id with words in it".into()));
+        assert_eq!(no_ref.driver.as_deref(), Some("orca"));
+        assert_eq!(no_ref.driver_ref, None);
+        // A sync that has applied nothing yet has a state and no commit.
+        let waiting = report().with_config(&config_sync::Report {
+            state: Some(config_sync::State::Pending),
+            ..config_sync::Report::default()
+        });
+        assert_eq!(waiting.config_commit, None);
+        assert_eq!(waiting.config_state.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn a_field_ahead_of_the_contract_goes_only_to_a_watch_that_said_it_takes_it() {
+        let now = at(1_795_089_600_000);
+        let commit = "a1".repeat(20);
+        let report = EnvironmentReport::new("t3", true, None, None, now)
+            .with_restarts(Some(4))
+            .with_driver(Some("t3code"), Some("env_01HZX".into()))
+            .with_config(&config_sync::Report {
+                commit: Some(commit.clone()),
+                modified: Some(false),
+                state: Some(config_sync::State::Ok),
+                detail: None,
+            });
+        let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
+        assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
+            let mut all = AHEAD.to_vec();
+            all.sort_unstable();
+            all
+        });
+        let sent = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            serde_json::to_value(said.only(&Taken::from_names(&names))).unwrap()["environments"][0]
+                .clone()
+        };
+        // A Watch that has said nothing is sent what every Watch takes.
+        assert_eq!(
+            sent(&[]),
+            json!({ "env_id": "t3", "server_alive": true, "server_restarts": 4 })
+        );
+        assert!(said.only(&Taken::default()).ahead().is_empty());
+        assert_eq!(
+            said.only(&Taken::from_names(&AHEAD.map(String::from))),
+            said
+        );
+        // One that takes some is sent those, and a field that only means
+        // something beside one it does not take stays behind with it.
+        assert_eq!(
+            sent(&["driver", "config_state"]),
+            json!({
+                "env_id": "t3", "server_alive": true, "server_restarts": 4,
+                "driver": "t3code", "config_state": "ok",
+            })
+        );
+        assert_eq!(
+            sent(&["driver_ref", "config_modified"]),
+            json!({ "env_id": "t3", "server_alive": true, "server_restarts": 4 })
+        );
+        // A name this program has no field for unlocks nothing.
+        assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
+    }
+
+    #[test]
+    fn an_answer_to_a_heartbeat_names_what_watch_takes_or_takes_nothing_new() {
+        let ack = |body: Value| serde_json::from_value::<HeartbeatAck>(body).unwrap();
+        // Watch as it is today names nothing.
+        let today = ack(json!({ "received_at": "x", "heartbeat_interval_s": 60 }));
+        assert_eq!(today.heartbeat_interval_s, Some(60));
+        assert_eq!(Taken::from_names(&today.accepts), Taken::default());
+        let later = ack(json!({ "heartbeat_interval_s": 60, "accepts": ["driver", "driver_ref"] }));
+        let taken = Taken::from_names(&later.accepts);
+        assert!(taken.takes("driver") && taken.takes("driver_ref"));
+        assert!(!taken.takes("config_state"));
+        // An answer that is otherwise good is never lost to this one field.
+        for odd in [json!("driver"), json!({ "driver": true }), json!([1, null])] {
+            let odd = ack(json!({ "heartbeat_interval_s": 300, "accepts": odd }));
+            assert_eq!(odd.heartbeat_interval_s, Some(300));
+            assert_eq!(Taken::from_names(&odd.accepts), Taken::default());
+        }
     }
 
     #[test]
