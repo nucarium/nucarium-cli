@@ -1,8 +1,9 @@
 name: Binaries
 
 # When a release is published, build nucleate and nucleated for every target,
-# attach the archives and their checksums to that release, and tell the
-# Homebrew tap so it can rewrite its formula.
+# attach the archives and their checksums to that release, and tell the two
+# repositories that pin a release: the Homebrew tap, which rewrites its
+# formula, and the box recipe, which moves its pin.
 #
 # The version is the release's tag. Cargo.toml carries a placeholder, and this
 # workflow writes the real version into it before building.
@@ -98,26 +99,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
 
-  # Tells nucarium/homebrew-tap the version and the four checksums. Its Update
-  # formula workflow does the rest. The Robot App must be installed on that
-  # repository too; if it is not, this job fails and the release is still whole.
-  tap:
+  # Tells the two repositories that pin a release of nucleate, each with the
+  # version and the four checksums:
+  #
+  #   nucarium/homebrew-tap      rewrites its formula
+  #   nucarium/nucarium-ansible  moves the box recipe's pin, which releases the
+  #                              recipe, which in turn moves the installer's pin
+  #
+  # Each does the rest itself. The Robot App must be installed on both; if one
+  # cannot be told, its half of this job fails and the release is still whole.
+  announce:
     needs: attach
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: [homebrew-tap, nucarium-ansible]
+    env:
+      REPOSITORY: ${{ matrix.repository }}
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
-      - name: Generate Robot App token for the tap
+      - name: Generate Robot App token for the repository being told
         uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_PRIVATE_KEY }}
           owner: nucarium
-          repositories: homebrew-tap
-      - name: Tell the tap
+          repositories: ${{ matrix.repository }}
+      - name: Send the version and the checksums
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -129,4 +142,4 @@ jobs:
             --arg linux_arm "$(sum aarch64-unknown-linux-musl)" \
             --arg linux_intel "$(sum x86_64-unknown-linux-musl)" \
             '{event_type: "nucleate-released", client_payload: {version: $version, sha256: {"aarch64-apple-darwin": $mac_arm, "x86_64-apple-darwin": $mac_intel, "aarch64-unknown-linux-musl": $linux_arm, "x86_64-unknown-linux-musl": $linux_intel}}}' \
-            | gh api repos/nucarium/homebrew-tap/dispatches --input -
+            | gh api "repos/nucarium/$REPOSITORY/dispatches" --input -
