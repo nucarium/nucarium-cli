@@ -1,0 +1,66 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish a release holding one archive per target.
+# Each archive holds both static Linux binaries, nucleate and nucleated, at its
+# top level, and has its checksum beside it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Built on an arm64 runner, so the C in the TLS stack needs no
+          # cross-compiler.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add "$TARGET"
+      - run: cargo test
+      - run: cargo build --release --target "$TARGET"
+      - name: Package
+        run: |
+          name="nucleate-$GITHUB_REF_NAME-$TARGET"
+          tar -C "target/$TARGET/release" -czf "$name.tar.gz" nucleate nucleated
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            nucleate-*.tar.gz
+            nucleate-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # One release, made once every target has built.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/*

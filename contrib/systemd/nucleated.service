@@ -1,0 +1,13 @@
+[Unit]
+Description=nucleated: heartbeat, session events and housekeeping for this box
+Documentation=https://nucarium.dev
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nucleated run
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
