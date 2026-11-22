@@ -123,12 +123,6 @@ fn commit(worktree: &Path, file: &str) {
     git(worktree, &["commit", "-q", "-m", "work"]);
 }
 
-/// Push the session's branch and make it the one the worktree tracks, as an
-/// agent's `git push -u` does.
-fn push(worktree: &Path) {
-    git(worktree, &["push", "-q", "-u", "origin", "HEAD"]);
-}
-
 /// Set a file's modification time well into the past, so it no longer looks
 /// like something being written.
 fn age(path: &Path) {
@@ -234,7 +228,7 @@ fn unsaved_work_is_counted_on_a_schedule_and_a_heartbeat_reads_the_count() {
     assert_eq!(fresh["environments"][0]["unsaved"]["unpushed_commits"], 2);
 
     // Pushed and committed, it is saved.
-    push(&worktree);
+    rig.push(&worktree);
     fs::remove_file(worktree.join("notes.txt")).unwrap();
     fs::remove_file(clean.join("more.txt")).unwrap();
     reporter.tick(&rig.settings(), start + secs(1_200));
@@ -410,7 +404,7 @@ fn a_session_that_stops_reports_what_it_left_behind() {
     commit(&worktree, "a.txt");
     commit(&worktree, "b.txt");
     commit(&worktree, "c.txt");
-    push(&worktree);
+    rig.push(&worktree);
     fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
 
     let start = Instant::now();
@@ -600,7 +594,7 @@ fn when_github_gives_no_answer_the_outcome_says_nothing_about_pull_requests() {
     let stub = github(|_, _| Reply::json(500, json!({ "message": "Server Error" })));
     let worktree = rig.session("fix-login");
     commit(&worktree, "a.txt");
-    push(&worktree);
+    rig.push(&worktree);
     let start = Instant::now();
     let mut daemon = stopped_session(&rig, &worktree);
     Reporter::default()
@@ -626,7 +620,7 @@ fn a_commit_made_after_the_push_does_not_say_the_pull_request_is_gone() {
     let stub = github(|slug, sha| Reply::json(200, listed(slug, sha)));
     let worktree = rig.session("fix-login");
     commit(&worktree, "a.txt");
-    push(&worktree);
+    rig.push(&worktree);
     // The pull request is open on what was pushed. One more commit stays on the box.
     commit(&worktree, "b.txt");
 

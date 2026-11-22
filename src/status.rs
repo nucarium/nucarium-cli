@@ -8,6 +8,7 @@ use crate::driver;
 use crate::envelope::{rfc3339, unix_ms};
 use crate::housekeeping;
 use crate::notifier;
+use crate::reporter;
 use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Settings, Target};
 use crate::watch::{Client, Heartbeat, Taken};
@@ -63,6 +64,8 @@ pub fn view(settings: &Settings) -> Value {
     let (beat, setup_problems) = daemon::sample(settings, now);
 
     let synced = config_sync::read_status(settings);
+    // The repos the last count found the daemon would not run git in.
+    let last_count = reporter::read_counts(settings);
 
     let mut inbox: Vec<(u8, u64, Value)> = Vec::new();
     let mut environments = Vec::new();
@@ -141,6 +144,11 @@ pub fn view(settings: &Settings) -> Value {
                     .and_then(|adapter| adapter.link_template()),
             })
         });
+        let refused = last_count
+            .as_ref()
+            .and_then(|counted| counted.nucleus(&environment.name))
+            .map(|nucleus| nucleus.refused.clone())
+            .unwrap_or_default();
         let config = config_sync::report(synced.as_ref(), &environment.name, now);
         let config = (config != config_sync::Report::default()).then(|| {
             json!({
@@ -172,6 +180,7 @@ pub fn view(settings: &Settings) -> Value {
             "unsaved": report.unsaved,
             "last_snapshot_at": report.last_snapshot_at,
             "sessions": counts,
+            "git_refused": refused,
         }));
     }
     inbox.sort_by_key(|item| (item.0, item.1));
@@ -401,6 +410,26 @@ fn setup_words(setup: &Value, problems: &Value) -> String {
     words
 }
 
+/// The repos the daemon would not run git in, by name and why.
+fn refused_words(refused: &Value) -> String {
+    let named: Vec<String> = refused
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|repo| {
+            format!(
+                "{} ({})",
+                repo["repo"].as_str().unwrap_or_default(),
+                repo["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if named.is_empty() {
+        return String::new();
+    }
+    format!("  git refused: {}", named.join(", "))
+}
+
 /// The view as text, for a person at the box.
 pub fn render(view: &Value) -> String {
     let now_ms = view["now_ms"].as_u64().unwrap_or(0);
@@ -627,6 +656,7 @@ pub fn render(view: &Value) -> String {
                 &environment["setup"],
                 &environment["setup_problems"],
             ));
+            line.push_str(&refused_words(&environment["git_refused"]));
             out.push_str(&line);
             out.push('\n');
         }

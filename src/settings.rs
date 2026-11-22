@@ -5,7 +5,7 @@
 
 use crate::driver::{self, Driver};
 use crate::envelope::{valid_branch, valid_env_key};
-use crate::{agent, paths};
+use crate::{agent, git, paths};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::env;
@@ -163,6 +163,9 @@ pub struct Settings {
     pub notify: Option<Notify>,
     /// `None` is off, which is the default.
     pub config_sync: Option<ConfigSync>,
+    /// What happens to a repository whose git config or pointers the daemon
+    /// will not run git in: refused, the default, or only reported.
+    pub git_vetting: git::Vetting,
 }
 
 // Every table refuses a key it does not know. A key that is misspelled is
@@ -193,6 +196,14 @@ struct File {
     #[serde(default)]
     notify: NotifyFile,
     config_sync: Option<ConfigSyncFile>,
+    #[serde(default)]
+    git: GitFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitFile {
+    vetting: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -678,6 +689,11 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
             Some(every)
         }
     };
+    let git_vetting = match file.git.vetting.as_deref() {
+        None | Some("enforce") => git::Vetting::Enforce,
+        Some("report") => git::Vetting::Report,
+        Some(other) => bail!("git.vetting is {other:?}; it takes \"enforce\" or \"report\""),
+    };
     let notify = match file.notify.url.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(url) => {
@@ -738,6 +754,7 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
         report_unsaved,
         notify,
         config_sync,
+        git_vetting,
     })
 }
 

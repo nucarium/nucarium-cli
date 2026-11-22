@@ -557,7 +557,7 @@ fn what_a_session_left_behind_leaves_the_box_as_counts_times_and_one_address() {
     common::git(&worktree, &["add", "."]);
     let message = format!("{MARK} commit subject\n\n{MARK} commit body");
     common::git(&worktree, &["commit", "-q", "-m", &message]);
-    common::git(&worktree, &["push", "-q", "-u", "origin", "HEAD"]);
+    rig.push(&worktree);
     // Work that is not committed: an untracked file and a changed one.
     std::fs::write(
         worktree.join(format!("{MARK}_untracked_file.txt")),

@@ -288,6 +288,12 @@ impl Home {
         self.dir.join("environments")
     }
 
+    /// The test user's own global git config. Nothing writes it unless a
+    /// test asks; a missing file is read as an empty one.
+    pub fn gitconfig(&self) -> PathBuf {
+        self.dir.join(".gitconfig")
+    }
+
     pub fn write_config(&self, text: &str) {
         let path = self.config_file();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -302,13 +308,30 @@ impl Home {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.dir)
             .env("LC_ALL", "C")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", self.gitconfig())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.com");
         command
+    }
+
+    /// Run git as the test user, with their global config, in `dir`.
+    pub fn git(&self, dir: &Path, args: &[&str]) -> String {
+        let out = self
+            .command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     pub fn nucleate(&self) -> Command {
@@ -479,13 +502,26 @@ impl Rig {
     /// Make the `web` repo's remote read as one on GitHub, so that the repo
     /// has an owner and its pull requests have addresses, while git still
     /// fetches from and pushes to the upstream folder. Nothing here reaches
-    /// GitHub: a test that uses this points nucleate at a stand-in.
+    /// GitHub: a test that uses this points nucleate at a stand-in. The
+    /// rewrite is the test user's own, as a box's git settings are, and not
+    /// the repo's: a repo's config holds nothing of the kind.
     pub fn as_github(&self, slug: &str) {
         let bare = self.root.join(".repos/web.git");
         let url = format!("https://github.com/{slug}.git");
         let rewrite = format!("url.{}.insteadOf", self.upstream.display());
-        git(&bare, &["config", &rewrite, &url]);
+        let global = self.home.gitconfig();
+        git(
+            &bare,
+            &["config", "--file", global.to_str().unwrap(), &rewrite, &url],
+        );
         git(&bare, &["config", "remote.origin.url", &url]);
+    }
+
+    /// Push a worktree's branch and make it the one it tracks, as an agent's
+    /// `git push -u` does, with the test user's git settings.
+    pub fn push(&self, worktree: &Path) {
+        self.home
+            .git(worktree, &["push", "-q", "-u", "origin", "HEAD"]);
     }
 
     /// Create a nucleus session holding the `web` repo; returns its worktree.

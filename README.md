@@ -430,6 +430,12 @@ cleanup_min_age = "7d"
 # "off". A heartbeat reads the last count and never runs git itself.
 unsaved = "10m"
 
+[git]
+# What the daemon does with a repo whose git config or pointers it will not
+# run git in (see Git in session repos): "enforce" refuses it; "report" logs
+# and shows the refusal and runs git in it anyway.
+vetting = "enforce"
+
 # Only on a box with a UPS that NUT watches. The daemon asks NUT whether the
 # box is running on battery. Left out, nothing is said about a battery.
 # [ups]
@@ -487,7 +493,7 @@ and all mode 600:
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
-| `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times. The heartbeat reads it. |
+| `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times, and the name of each repo the daemon would not run git in, with one word for why. The heartbeat reads the numbers and times, never the names. |
 | `outcomes/<environment>/<session_id>.json` | A note that a session stopped or ended and its repos are to be looked at. Removed when they have been. |
 | `merged.json` | GitHub's answers to "was this commit merged?", so the count asks about a commit once an hour at most and never again once it was merged. |
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
@@ -1027,7 +1033,8 @@ count that nucleus once. The count covers every worktree of the nucleus's
 repos, including one another tool added outside `.worktrees/`, except those
 in the folders of a driver that owns its worktrees, which are counted under
 that driver's environment. A worktree git cannot read makes its nucleus's count
-unknown, and nothing is sent in place of it. `"off"` stops the count and
+unknown, and nothing is sent in place of it; so does a repo the daemon refuses
+(see [Git in session repos](#git-in-session-repos)). `"off"` stops the count and
 removes the last one.
 
 With the count goes `last_snapshot_at`: when the snapshot job last finished for
@@ -1153,6 +1160,82 @@ is not pruned. The same holds for every worktree of a nucleus's repos that is
 not under the nucleus's `.worktrees/`, whoever made it and wherever it is:
 `snapshot` reports it as skipped, and `cleanup` does not prune the worktree
 records of a repo that holds one. See [Drivers](#drivers).
+
+### Git in session repos
+
+The daemon runs git on the host, as the agent user, in bare repos and
+worktrees that agent sessions can write. A repo's own config can name a
+program for git to run (`core.fsmonitor`, `core.sshCommand`, a filter's
+`clean`, an `include.path` that brings in more of the same), and a worktree's
+`.git` file or a `worktrees/*/commondir` can send git to another repo whose
+config does. So the daemon checks a repo before every git call it makes there:
+
+- It reads the repo's `config`, and a worktree's `config.worktree`, with git's
+  own parser and no includes, and refuses the repo unless every key is one of
+  these: `core.repositoryformatversion`, `core.bare`, `core.filemode`,
+  `core.logallrefupdates`, `core.ignorecase`, `core.precomposeunicode`,
+  `core.hooksPath`, `remote.<name>.url`, `remote.<name>.fetch`,
+  `branch.<name>.remote`, `branch.<name>.merge`,
+  `branch.<name>.vscode-merge-base`, `extensions.worktreeConfig`, and any
+  `gc.<key>` set to a number. These are what `git clone`, `git worktree add`
+  and `nucleate` write, and the branch keys `nucleate hook-create` adds for
+  each session.
+- It refuses a worktree with no `.git` of its own, or one whose `.git`, or
+  whose `commondir`, leads outside the nucleus's `.repos/`, or nowhere. It
+  then hands git a worktree's folders as it checked them, so a worktree's
+  pointer changed after the check is not followed.
+  The worktrees of a driver that owns them belong to repos of the owner's
+  choosing: their config is checked, and where they point is not.
+- It refuses a worktree whose index names a submodule, checked out or not:
+  `git add` and `git status` start git again inside one that is checked out,
+  where that repository's own config would be read and not checked. A repo
+  that uses submodules is therefore refused; report-only mode shows which.
+- It runs git with no system config or attributes (`GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_ATTR_NOSYSTEM=1`), with its own global config (the one its environment
+  names in `GIT_CONFIG_GLOBAL`, else `~/.gitconfig`), and with
+  `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+  `core.attributesFile=/dev/null` and `diff.ignoreSubmodules=all` on the
+  command line, where they win over anything in a repo. That is why `core.hooksPath` may be set: it does nothing.
+
+A refused repo is skipped. The daemon logs it once, by name, in one fixed
+sentence that quotes nothing from its config, and logs it again only if it is
+refused again after passing. `refresh` and `snapshot` report it as `refused`
+with one word for why (`config`, `pointer`, `submodule` or `unreadable`), which counts as a
+run that did not finish clean. `cleanup` keeps any session that holds it. Its
+nucleus's unsaved-work count is unknown until it passes again, so Watch is
+sent no count rather than one that leaves it out. `nucleated status` names it
+on its environment's line, as in `git refused: web (config)`, from the last
+count; with the count off, only the log has it. The heartbeat itself is never
+held up by it.
+
+The check runs just before each call, so a session that rewrites a repo's
+config, or adds a `commondir` to a bare repo, between the check and git's own
+read of it could still slip past it. The overrides on the command line hold
+either way.
+
+**Checking a box before enforcing.** A repo set up by hand or by another tool
+may hold a key that is not on the list (`submodule.*`, `pull.rebase`, `lfs.*`,
+a `core.hooksPath` set by husky alongside something else). To find out without
+refusing anything:
+
+1. Set `vetting = "report"` in `[git]` and restart the daemon:
+   `systemctl --user restart nucleated`.
+2. Run `nucleated housekeeping run refresh`, which logs each repo enforcing
+   would refuse, and wait for the next count (ten minutes, or `unsaved` in
+   `[report]`).
+3. Read `nucleated status`: each repo that enforcing would refuse is named
+   after `git refused:`. `journalctl --user -u nucleated | grep refused` shows
+   the same, once per repo.
+4. For each, read its config yourself (`git config --file
+   <nucleus>/.repos/<repo>.git/config --no-includes --list`), and remove what
+   should not be there, or decide the repo is not one for this box.
+5. When `nucleated status` names none, set `vetting = "enforce"` (or remove
+   the line) and restart the daemon.
+
+In report-only mode git runs in a refused repo as it did before this check,
+with the overrides above: hooks, the file-system monitor and an attributes
+file stay off, and any other program its config, or a submodule's, names can
+run.
 
 ## Assumptions
 
