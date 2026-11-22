@@ -5,9 +5,11 @@
 use crate::config_sync;
 use crate::credentials::Token;
 use crate::envelope::{
-    rfc3339, valid_commit_id, valid_env_key, valid_session_id, valid_version, within, Envelope,
+    rfc3339, valid_commit_id, valid_env_key, valid_repo, valid_session_id, valid_version, within,
+    Envelope,
 };
 use crate::sessions::ACTIVITY_BEAT;
+use crate::setup::{Network, ScriptState};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -186,6 +188,11 @@ pub enum TokenPoll {
 pub const MAX_UNCOMMITTED_REPOS: u64 = 10_000;
 pub const MAX_UNPUSHED_COMMITS: u64 = 1_000_000;
 pub const MAX_SERVER_RESTARTS: u64 = 2_147_483_647;
+/// The most Watch takes in an environment's setup.
+pub const MAX_ALLOWED_HOSTS: u64 = 10_000;
+pub const MAX_VARIABLES: u64 = 1_000;
+pub const MAX_SECRETS: u64 = 1_000;
+pub const MAX_SETUP_REPOS: usize = 32;
 /// The longest maintenance pause Watch keeps.
 pub const MAX_PAUSE: Duration = Duration::from_secs(86_400);
 
@@ -262,18 +269,113 @@ impl UnsavedReport {
     }
 }
 
+/// What an environment is set up with on the box, as the box recipe wrote it
+/// down: a fixed word for its network, three counts, its repositories'
+/// names, and the setup script's last run. Never a variable's name or value,
+/// the script, its hash or its output.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SetupReport {
+    pub network: Network,
+    /// With `limited`, how many hosts are allowed beyond the default list.
+    pub allowed_hosts: u64,
+    pub repos: Vec<String>,
+    pub variables: u64,
+    pub secrets: u64,
+    /// Nothing when there is no script, or it has not run yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptReport>,
+}
+
+impl SetupReport {
+    /// Nothing when a count is more than Watch takes, or there are more
+    /// repositories than it takes. A repository's name that is not an
+    /// `owner/name` or a `name` is left out, and only it.
+    pub fn new(
+        network: Network,
+        allowed_hosts: u64,
+        repos: &[String],
+        variables: u64,
+        secrets: u64,
+        script: Option<ScriptReport>,
+    ) -> Option<SetupReport> {
+        (allowed_hosts <= MAX_ALLOWED_HOSTS
+            && variables <= MAX_VARIABLES
+            && secrets <= MAX_SECRETS
+            && repos.len() <= MAX_SETUP_REPOS)
+            .then(|| SetupReport {
+                network,
+                allowed_hosts,
+                repos: repos
+                    .iter()
+                    .filter(|repo| valid_repo(repo))
+                    .cloned()
+                    .collect(),
+                variables,
+                secrets,
+                script,
+            })
+    }
+}
+
+/// The setup script's last run: a fixed word, when it started, when it
+/// ended, and for a failed run how it exited.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScriptReport {
+    pub state: ScriptState,
+    pub started_at: String,
+    /// Nothing while it runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    /// Only for a failed run, and only when it is an exit status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u8>,
+}
+
+impl ScriptReport {
+    /// A run as Watch takes one. A run that has ended needs its end, and one
+    /// that ended before it started is no run: nothing is made up for
+    /// either. The two are compared as written, before a time ahead of now,
+    /// from a clock that has since moved back, is sent as now.
+    pub fn new(
+        state: ScriptState,
+        started_at: SystemTime,
+        finished_at: Option<SystemTime>,
+        exit_code: Option<i64>,
+        now: SystemTime,
+    ) -> Option<ScriptReport> {
+        let finished_at = match state {
+            ScriptState::Running => None,
+            ScriptState::Ok | ScriptState::Failed => Some(finished_at?),
+        };
+        if finished_at.is_some_and(|finished| finished < started_at) {
+            return None;
+        }
+        let started_at = started_at.min(now);
+        let finished_at = finished_at.map(|finished| finished.min(now));
+        Some(ScriptReport {
+            state,
+            started_at: rfc3339(started_at),
+            finished_at: finished_at.map(rfc3339),
+            exit_code: exit_code
+                .filter(|_| state == ScriptState::Failed)
+                .and_then(|code| u8::try_from(code).ok()),
+        })
+    }
+}
+
 /// The fields of a heartbeat's environment that are ahead of the contract
 /// every Watch holds. Watch refuses a heartbeat that carries a field it does
 /// not name, and to its owner a refused heartbeat is a machine gone dark, so
 /// none of these is sent until Watch has said it takes it: in `accepts`, in
 /// its answer to a heartbeat. Until then each stays on the box, where
 /// `nucleated status` shows it.
-pub const AHEAD: [&str; 5] = [
+pub const AHEAD: [&str; 6] = [
     "driver",
     "driver_ref",
     "config_commit",
     "config_modified",
     "config_state",
+    "setup",
 ];
 
 /// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
@@ -333,6 +435,9 @@ pub struct EnvironmentReport {
     /// How the sync stands: one of [`config_sync::State`]'s fixed words.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_state: Option<String>,
+    /// What the environment is set up with on the box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupReport>,
 }
 
 impl EnvironmentReport {
@@ -360,6 +465,7 @@ impl EnvironmentReport {
             config_commit: None,
             config_modified: None,
             config_state: None,
+            setup: None,
         }
     }
 
@@ -382,6 +488,13 @@ impl EnvironmentReport {
         self.config_commit = config.commit.clone().filter(|id| valid_commit_id(id));
         self.config_modified = config.modified.filter(|_| self.config_commit.is_some());
         self.config_state = config.state.map(|state| state.as_str().to_string());
+        self
+    }
+
+    /// Say what the environment is set up with, as the box recipe wrote it
+    /// down and [`SetupReport::new`] held it to its shape.
+    pub fn with_setup(mut self, setup: Option<SetupReport>) -> Self {
+        self.setup = setup;
         self
     }
 
@@ -420,6 +533,9 @@ impl EnvironmentReport {
         if !taken.takes("config_state") {
             report.config_state = None;
         }
+        if !taken.takes("setup") {
+            report.setup = None;
+        }
         report
     }
 
@@ -431,6 +547,7 @@ impl EnvironmentReport {
             self.config_commit.is_some(),
             self.config_modified.is_some(),
             self.config_state.is_some(),
+            self.setup.is_some(),
         ]
         .into_iter()
         .zip(AHEAD)
@@ -1029,6 +1146,137 @@ mod tests {
         assert_eq!(waiting.config_state.as_deref(), Some("pending"));
     }
 
+    fn setup(script: Option<ScriptReport>) -> Option<SetupReport> {
+        SetupReport::new(
+            Network::Full,
+            0,
+            &["your-org/web".to_string(), "your-org/api".to_string()],
+            2,
+            0,
+            script,
+        )
+    }
+
+    #[test]
+    fn an_environments_setup_goes_out_as_fixed_words_counts_names_and_times() {
+        let now = at(1_795_089_600_000);
+        let minutes = |n: u64| Duration::from_secs(60 * n);
+        let failed = ScriptReport::new(
+            ScriptState::Failed,
+            now - minutes(10),
+            Some(now - minutes(9)),
+            Some(3),
+            now,
+        );
+        let report =
+            EnvironmentReport::new("client-a", true, None, None, now).with_setup(setup(failed));
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            json!({
+                "env_id": "client-a", "server_alive": true,
+                "setup": {
+                    "network": "full", "allowed_hosts": 0,
+                    "repos": ["your-org/web", "your-org/api"],
+                    "variables": 2, "secrets": 0,
+                    "script": {
+                        "state": "failed",
+                        "started_at": "2026-11-19T11:50:00.000Z",
+                        "finished_at": "2026-11-19T11:51:00.000Z",
+                        "exit_code": 3,
+                    },
+                },
+            })
+        );
+        // With no script run, no script; a run that has ended says no exit
+        // unless it failed; one still running says when it started.
+        let bare = serde_json::to_value(setup(None)).unwrap();
+        assert!(bare.get("script").is_none(), "{bare}");
+        let ok = ScriptReport::new(ScriptState::Ok, now - minutes(2), Some(now), Some(0), now);
+        assert_eq!(
+            serde_json::to_value(ok).unwrap(),
+            json!({
+                "state": "ok",
+                "started_at": "2026-11-19T11:58:00.000Z",
+                "finished_at": "2026-11-19T12:00:00.000Z",
+            })
+        );
+        let running = ScriptReport::new(
+            ScriptState::Running,
+            now - minutes(2),
+            Some(now),
+            Some(1),
+            now,
+        );
+        assert_eq!(
+            serde_json::to_value(running).unwrap(),
+            json!({ "state": "running", "started_at": "2026-11-19T11:58:00.000Z" })
+        );
+    }
+
+    #[test]
+    fn a_setup_watch_would_not_take_is_not_sent_and_what_it_cannot_vouch_for_is_left_out() {
+        let now = at(1_795_089_600_000);
+        let hour = Duration::from_secs(3_600);
+        let repos = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let made = |hosts, variables, secrets, names: &[&str]| {
+            SetupReport::new(
+                Network::Limited,
+                hosts,
+                &repos(names),
+                variables,
+                secrets,
+                None,
+            )
+        };
+        assert!(made(10_000, 1_000, 1_000, &["web"; 32]).is_some());
+        assert_eq!(made(10_001, 0, 0, &[]), None);
+        assert_eq!(made(0, 1_001, 0, &[]), None);
+        assert_eq!(made(0, 0, 1_001, &[]), None);
+        assert_eq!(made(0, 0, 0, &["web"; 33]), None);
+        assert_eq!(
+            made(0, 0, 0, &["your-org/web", "a/b/c", "a sentence", "api"])
+                .unwrap()
+                .repos,
+            ["your-org/web", "api"]
+        );
+        // A run's times are never ahead of the clock, and it never ends
+        // before it starts or without an end.
+        let ahead = ScriptReport::new(ScriptState::Ok, now - hour, Some(now + hour), None, now);
+        assert_eq!(
+            ahead.unwrap().finished_at.as_deref(),
+            Some("2026-11-19T12:00:00.000Z")
+        );
+        let started = ScriptReport::new(ScriptState::Running, now + hour, None, None, now);
+        assert_eq!(started.unwrap().started_at, "2026-11-19T12:00:00.000Z");
+        assert_eq!(
+            ScriptReport::new(ScriptState::Ok, now, Some(now - hour), None, now),
+            None
+        );
+        // The order is judged as written, before either is sent as now.
+        assert_eq!(
+            ScriptReport::new(
+                ScriptState::Failed,
+                now + 2 * hour,
+                Some(now + hour),
+                Some(1),
+                now
+            ),
+            None
+        );
+        assert_eq!(
+            ScriptReport::new(ScriptState::Failed, now - hour, None, Some(1), now),
+            None
+        );
+        // An exit status is a byte.
+        for code in [-1, 256] {
+            let failed =
+                ScriptReport::new(ScriptState::Failed, now - hour, Some(now), Some(code), now);
+            assert_eq!(failed.unwrap().exit_code, None);
+        }
+        let killed = ScriptReport::new(ScriptState::Failed, now - hour, Some(now), Some(137), now);
+        assert_eq!(killed.unwrap().exit_code, Some(137));
+    }
+
     #[test]
     fn a_field_ahead_of_the_contract_goes_only_to_a_watch_that_said_it_takes_it() {
         let now = at(1_795_089_600_000);
@@ -1041,7 +1289,8 @@ mod tests {
                 modified: Some(false),
                 state: Some(config_sync::State::Ok),
                 detail: None,
-            });
+            })
+            .with_setup(setup(None));
         let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
         assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
             let mut all = AHEAD.to_vec();
@@ -1076,6 +1325,16 @@ mod tests {
             sent(&["driver_ref", "config_modified"]),
             json!({ "env_id": "t3", "server_alive": true, "server_restarts": 4 })
         );
+        // The setup goes whole to a Watch that takes it, and not at all to
+        // one that does not.
+        assert_eq!(
+            sent(&["setup"])["setup"],
+            json!({
+                "network": "full", "allowed_hosts": 0,
+                "repos": ["your-org/web", "your-org/api"], "variables": 2, "secrets": 0,
+            })
+        );
+        assert!(sent(&["driver", "config_state"]).get("setup").is_none());
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
     }

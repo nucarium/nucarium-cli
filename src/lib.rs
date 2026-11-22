@@ -24,6 +24,7 @@ pub mod pause;
 pub mod reporter;
 pub mod sessions;
 pub mod settings;
+pub mod setup;
 pub mod spool;
 pub mod status;
 pub mod watch;

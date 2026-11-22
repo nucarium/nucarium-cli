@@ -148,6 +148,9 @@ pub struct Settings {
     /// the state folder: the clone of the config repository, and the one
     /// copy of what a sync replaced.
     pub cache_dir: PathBuf,
+    /// Where the box recipe writes what each environment is set up with, and
+    /// how its setup script last ran. Read, never written.
+    pub setup_dir: PathBuf,
     pub spool_dir: PathBuf,
     pub spool_max_age: Duration,
     pub spool_max_events: usize,
@@ -172,6 +175,7 @@ struct File {
     target: Option<String>,
     state_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
+    setup_dir: Option<PathBuf>,
     #[serde(default)]
     watch: WatchFile,
     #[serde(default)]
@@ -727,6 +731,9 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
         spool_max_events: file.spool.max_events.unwrap_or(10_000).max(1),
         state_dir,
         cache_dir,
+        setup_dir: file
+            .setup_dir
+            .unwrap_or_else(|| PathBuf::from(crate::setup::DEFAULT_DIR)),
         ups,
         report_unsaved,
         notify,
@@ -1098,6 +1105,7 @@ mod tests {
         // Every key the tables do know still loads, spelled as documented.
         let whole = parse(&format!(
             "machine = \"agentbox\"\ntarget = \"none\"\nstate_dir = \"/s\"\ncache_dir = \"/c\"\n\
+             setup_dir = \"/e\"\n\
              [watch]\nurl = \"http://localhost:8787\"\ntoken_file = \"/t\"\n\
              [heartbeat]\ninterval = \"60s\"\n\
              {env}unit = \"u.service\"\ncheck = \"true\"\nagent = \"claude-code\"\n\
@@ -1121,6 +1129,22 @@ mod tests {
         .unwrap();
         assert_eq!(whole.environments.len(), 4);
         assert!(whole.config_sync.unwrap().require_signed);
+        assert_eq!(whole.setup_dir, PathBuf::from("/e"));
+        refused("setup-dir = \"/e\"\n", "setup-dir");
+    }
+
+    #[test]
+    fn the_setup_files_are_read_from_where_the_box_recipe_writes_them() {
+        assert_eq!(
+            parse("").unwrap().setup_dir,
+            PathBuf::from("/var/lib/nucarium/environments")
+        );
+        assert_eq!(
+            parse("setup_dir = \"/srv/environments\"\n")
+                .unwrap()
+                .setup_dir,
+            PathBuf::from("/srv/environments")
+        );
     }
 
     #[test]
