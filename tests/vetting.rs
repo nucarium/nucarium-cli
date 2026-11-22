@@ -303,6 +303,25 @@ fn a_worktree_holding_a_submodule_with_a_config_of_its_own_is_refused() {
 }
 
 #[test]
+fn a_worktree_whose_index_names_a_submodule_not_checked_out_is_refused() {
+    let rig = Rig::new();
+    let (_, marker) = marker_program(&rig);
+    let worktree = session_with_work(&rig);
+    // Nothing is there yet. Something can be by the time git looks.
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    git(
+        &worktree,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},vendored"),
+        ],
+    );
+    assert_refused_worktree(&rig, &marker, "submodule", &head);
+}
+
+#[test]
 fn a_repo_with_tracking_branches_and_the_keys_git_writes_passes() {
     let rig = Rig::new();
     let (_, marker) = marker_program(&rig);

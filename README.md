@@ -1186,9 +1186,10 @@ config does. So the daemon checks a repo before every git call it makes there:
   pointer changed after the check is not followed.
   The worktrees of a driver that owns them belong to repos of the owner's
   choosing: their config is checked, and where they point is not.
-- It refuses a worktree whose index names a submodule that is checked out:
-  `git add` and `git status` start git again inside one, where that
-  repository's own config would be read and not checked.
+- It refuses a worktree whose index names a submodule, checked out or not:
+  `git add` and `git status` start git again inside one that is checked out,
+  where that repository's own config would be read and not checked. A repo
+  that uses submodules is therefore refused; report-only mode shows which.
 - It runs git with no system config or attributes (`GIT_CONFIG_NOSYSTEM=1`,
   `GIT_ATTR_NOSYSTEM=1`), with its own global config (the one its environment
   names in `GIT_CONFIG_GLOBAL`, else `~/.gitconfig`), and with

@@ -128,7 +128,7 @@ const ALLOWED: [(&str, bool, &str); 12] = [
 /// Settings given to every call, ahead of anything in a repository.
 /// `diff.ignoreSubmodules` keeps `git status` out of a submodule, whose own
 /// config is not checked; `git add` goes into one whatever is set, which is
-/// why a worktree holding one is refused before either runs.
+/// why a worktree whose index names one is refused before either runs.
 const OVERRIDES: [&str; 8] = [
     "-c",
     "core.hooksPath=/dev/null",
@@ -215,8 +215,8 @@ pub enum Reason {
     Pointer,
     /// Its config could not be read.
     Unreadable,
-    /// A worktree holds a checked-out submodule, or another repository git
-    /// would treat as one: git would read that repository's own config.
+    /// A worktree's index names a submodule. Git starts again inside one
+    /// that is checked out, where that repository's own config is read.
     Submodule,
 }
 
@@ -441,14 +441,22 @@ impl Guarded {
         self.pin_git_dir(&dir.join(target))
     }
 
-    /// True when a worktree's index names a submodule whose folder holds a
-    /// `.git`: git would start again in there. The listing itself goes into
-    /// no submodule.
-    fn holds_submodule(&self, dir: &Path, pinned: &Pinned) -> Result<bool, Reason> {
+    /// True when a worktree's index, or the one a call is given, names a
+    /// submodule at all, checked out or not: one that is not checked out now
+    /// can be by the time git looks. The listing itself goes into none.
+    fn holds_submodule(
+        &self,
+        dir: &Path,
+        pinned: &Pinned,
+        index: Option<&OsStr>,
+    ) -> Result<bool, Reason> {
         let mut command = self.command();
         command.args(OVERRIDES);
         if pinned.common != pinned.git_dir {
             command.env("GIT_COMMON_DIR", &pinned.common);
+        }
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
         }
         command
             .arg("-C")
@@ -463,15 +471,11 @@ impl Guarded {
         if !out.ok {
             return Err(Reason::Unreadable);
         }
+        // Each entry starts with its mode; a submodule's is 160000.
         Ok(out
             .stdout
             .split(|byte| *byte == 0)
-            .filter_map(|entry| {
-                let (head, path) = entry.split_at(entry.iter().position(|b| *b == b'\t')?);
-                head.starts_with(b"160000 ")
-                    .then(|| PathBuf::from(String::from_utf8_lossy(&path[1..]).to_string()))
-            })
-            .any(|path| std::fs::symlink_metadata(dir.join(path).join(".git")).is_ok()))
+            .any(|entry| entry.starts_with(b"160000 ")))
     }
 
     /// Log a refusal the first time it is found, and forget it once the
@@ -496,15 +500,21 @@ impl Guarded {
         }
     }
 
-    /// Check a repository. For a worktree, `submodules` also looks in its
-    /// index for a checked-out submodule, which only the commands that go
-    /// into one need.
-    fn vet(&self, dir: &Path, bare: bool, submodules: bool) -> Result<Pinned, Refused> {
+    /// Check a repository. For a worktree, `submodules` also looks for a
+    /// submodule in its index, or in `index` when the call is given one,
+    /// which only the commands that go into one need.
+    fn vet(
+        &self,
+        dir: &Path,
+        bare: bool,
+        submodules: bool,
+        index: Option<&OsStr>,
+    ) -> Result<Pinned, Refused> {
         let pinned = if bare {
             self.pin_git_dir(dir)
         } else {
             self.pin_worktree(dir).and_then(|pinned| {
-                match submodules && self.holds_submodule(dir, &pinned)? {
+                match submodules && self.holds_submodule(dir, &pinned, index)? {
                     true => Err(Reason::Submodule),
                     false => Ok(pinned),
                 }
@@ -520,12 +530,18 @@ impl Guarded {
 
     /// The command for one call in `dir`, vetted first. Refused, it is an
     /// error when enforcing, and the plain location when only reporting.
-    fn prepare(&self, dir: &Path, bare: bool, args: &[&str]) -> Result<Command> {
+    fn prepare(
+        &self,
+        dir: &Path,
+        bare: bool,
+        args: &[&str],
+        index: Option<&OsStr>,
+    ) -> Result<Command> {
         let mut command = self.command();
         command.args(OVERRIDES);
         let command_name = args.iter().find(|arg| !arg.starts_with('-'));
         let submodules = command_name.is_some_and(|name| ENTER_SUBMODULES.contains(name));
-        match self.vet(dir, bare, submodules) {
+        match self.vet(dir, bare, submodules, index) {
             Ok(pinned) => {
                 // Pinned, so that a pointer changed after the check is not
                 // followed: git takes both folders from here. A repository
@@ -586,7 +602,7 @@ impl Git {
     pub fn vet_bare(&self, dir: &Path) -> Option<Refused> {
         match self {
             Git::Plain => None,
-            Git::Guarded(guarded) => guarded.vet(dir, true, true).err(),
+            Git::Guarded(guarded) => guarded.vet(dir, true, true, None).err(),
         }
     }
 
@@ -594,14 +610,14 @@ impl Git {
     pub fn vet_tree(&self, dir: &Path) -> Option<Refused> {
         match self {
             Git::Plain => None,
-            Git::Guarded(guarded) => guarded.vet(dir, false, true).err(),
+            Git::Guarded(guarded) => guarded.vet(dir, false, true, None).err(),
         }
     }
 
     pub fn try_bare(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_bare(dir, args),
-            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, true, args)?),
+            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, true, args, None)?),
         }
     }
 
@@ -615,7 +631,7 @@ impl Git {
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_tree(dir, args),
-            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, false, args)?),
+            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, false, args, None)?),
         }
     }
 
@@ -636,8 +652,13 @@ impl Git {
         let Git::Guarded(guarded) = self else {
             return tree_raw(dir, args, envs);
         };
+        // A call given an index of its own is checked against that index.
+        let index = envs
+            .iter()
+            .find(|(name, _)| *name == "GIT_INDEX_FILE")
+            .map(|(_, value)| *value);
         let out = guarded
-            .prepare(dir, false, args)?
+            .prepare(dir, false, args, index)?
             .envs(envs.iter().copied())
             .output()
             .context("running git (is it installed?)")?;
