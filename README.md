@@ -853,9 +853,14 @@ the worse for it:
   over 1000), or more than 32 repositories: no `setup`.
 - A repository's name that is not an `owner/name` or a `name`: that name
   alone is left out.
-- A `<name>.setup.json` that cannot be read or is not what the runner
-  writes, or a run that ended with no end time or before it started: no
-  `script`. An exit code that is not 0 to 255 is left out.
+- With a setup script, a `<name>.setup.json` that is there and cannot be
+  read or is not what the runner writes, or a run that ended with no end
+  time or, as written, before it started: no `setup`. A `setup` with no
+  `script` would tell Watch the script was removed, and close what it knows
+  of a failed run; no `setup` at all leaves Watch as it was. A
+  `<name>.setup.json` that is not there yet means the script has not run,
+  and `setup` is sent with no `script`.
+- An exit code that is not 0 to 255 is left out.
 - A time ahead of the box's clock is sent as now.
 
 Each of these is logged once, in fixed words, when it first appears, and not

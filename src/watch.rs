@@ -334,8 +334,8 @@ pub struct ScriptReport {
 impl ScriptReport {
     /// A run as Watch takes one. A run that has ended needs its end, and one
     /// that ended before it started is no run: nothing is made up for
-    /// either. A time ahead of now, from a clock that has since moved back,
-    /// is sent as now.
+    /// either. The two are compared as written, before a time ahead of now,
+    /// from a clock that has since moved back, is sent as now.
     pub fn new(
         state: ScriptState,
         started_at: SystemTime,
@@ -343,14 +343,15 @@ impl ScriptReport {
         exit_code: Option<i64>,
         now: SystemTime,
     ) -> Option<ScriptReport> {
-        let started_at = started_at.min(now);
         let finished_at = match state {
             ScriptState::Running => None,
-            ScriptState::Ok | ScriptState::Failed => Some(finished_at?.min(now)),
+            ScriptState::Ok | ScriptState::Failed => Some(finished_at?),
         };
         if finished_at.is_some_and(|finished| finished < started_at) {
             return None;
         }
+        let started_at = started_at.min(now);
+        let finished_at = finished_at.map(|finished| finished.min(now));
         Some(ScriptReport {
             state,
             started_at: rfc3339(started_at),
@@ -1249,6 +1250,17 @@ mod tests {
         assert_eq!(started.unwrap().started_at, "2026-11-19T12:00:00.000Z");
         assert_eq!(
             ScriptReport::new(ScriptState::Ok, now, Some(now - hour), None, now),
+            None
+        );
+        // The order is judged as written, before either is sent as now.
+        assert_eq!(
+            ScriptReport::new(
+                ScriptState::Failed,
+                now + 2 * hour,
+                Some(now + hour),
+                Some(1),
+                now
+            ),
             None
         );
         assert_eq!(

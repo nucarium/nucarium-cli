@@ -206,11 +206,30 @@ fn a_file_the_box_cannot_vouch_for_never_costs_the_heartbeat() {
     over["variables"] = json!(1_001);
     write(&rig, Some(&over), None);
     assert!(said().get("setup").is_none());
-    // A run file that is not one the runner writes costs only the script.
-    write(&rig, Some(&defined()), Some(&json!({ "state": "done" })));
+    // A script that has not run yet: the setup, with no script.
+    write(&rig, Some(&defined()), None);
     let environment = said();
     assert_eq!(environment["setup"]["variables"], 2);
     assert!(environment["setup"].get("script").is_none());
+    // A run that failed, and then a run file that is there and not one the
+    // runner writes. A setup with no script would tell Watch the script is
+    // gone and the failure with it, so the heartbeat says no setup at all.
+    write(&rig, Some(&defined()), Some(&run("failed", 1, Some(3))));
+    assert_eq!(said()["setup"]["script"]["state"], "failed");
+    write(&rig, Some(&defined()), Some(&json!({ "state": "done" })));
+    assert!(said().get("setup").is_none());
+    // So does a run that, as written, ended before it started, even with
+    // both times ahead of the clock.
+    let later = unix_ms(SystemTime::now()) + 7_200_000;
+    write(
+        &rig,
+        Some(&defined()),
+        Some(&json!({
+            "state": "failed", "started_at_ms": later,
+            "finished_at_ms": later - 3_600_000, "exit_code": 3,
+        })),
+    );
+    assert!(said().get("setup").is_none());
     // A run dated ahead of the clock is sent as now, and so is never ahead
     // of the heartbeat that carries it.
     let ahead = unix_ms(SystemTime::now()) + 3_600_000;
@@ -232,13 +251,23 @@ fn a_file_the_box_cannot_vouch_for_never_costs_the_heartbeat() {
 #[test]
 fn what_keeps_the_setup_out_is_logged_once_and_quotes_nothing() {
     let rig = Rig::new();
+    // A second environment, whose run file is not one the runner writes.
+    let other = rig.home.dir.join("client-b");
+    fs::create_dir_all(&other).unwrap();
+    rig.configure(&format!(
+        "[[environment]]\nname = \"client-b\"\nroot = \"{}\"\ncheck = \"true\"\n",
+        other.display()
+    ));
     let mut defined = defined();
     defined["repos"] = json!(["your-org/web", format!("{MARK} a repo the user named")]);
-    write(
-        &rig,
-        Some(&defined),
-        Some(&json!({ "state": format!("{MARK} it went badly"), "started_at_ms": 1 })),
-    );
+    write(&rig, Some(&defined), Some(&run("ok", 5, None)));
+    let dir = rig.home.setup_dir();
+    fs::write(dir.join("client-b.json"), self::defined().to_string()).unwrap();
+    fs::write(
+        dir.join("client-b.setup.json"),
+        json!({ "state": format!("{MARK} it went badly"), "started_at_ms": 1 }).to_string(),
+    )
+    .unwrap();
     let mock = gate::watch_taking(&["setup"]);
     rig.sign_in(&mock.url);
     // The first heartbeat, and the one at once after it with `setup`: two
@@ -252,7 +281,7 @@ fn what_keeps_the_setup_out_is_logged_once_and_quotes_nothing() {
     assert_eq!(
         logged
             .matches(
-                "environment client-a: its setup script's run file is not one the runner writes"
+                "environment client-b: its setup script's run file is not one the runner writes"
             )
             .count(),
         1,
@@ -271,12 +300,18 @@ fn what_keeps_the_setup_out_is_logged_once_and_quotes_nothing() {
         beat["environments"][0]["setup"]["repos"],
         json!(["your-org/web"])
     );
+    assert!(beat["environments"][1].get("setup").is_none(), "{beat}");
     // Status names why, in fixed words.
     let shown = gate::status_shown(&rig);
     assert_eq!(
         shown["environments"][0]["setup_problems"],
-        json!(["repo_left_out", "run_malformed"])
+        json!(["repo_left_out"])
     );
+    assert_eq!(
+        shown["environments"][1]["setup_problems"],
+        json!(["run_malformed"])
+    );
+    assert!(shown["environments"][1]["setup"].is_null());
     gate::assert_clean(&rig, &mock);
 }
 

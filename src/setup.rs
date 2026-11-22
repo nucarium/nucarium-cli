@@ -12,7 +12,9 @@
 //! run a fixed word, two times and an exit code. The hash of the script, its
 //! text, its output, the variables' names and values and the files' own
 //! paths all stay on the box. A file that is missing, cannot be read or is
-//! not one the recipe writes is no report, and never a failed heartbeat.
+//! not one the recipe writes is no report, and never a failed heartbeat. The
+//! one exception is a run file that is simply not there yet: the script has
+//! not run, and the setup is reported with no script.
 
 use crate::watch::{ScriptReport, SetupReport, MAX_SETUP_REPOS};
 use serde::{Deserialize, Serialize};
@@ -87,10 +89,11 @@ pub enum Problem {
     /// A repository's name is not an `owner/name` or a `name`. It alone is
     /// left out.
     RepoLeftOut,
-    /// `<name>.setup.json` is there and could not be read.
+    /// `<name>.setup.json` is there and could not be read. The whole setup
+    /// is left out, not only the script.
     RunUnreadable,
     /// `<name>.setup.json` is not one the runner writes, or its times do not
-    /// make a run.
+    /// make a run. The whole setup is left out, not only the script.
     RunMalformed,
 }
 
@@ -123,11 +126,11 @@ impl Problem {
                 "a repository in its setup file is not an owner/name or a name; it is left out"
             }
             Problem::RunUnreadable => {
-                "its setup script's run file cannot be read; the script's last run is not reported"
+                "its setup script's run file cannot be read; its setup is not reported"
             }
             Problem::RunMalformed => {
-                "its setup script's run file is not one the runner writes; the script's last run \
-                 is not reported"
+                "its setup script's run file is not one the runner writes; its setup is not \
+                 reported"
             }
         }
     }
@@ -190,7 +193,6 @@ fn script(dir: &Path, environment: &str, now: SystemTime) -> Result<Option<Scrip
 /// Read one environment's two files and make its report. Nothing here fails:
 /// what cannot be vouched for is left out, and [`Found::problems`] says what.
 pub fn report(dir: &Path, environment: &str, now: SystemTime) -> Found {
-    let mut problems = Vec::new();
     let defined = match read_small(&defined_file(dir, environment)) {
         Ok(Some(bytes)) => {
             serde_json::from_slice::<Defined>(&bytes).map_err(|_| Problem::Malformed)
@@ -208,12 +210,19 @@ pub fn report(dir: &Path, environment: &str, now: SystemTime) -> Found {
         }
     };
     // A file that says there is no script is believed over a run file left
-    // behind from when there was one.
+    // behind from when there was one. A run file that is there and cannot be
+    // used costs the whole setup for now: a setup with no script would tell
+    // Watch the script is gone, and close what it knows of a failed run.
     let script = match defined.setup_script {
-        true => script(dir, environment, now).unwrap_or_else(|problem| {
-            problems.push(problem);
-            None
-        }),
+        true => match script(dir, environment, now) {
+            Ok(script) => script,
+            Err(problem) => {
+                return Found {
+                    report: None,
+                    problems: vec![problem],
+                }
+            }
+        },
         false => None,
     };
     // A list longer than the recipe writes is not cut down to one Watch
@@ -232,13 +241,11 @@ pub fn report(dir: &Path, environment: &str, now: SystemTime) -> Found {
         script,
     )
     .filter(|_| defined.repos.len() <= MAX_SETUP_REPOS);
-    match &report {
-        None => problems = vec![Problem::OutOfRange],
-        Some(report) if report.repos.len() < defined.repos.len() => {
-            problems.insert(0, Problem::RepoLeftOut)
-        }
-        Some(_) => {}
-    }
+    let problems = match &report {
+        None => vec![Problem::OutOfRange],
+        Some(report) if report.repos.len() < defined.repos.len() => vec![Problem::RepoLeftOut],
+        Some(_) => Vec::new(),
+    };
     Found { report, problems }
 }
 
@@ -428,7 +435,10 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_run_file_costs_the_script_and_nothing_else() {
+    fn a_run_file_that_is_there_and_cannot_be_used_costs_the_whole_setup() {
+        // A setup with no script says the script is gone. A run file that is
+        // there and unusable says nothing of the kind, so nothing is said.
+        let ahead = 1_795_089_600_000u64;
         let bad_runs = [
             json!({ "state": "crashed", "started_at_ms": 1_795_082_400_000u64 }),
             json!({ "state": "ok", "started_at_ms": "yesterday" }),
@@ -438,19 +448,36 @@ mod tests {
             json!({ "state": "failed", "started_at_ms": 1_795_082_400_000u64, "exit_code": 1 }),
             // Ended before it started.
             json!({ "state": "ok", "started_at_ms": 1_795_082_442_000u64, "finished_at_ms": 1_795_082_400_000u64 }),
+            // Ended before it started, both ahead of the clock: as written
+            // it is no run, whatever both would be once sent as now.
+            json!({
+                "state": "failed", "started_at_ms": ahead + 7_200_000,
+                "finished_at_ms": ahead + 3_600_000, "exit_code": 1,
+            }),
         ];
         for run in bad_runs {
-            let (report, problems) = found(Some(defined(json!({}))), Some(run.clone()));
-            let report = report.unwrap_or_else(|| panic!("no report for {run}"));
-            assert!(report.get("script").is_none(), "{run}");
-            assert_eq!(report["variables"], 2);
-            assert_eq!(problems, ["run_malformed"], "{run}");
+            assert_eq!(
+                found(Some(defined(json!({}))), Some(run.clone())),
+                (None, vec!["run_malformed"]),
+                "{run}"
+            );
         }
         let dir = folder(Some(defined(json!({}))), None);
         fs::create_dir(run_file(dir.path(), "client-a")).unwrap();
-        let found = report(dir.path(), "client-a", now());
-        assert!(found.report.unwrap().script.is_none());
-        assert_eq!(found.problems, [Problem::RunUnreadable]);
+        assert_eq!(
+            report(dir.path(), "client-a", now()),
+            Found {
+                report: None,
+                problems: vec![Problem::RunUnreadable],
+            }
+        );
+        // With no script, a bad run file left behind costs nothing.
+        let (report, problems) = found(
+            Some(defined(json!({ "setup_script": false }))),
+            Some(json!({ "state": "crashed" })),
+        );
+        assert_eq!(report.unwrap()["variables"], 2);
+        assert_eq!(problems, Vec::<&str>::new());
     }
 
     #[test]
