@@ -293,7 +293,7 @@ if the box were not signed in.
 
 ## nucleated
 
-The daemon runs as the agent user, never as root. It does ten things:
+The daemon runs as the agent user, never as root. It does eleven things:
 
 | Job | What it does |
 |---|---|
@@ -302,6 +302,7 @@ The daemon runs as the agent user, never as root. It does ten things:
 | Environment discovery | It reads the agent servers on the box from its config and reports each as an environment. |
 | Drivers | For an environment watched through a driver, a tool you run and steer agents with, it asks the driver which agents it has and what each is doing, and reports them as sessions. It reads state and sends the driver no command. See [Drivers](#drivers). |
 | Config sync | With a repository of your own named in the config, it keeps each login's agent settings, instructions and skills at one pinned branch, and each heartbeat says which commit an environment is at. Off by default. See [Config sync](#config-sync). |
+| Environment setup | It reads what the box recipe set each environment up with, its repositories, network access, counts of variables and secrets, and how its setup script last ran, and each heartbeat says so. It writes nothing there and runs no script. See [Environment setup](#environment-setup). |
 | Unsaved work and outcomes | It counts what exists only on the box, on a schedule, and when a session stops or ends it reports what the session left behind: commits made, work not saved, and the addresses of its open pull requests. See [Unsaved work and outcomes](#unsaved-work-and-outcomes). |
 | Housekeeping | Fetch and prune, remove sessions that are finished and hold nothing unsaved, and snapshot uncommitted work to a hidden ref. These call the same code as `nucleate`. |
 | Maintenance pause | `nucleated pause 2h` tells Watch to hold its alerts for this box going dark while you work on it. See [The maintenance pause](#the-maintenance-pause). |
@@ -355,6 +356,9 @@ target = "hosted"
 # the clone of your config repository and the one copy of what a sync
 # replaced. It may not be inside state_dir.
 # cache_dir = "/home/agent/.cache/nucleated"
+# Where the box recipe writes what each environment is set up with (see
+# Environment setup). Read, never written.
+# setup_dir = "/var/lib/nucarium/environments"
 
 [watch]
 # Only for a Watch API on this machine, in development.
@@ -820,13 +824,53 @@ environment's config is from the daemon's last pass or the last run without
 `--dry-run`. What a check last found is passed on for ten minutes and no longer:
 a sync that has stopped checking says nothing rather than something old.
 
+### Environment setup
+
+The box recipe defines each environment's repositories, network access,
+network secrets, setup script and environment variables, and applies them as
+root. It writes what it applied into one folder, `/var/lib/nucarium/environments/`
+(or `setup_dir`), two files per environment:
+
+| File | Written by | Holds |
+|---|---|---|
+| `<name>.json` | The recipe | `network` (`none`, `limited` or `full`), `allowed_hosts`, `repos`, `variables` and `secrets` (counts), and `setup_script`, whether there is one. |
+| `<name>.setup.json` | The setup script's runner | The last run: `state` (`running`, `ok` or `failed`), when it started and ended as Unix milliseconds, its exit code, and the hash of the script that ran. Absent until the script has run once. |
+
+The daemon reads both afresh for every heartbeat, and writes neither. Each
+heartbeat then carries, per environment, a `setup` object: the network word,
+the three counts, the repositories' names, and of the script's last run its
+state, when it started, when it ended and, for a failed run, its exit code.
+There is no `script` when the environment has no setup script or it has not
+run yet. The hash of the script, its text, its output, the variables' names
+and values, and the files' paths stay on the box.
+
+What the daemon cannot vouch for it leaves out, and the heartbeat is never
+the worse for it:
+
+- No `<name>.json`, one that cannot be read, or one that is not what the
+  recipe writes: no `setup`.
+- A count out of range (`allowed_hosts` over 10000, `variables` or `secrets`
+  over 1000), or more than 32 repositories: no `setup`.
+- A repository's name that is not an `owner/name` or a `name`: that name
+  alone is left out.
+- A `<name>.setup.json` that cannot be read or is not what the runner
+  writes, or a run that ended with no end time or before it started: no
+  `script`. An exit code that is not 0 to 255 is left out.
+- A time ahead of the box's clock is sent as now.
+
+Each of these is logged once, in fixed words, when it first appears, and not
+at every heartbeat. `nucleated status` shows the setup either way, and names
+in `setup_problems` why anything was left out. `setup` goes only to a Watch
+that has said it takes it (see
+[Fields Watch has to ask for](#fields-watch-has-to-ask-for)).
+
 ### Fields Watch has to ask for
 
-Five fields of a heartbeat are newer than the contract every Watch holds:
-`driver`, `driver_ref`, `config_commit`, `config_modified` and
-`config_state`. Watch refuses a heartbeat that carries a field it does not
+Six fields of a heartbeat are newer than the contract every Watch holds:
+`driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`
+and `setup`. Watch refuses a heartbeat that carries a field it does not
 name, and a refused heartbeat is a box gone dark, with every environment on
-it looking down and no event sent. So the daemon sends none of the five on a
+it looking down and no event sent. So the daemon sends none of the six on a
 guess.
 
 - Every heartbeat carries what every Watch takes. Watch's answer to a
@@ -843,8 +887,9 @@ guess.
 
 Until the Watch you report to names them, an environment watched through a
 driver is reported like any other: its server, its sessions and their
-events, with no link into the driver, and config sync runs on the box with
-nothing said of it to Watch.
+events, with no link into the driver, config sync runs on the box with
+nothing said of it to Watch, and an environment's setup is shown only by
+`nucleated status`.
 
 ### What leaves the box
 
@@ -871,6 +916,7 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
 | Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
 | Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |
+| Heartbeat, per environment the box recipe set up, to a Watch that names the field in `accepts` | `setup`: `network`, one of three fixed words; `allowed_hosts`, `variables` and `secrets`, numbers; `repos`, each an `owner/name` or a `name`; and `script`, the setup script's last run: `state`, one of three fixed words, `started_at` and `finished_at`, timestamps, and `exit_code`, a number. |
 
 Each value is checked against the shape Watch accepts before it is written
 down or sent. One that does not fit is left out. A time is built from a time
@@ -905,6 +951,10 @@ Never sent from a config sync: the repository's address, its branch, a
 commit's subject, author or signer, any file's name or content, and git's own
 words for an error.
 
+Never sent from an environment's setup: the setup script, its hash and its
+output, the names and values of its variables and secrets, the hosts it may
+reach, and the paths of the recipe's files.
+
 Two things leave the box for somewhere other than Watch, and neither goes to
 Nucarium. The hourly snapshot pushes uncommitted work, which is code, to
 `refs/wip/<branch>` on the repository's own remote: your Git host, under your
@@ -932,8 +982,8 @@ the state folder holds and at what every file and folder there is called. An
 adapter's fixture is its third party's own answer with the sentinel in every
 field that carries content, in fields where a short word belongs, and in
 fields that do not exist yet. `tests/codex.rs`, `tests/t3code.rs`, `tests/herdr.rs`,
-`tests/orca.rs` and `tests/config_sync.rs` are each part of the gate: if one
-fails, do not release.
+`tests/orca.rs`, `tests/config_sync.rs` and `tests/setup.rs` are each part of
+the gate: if one fails, do not release.
 
 ### Spool and replay
 
