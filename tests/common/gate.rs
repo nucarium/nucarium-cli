@@ -77,6 +77,16 @@ pub const ENVIRONMENT_FIELDS: [&str; 7] = [
     "unsaved",
 ];
 pub const UNSAVED_FIELDS: [&str; 3] = ["uncommitted_repos", "unpushed_commits", "counted_at"];
+/// Every field of an environment's setup, and of its script's last run.
+pub const SETUP_FIELDS: [&str; 6] = [
+    "network",
+    "allowed_hosts",
+    "repos",
+    "variables",
+    "secrets",
+    "script",
+];
+pub const SCRIPT_FIELDS: [&str; 4] = ["state", "started_at", "finished_at", "exit_code"];
 
 /// Every key of every object the box sent is one this file lists, or, about
 /// an environment, a field ahead of the contract that the stand-in it was
@@ -111,6 +121,12 @@ pub fn only_listed_fields(mock: &Mock) {
             listed("an environment", environment, &environment_fields);
             if let Some(unsaved) = environment.get("unsaved") {
                 listed("unsaved", unsaved, &UNSAVED_FIELDS);
+            }
+            if let Some(setup) = environment.get("setup") {
+                listed("setup", setup, &SETUP_FIELDS);
+                if let Some(script) = setup.get("script") {
+                    listed("setup.script", script, &SCRIPT_FIELDS);
+                }
             }
         }
     }

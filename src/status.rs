@@ -60,7 +60,7 @@ pub fn view(settings: &Settings) -> Value {
     let hosted = settings.target(signed_in) == Target::Hosted;
     // What a heartbeat would say now. Built where the daemon builds its own,
     // so what is shown here is what Watch is told.
-    let beat = daemon::heartbeat(settings, now);
+    let (beat, setup_problems) = daemon::sample(settings, now);
 
     let synced = config_sync::read_status(settings);
 
@@ -150,12 +150,21 @@ pub fn view(settings: &Settings) -> Value {
                 "detail": config.detail,
             })
         });
+        // What the box recipe set the environment up with, as a heartbeat
+        // carries it, and fixed words for what was left out and why.
+        let problems: Vec<&str> = setup_problems
+            .iter()
+            .filter(|(name, _)| *name == environment.name)
+            .map(|(_, problem)| problem.as_str())
+            .collect();
         environments.push(json!({
             "name": environment.name,
             "root": environment.root,
             "agent": environment.agent,
             "driver": watched,
             "config": config,
+            "setup": report.setup,
+            "setup_problems": problems,
             "agent_version": report.agent_version,
             "login_expires_at": report.login_expires_at,
             "server_alive": alive,
@@ -332,6 +341,62 @@ fn config_words(config: &Value) -> String {
         (None | Some("ok"), _) => {}
         (Some(state), Some(detail)) => words.push_str(&format!(" ({state}: {detail})")),
         (Some(state), None) => words.push_str(&format!(" ({state})")),
+    }
+    words
+}
+
+/// What the box recipe set an environment up with: its network, its counts,
+/// and how its setup script last ran; and, when something in its files was
+/// left out, the fixed words for why. Nothing when the recipe wrote nothing.
+fn setup_words(setup: &Value, problems: &Value) -> String {
+    let problems: Vec<&str> = problems
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|problem| *problem != "missing")
+        .collect();
+    if !setup.is_object() {
+        return match problems.is_empty() {
+            true => String::new(),
+            false => format!("  setup not reported ({})", problems.join(", ")),
+        };
+    }
+    let count = |key: &str| setup[key].as_u64().unwrap_or(0);
+    let network = match setup["network"].as_str() {
+        Some("limited") => format!(
+            "network limited, {}",
+            counted(count("allowed_hosts"), "more host", "")
+        ),
+        Some(other) => format!("network {other}"),
+        None => String::new(),
+    };
+    let mut words = format!(
+        "  setup {network}, {}, {}, {}",
+        counted(
+            setup["repos"].as_array().map_or(0, |r| r.len() as u64),
+            "repo",
+            ""
+        ),
+        counted(count("variables"), "variable", ""),
+        counted(count("secrets"), "secret", ""),
+    );
+    let script = &setup["script"];
+    let at = |key: &str| script[key].as_str().map(clock).unwrap_or_default();
+    match script["state"].as_str() {
+        Some("running") => words.push_str(&format!(", script running since {}", at("started_at"))),
+        Some("ok") => words.push_str(&format!(", script ran ok at {}", at("finished_at"))),
+        Some("failed") => match script["exit_code"].as_u64() {
+            Some(code) => words.push_str(&format!(
+                ", script failed with exit {code} at {}",
+                at("finished_at")
+            )),
+            None => words.push_str(&format!(", script failed at {}", at("finished_at"))),
+        },
+        _ => {}
+    }
+    if !problems.is_empty() {
+        words.push_str(&format!(" ({})", problems.join(", ")));
     }
     words
 }
@@ -558,6 +623,10 @@ pub fn render(view: &Value) -> String {
             }
             line.push_str(&driver_words(&environment["driver"]));
             line.push_str(&config_words(&environment["config"]));
+            line.push_str(&setup_words(
+                &environment["setup"],
+                &environment["setup_problems"],
+            ));
             out.push_str(&line);
             out.push('\n');
         }
@@ -825,6 +894,82 @@ mod tests {
         let text = render(&bare);
         assert!(text.contains("client-a  7f3c2a1e  rate_limit  3s  your-org/web"));
         assert!(text.contains("client-a  agent server alive  /home/agent/client-a\n"));
+    }
+
+    #[test]
+    fn an_environments_setup_is_shown_and_so_is_its_being_held_back() {
+        let view = |setup: Value, problems: Value| {
+            json!({
+                "now_ms": 1_795_089_603_120u64,
+                "machine": { "name": "agentbox", "disk_used_pct": 41.5, "load_1m": 0.6, "uptime_s": 60 },
+                "watch": {
+                    "target": "hosted", "api_url": "https://api.nucarium.com",
+                    "token": "ok", "withheld": ["setup"],
+                },
+                "daemon": { "running": true },
+                "inbox": [],
+                "environments": [{
+                    "name": "client-a",
+                    "root": "/home/agent/client-a",
+                    "server_alive": true,
+                    "setup": setup,
+                    "setup_problems": problems,
+                }],
+            })
+        };
+        let setup = |script: Value| {
+            json!({
+                "network": "limited", "allowed_hosts": 3,
+                "repos": ["your-org/web", "your-org/api"], "variables": 2, "secrets": 0,
+                "script": script,
+            })
+        };
+        let text = render(&view(
+            setup(json!({
+                "state": "failed", "started_at": "2026-11-22T10:00:00.000Z",
+                "finished_at": "2026-11-22T10:00:42.000Z", "exit_code": 3,
+            })),
+            json!(["repo_left_out"]),
+        ));
+        assert!(
+            text.contains(
+                "/home/agent/client-a  setup network limited, 3 more hosts, 2 repos, 2 variables, \
+                 0 secrets, script failed with exit 3 at 2026-11-22 10:00 UTC (repo_left_out)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("not sent, Watch does not take it yet: setup"),
+            "{text}"
+        );
+        let running = render(&view(
+            setup(json!({ "state": "running", "started_at": "2026-11-22T10:00:00.000Z" })),
+            json!([]),
+        ));
+        assert!(
+            running.contains("0 secrets, script running since 2026-11-22 10:00 UTC\n"),
+            "{running}"
+        );
+        let ok = render(&view(
+            setup(json!({
+                "state": "ok", "started_at": "2026-11-22T10:00:00.000Z",
+                "finished_at": "2026-11-22T10:00:42.000Z",
+            })),
+            json!([]),
+        ));
+        assert!(
+            ok.contains("script ran ok at 2026-11-22 10:00 UTC\n"),
+            "{ok}"
+        );
+        // A file that could not be used says why; a box with no recipe says
+        // nothing about setup at all.
+        let broken = render(&view(Value::Null, json!(["malformed"])));
+        assert!(
+            broken.contains("/home/agent/client-a  setup not reported (malformed)\n"),
+            "{broken}"
+        );
+        let none = render(&view(Value::Null, json!(["missing"])));
+        assert!(none.contains("/home/agent/client-a\n"), "{none}");
     }
 
     #[test]

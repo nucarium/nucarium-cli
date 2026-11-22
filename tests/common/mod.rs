@@ -282,6 +282,12 @@ impl Home {
         self.dir.join(".cache/nucleated")
     }
 
+    /// Where a test plays the box recipe, writing each environment's setup.
+    /// Nothing is there unless a test puts it there.
+    pub fn setup_dir(&self) -> PathBuf {
+        self.dir.join("environments")
+    }
+
     pub fn write_config(&self, text: &str) {
         let path = self.config_file();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -433,10 +439,12 @@ impl Rig {
             None => (extra, ""),
         };
         self.home.write_config(&format!(
-            "machine = \"agentbox\"\nstate_dir = \"{state}\"\ncache_dir = \"{cache}\"\n{top}\n\
+            "machine = \"agentbox\"\nstate_dir = \"{state}\"\ncache_dir = \"{cache}\"\n\
+             setup_dir = \"{setup}\"\n{top}\n\
              [[environment]]\nname = \"client-a\"\nroot = \"{root}\"\n{environment}\n\n{tables}\n",
             state = self.home.state_dir().display(),
             cache = self.home.cache_dir().display(),
+            setup = self.home.setup_dir().display(),
             root = self.root.display(),
         ));
     }
@@ -572,13 +580,17 @@ pub mod contract {
     }
 
     /// The fields of a heartbeat's environment that are ahead of 0.5.0.
-    pub const AHEAD: [&str; 5] = [
+    pub const AHEAD: [&str; 6] = [
         "driver",
         "driver_ref",
         "config_commit",
         "config_modified",
         "config_state",
+        "setup",
     ];
+
+    const NETWORKS: [&str; 3] = ["none", "limited", "full"];
+    const SCRIPT_STATES: [&str; 3] = ["running", "ok", "failed"];
 
     /// The fixed words for how a config sync stands.
     const CONFIG_STATES: [&str; 6] = ["ok", "pending", "held", "unreachable", "rejected", "failed"];
@@ -823,6 +835,9 @@ pub mod contract {
                 "last_snapshot_at",
                 string(date_time),
             )?;
+            if let Some(setup) = environment.get("setup") {
+                setup_object(setup, &top["client_ts"])?;
+            }
             if let Some(unsaved) = environment.get("unsaved") {
                 let unsaved = object(unsaved, "unsaved")?;
                 closed(
@@ -844,6 +859,71 @@ pub mod contract {
                 return Err(format!("{} is named twice", environment["env_id"]));
             }
             seen.push(&environment["env_id"]);
+        }
+        Ok(())
+    }
+
+    /// `EnvironmentSetup`: `additionalProperties: false` at both levels, and
+    /// a run's times in the past of the heartbeat that carries them, its end
+    /// not before its start.
+    fn setup_object(value: &Value, client_ts: &Value) -> Check {
+        let setup = object(value, "setup")?;
+        closed(
+            setup,
+            "setup",
+            &["network", "allowed_hosts", "repos", "variables", "secrets"],
+            &["script"],
+        )?;
+        field(setup, "setup", "network", string(|v| NETWORKS.contains(&v)))?;
+        field(setup, "setup", "allowed_hosts", integer(0, 10_000))?;
+        field(setup, "setup", "variables", integer(0, 1_000))?;
+        field(setup, "setup", "secrets", integer(0, 1_000))?;
+        field(setup, "setup", "repos", |repos| {
+            repos
+                .as_array()
+                .is_some_and(|list| list.len() <= 32 && list.iter().all(string(repo)))
+        })?;
+        let Some(script) = setup.get("script") else {
+            return Ok(());
+        };
+        let script = object(script, "setup.script")?;
+        let state = script.get("state").and_then(Value::as_str).unwrap_or("");
+        let mut optional = Vec::new();
+        if state != "running" {
+            optional.push("finished_at");
+        }
+        if state == "failed" {
+            optional.push("exit_code");
+        }
+        let required: &[&str] = match state {
+            "running" => &["state", "started_at"],
+            _ => &["state", "started_at", "finished_at"],
+        };
+        closed(script, "setup.script", required, &optional)?;
+        field(
+            script,
+            "setup.script",
+            "state",
+            string(|v| SCRIPT_STATES.contains(&v)),
+        )?;
+        field(script, "setup.script", "started_at", string(date_time))?;
+        field(script, "setup.script", "finished_at", string(date_time))?;
+        field(script, "setup.script", "exit_code", integer(0, 255))?;
+        // This program writes every time in one form, so the strings order as
+        // the times do.
+        let time = |key: &str| script.get(key).and_then(Value::as_str);
+        let sent = client_ts.as_str().unwrap_or("");
+        if [time("started_at"), time("finished_at")]
+            .into_iter()
+            .flatten()
+            .any(|at| at > sent)
+        {
+            return Err("setup.script has a time ahead of client_ts".to_string());
+        }
+        if let (Some(started), Some(finished)) = (time("started_at"), time("finished_at")) {
+            if finished < started {
+                return Err("setup.script finished before it started".to_string());
+            }
         }
         Ok(())
     }

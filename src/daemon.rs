@@ -21,7 +21,7 @@ use crate::spool::Spool;
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
-use crate::{agent, config_sync, driver, housekeeping, paths, pause};
+use crate::{agent, config_sync, driver, housekeeping, paths, pause, setup};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -263,6 +263,12 @@ fn machine_totals(settings: &Settings, counts: &Counts) -> (Option<(u64, u64)>, 
 /// is the whole truth about the box, so a thinner one would tell Watch that
 /// what it left out is no longer so.
 pub fn heartbeat(settings: &Settings, now: SystemTime) -> Heartbeat {
+    sample(settings, now).0
+}
+
+/// The heartbeat, and why anything about an environment's setup was left
+/// out of it, by environment: for the daemon's log and `nucleated status`.
+pub fn sample(settings: &Settings, now: SystemTime) -> (Heartbeat, Vec<(String, setup::Problem)>) {
     let counts = reporter::read_counts(settings);
     let (unsaved, snapshot) = counts
         .as_ref()
@@ -271,15 +277,26 @@ pub fn heartbeat(settings: &Settings, now: SystemTime) -> Heartbeat {
         .with_unsaved(unsaved)
         .with_snapshot(snapshot.map(at_ms), now);
     let synced = config_sync::read_status(settings);
+    let mut problems = Vec::new();
     let environments = settings
         .environments
         .iter()
         .map(|environment| {
+            // Two small files the box recipe writes, read afresh each time.
+            let setup = setup::report(&settings.setup_dir, &environment.name, now);
+            problems.extend(
+                setup
+                    .problems
+                    .iter()
+                    .map(|problem| (environment.name.clone(), *problem)),
+            );
             environment_report(settings, environment, counts.as_ref(), synced.as_ref(), now)
+                .with_setup(setup.report)
         })
         .collect();
-    Heartbeat::new(machine, environments, now)
-        .with_pause(pause::until(&settings.state_dir, now), now)
+    let beat = Heartbeat::new(machine, environments, now)
+        .with_pause(pause::until(&settings.state_dir, now), now);
+    (beat, problems)
 }
 
 pub struct Daemon {
@@ -315,6 +332,9 @@ pub struct Daemon {
     heartbeat: HeartbeatState,
     environments: Vec<EnvironmentState>,
     machine: Option<MachineHealth>,
+    /// What the last heartbeat could not say about an environment's setup,
+    /// and why. Each is logged when it first appears, and not at every beat.
+    setup_problems: BTreeSet<(String, setup::Problem)>,
 
     pending: BTreeMap<String, Pending>,
     backoff: Duration,
@@ -364,6 +384,7 @@ impl Daemon {
             ahead_held_until: None,
             environments: Vec::new(),
             machine: None,
+            setup_problems: BTreeSet::new(),
             pending: BTreeMap::new(),
             retry_at: None,
             events: EventsState::default(),
@@ -468,6 +489,18 @@ impl Daemon {
         }
     }
 
+    /// Log what keeps an environment's setup out of the heartbeat, once: when
+    /// it first appears, and again only if it goes away and comes back. The
+    /// line is fixed words and the environment's name: no path, and nothing
+    /// from the file.
+    fn note_setup(&mut self, problems: Vec<(String, setup::Problem)>) {
+        let problems: BTreeSet<_> = problems.into_iter().collect();
+        for (environment, problem) in problems.difference(&self.setup_problems) {
+            log(&format!("environment {environment}: {}", problem.says()));
+        }
+        self.setup_problems = problems;
+    }
+
     /// The fields ahead of the contract that may go in a heartbeat now: what
     /// Watch last said it takes, and nothing while a refusal is being sat out.
     fn taken_now(&self, now: Instant) -> Taken {
@@ -486,7 +519,8 @@ impl Daemon {
     fn beat(&mut self, now: Instant) {
         let wall = SystemTime::now();
         let stamp = rfc3339(wall);
-        let known = heartbeat(&self.settings, wall);
+        let (known, problems) = sample(&self.settings, wall);
+        self.note_setup(problems);
         self.environments = known
             .environments
             .iter()
