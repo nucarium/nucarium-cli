@@ -1186,17 +1186,20 @@ config does. So the daemon checks a repo before every git call it makes there:
   pointer changed after the check is not followed.
   The worktrees of a driver that owns them belong to repos of the owner's
   choosing: their config is checked, and where they point is not.
+- It refuses a worktree whose index names a submodule that is checked out:
+  `git add` and `git status` start git again inside one, where that
+  repository's own config would be read and not checked.
 - It runs git with no system config or attributes (`GIT_CONFIG_NOSYSTEM=1`,
   `GIT_ATTR_NOSYSTEM=1`), with its own global config (the one its environment
   names in `GIT_CONFIG_GLOBAL`, else `~/.gitconfig`), and with
-  `core.hooksPath=/dev/null`, `core.fsmonitor=false` and
-  `core.attributesFile=/dev/null` on the command line, where they win over
-  anything in a repo. That is why `core.hooksPath` may be set: it does nothing.
+  `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+  `core.attributesFile=/dev/null` and `diff.ignoreSubmodules=all` on the
+  command line, where they win over anything in a repo. That is why `core.hooksPath` may be set: it does nothing.
 
 A refused repo is skipped. The daemon logs it once, by name, in one fixed
 sentence that quotes nothing from its config, and logs it again only if it is
 refused again after passing. `refresh` and `snapshot` report it as `refused`
-with one word for why (`config`, `pointer` or `unreadable`), which counts as a
+with one word for why (`config`, `pointer`, `submodule` or `unreadable`), which counts as a
 run that did not finish clean. `cleanup` keeps any session that holds it. Its
 nucleus's unsaved-work count is unknown until it passes again, so Watch is
 sent no count rather than one that leaves it out. `nucleated status` names it
@@ -1230,7 +1233,8 @@ refusing anything:
 
 In report-only mode git runs in a refused repo as it did before this check,
 with the overrides above: hooks, the file-system monitor and an attributes
-file stay off, and any other program its config names can run.
+file stay off, and any other program its config, or a submodule's, names can
+run.
 
 ## Assumptions
 

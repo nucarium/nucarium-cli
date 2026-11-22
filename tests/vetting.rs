@@ -235,7 +235,7 @@ fn a_worktree_that_points_outside_the_nucleus_is_refused() {
     let outside = outside_repo(&rig, &program);
     let value = format!("gitdir: {}\n", outside.join(".git").display());
     fs::write(worktree.join(".git"), &value).unwrap();
-    assert_refused_worktree(&rig, &marker, value.trim());
+    assert_refused_worktree(&rig, &marker, "pointer", value.trim());
 }
 
 #[test]
@@ -248,13 +248,13 @@ fn a_worktree_whose_common_folder_is_outside_the_nucleus_is_refused() {
     assert!(commondir.is_file());
     let value = outside.join(".git").display().to_string();
     fs::write(&commondir, format!("{value}\n")).unwrap();
-    assert_refused_worktree(&rig, &marker, &value);
+    assert_refused_worktree(&rig, &marker, "pointer", &value);
 }
 
 /// As [`assert_refused`], for a repo whose own config is clean and one of
 /// whose worktrees points somewhere git must not be let go: the repo is
 /// fetched, and the worktree is neither snapshotted nor counted.
-fn assert_refused_worktree(rig: &Rig, marker: &Path, planted: &str) {
+fn assert_refused_worktree(rig: &Rig, marker: &Path, reason: &str, planted: &str) {
     let seen = everything(rig);
     assert!(!marker.exists(), "a program the repo names was run");
     assert_eq!(seen.refresh["repos"][0]["ok"], true, "{}", seen.refresh);
@@ -263,15 +263,43 @@ fn assert_refused_worktree(rig: &Rig, marker: &Path, planted: &str) {
         "{}",
         seen.snapshot
     );
-    assert_eq!(seen.snapshot["worktrees"][0]["reason"], "pointer");
+    assert_eq!(seen.snapshot["worktrees"][0]["reason"], reason);
     let environment = &seen.status["environments"][0];
     assert_eq!(
         environment["git_refused"],
-        json!([{ "repo": "web", "reason": "pointer" }])
+        json!([{ "repo": "web", "reason": reason }])
     );
     assert!(environment["unsaved"].is_null(), "{environment}");
-    assert!(seen.text.contains("web (pointer)"), "{}", seen.text);
+    assert!(
+        seen.text.contains(&format!("web ({reason})")),
+        "{}",
+        seen.text
+    );
     assert!(!seen.logs.contains(planted), "{}", seen.logs);
+}
+
+#[test]
+fn a_worktree_holding_a_submodule_with_a_config_of_its_own_is_refused() {
+    let rig = Rig::new();
+    let (program, marker) = marker_program(&rig);
+    let worktree = session_with_work(&rig);
+    // A repository checked out inside the worktree and committed to it as a
+    // submodule. Its own config, which nobody checks, names a filter for its
+    // files; `git add` in the worktree starts git again in there.
+    let nested = worktree.join("vendored");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-q", "-b", "main"]);
+    fs::write(nested.join(".gitattributes"), "* filter=planted\n").unwrap();
+    fs::write(nested.join("lib.txt"), "library\n").unwrap();
+    git(&nested, &["add", "."]);
+    git(&nested, &["commit", "-q", "-m", "vendored"]);
+    git(&worktree, &["add", "vendored"]);
+    git(&worktree, &["commit", "-q", "-m", "add a submodule"]);
+    let value = program.to_str().unwrap();
+    git(&nested, &["config", "filter.planted.clean", value]);
+    // Changed since its index saw it, so git must read it through the filter.
+    fs::write(nested.join("lib.txt"), "library, edited\n").unwrap();
+    assert_refused_worktree(&rig, &marker, "submodule", value);
 }
 
 #[test]

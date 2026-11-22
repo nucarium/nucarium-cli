@@ -126,14 +126,26 @@ const ALLOWED: [(&str, bool, &str); 12] = [
 ];
 
 /// Settings given to every call, ahead of anything in a repository.
-const OVERRIDES: [&str; 6] = [
+/// `diff.ignoreSubmodules` keeps `git status` out of a submodule, whose own
+/// config is not checked; `git add` goes into one whatever is set, which is
+/// why a worktree holding one is refused before either runs.
+const OVERRIDES: [&str; 8] = [
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "core.fsmonitor=false",
     "-c",
     "core.attributesFile=/dev/null",
+    "-c",
+    "diff.ignoreSubmodules=all",
 ];
+
+/// The git commands that start git again inside each checked-out
+/// submodule, where the submodule's own config would be read.
+const ENTER_SUBMODULES: [&str; 2] = ["status", "add"];
+/// The most of a worktree's index listing that is read, and how long for.
+const MAX_LISTING: u64 = 256 * 1024 * 1024;
+const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Variables of the daemon's own environment that would point git at
 /// another repository or bring in config of their own.
@@ -203,6 +215,9 @@ pub enum Reason {
     Pointer,
     /// Its config could not be read.
     Unreadable,
+    /// A worktree holds a checked-out submodule, or another repository git
+    /// would treat as one: git would read that repository's own config.
+    Submodule,
 }
 
 impl Reason {
@@ -211,6 +226,7 @@ impl Reason {
             Reason::Config => "config",
             Reason::Pointer => "pointer",
             Reason::Unreadable => "unreadable",
+            Reason::Submodule => "submodule",
         }
     }
 
@@ -219,6 +235,7 @@ impl Reason {
             Reason::Config => "its git config sets a key nucleated does not allow",
             Reason::Pointer => "a git pointer in it leads outside the nucleus's repos",
             Reason::Unreadable => "its git config could not be read",
+            Reason::Submodule => "it holds a submodule, whose own git config is not checked",
         }
     }
 }
@@ -424,13 +441,47 @@ impl Guarded {
         self.pin_git_dir(&dir.join(target))
     }
 
+    /// True when a worktree's index names a submodule whose folder holds a
+    /// `.git`: git would start again in there. The listing itself goes into
+    /// no submodule.
+    fn holds_submodule(&self, dir: &Path, pinned: &Pinned) -> Result<bool, Reason> {
+        let mut command = self.command();
+        command.args(OVERRIDES);
+        if pinned.common != pinned.git_dir {
+            command.env("GIT_COMMON_DIR", &pinned.common);
+        }
+        command
+            .arg("-C")
+            .arg(dir)
+            .arg("--git-dir")
+            .arg(&pinned.git_dir)
+            .arg("--work-tree")
+            .arg(dir)
+            .args(["ls-files", "--stage", "-z"]);
+        let out = crate::bounded::run(&mut command, LISTING_TIMEOUT, MAX_LISTING)
+            .map_err(|_| Reason::Unreadable)?;
+        if !out.ok {
+            return Err(Reason::Unreadable);
+        }
+        Ok(out
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter_map(|entry| {
+                let (head, path) = entry.split_at(entry.iter().position(|b| *b == b'\t')?);
+                head.starts_with(b"160000 ")
+                    .then(|| PathBuf::from(String::from_utf8_lossy(&path[1..]).to_string()))
+            })
+            .any(|path| std::fs::symlink_metadata(dir.join(path).join(".git")).is_ok()))
+    }
+
     /// Log a refusal the first time it is found, and forget it once the
-    /// repository passes, so that a later one is logged again.
-    fn note(&self, key: &Path, outcome: &Result<Pinned, Refused>) {
+    /// repository passes a full check, so that a later one is logged again.
+    fn note(&self, key: &Path, outcome: &Result<Pinned, Refused>, full: bool) {
         let Ok(mut logged) = LOGGED.lock() else {
             return;
         };
         match outcome {
+            Ok(_) if !full => {}
             Ok(_) => logged.retain(|(path, _)| path != key),
             Err(refused) => {
                 if logged.insert((key.to_path_buf(), refused.reason)) {
@@ -445,17 +496,25 @@ impl Guarded {
         }
     }
 
-    fn vet(&self, dir: &Path, bare: bool) -> Result<Pinned, Refused> {
+    /// Check a repository. For a worktree, `submodules` also looks in its
+    /// index for a checked-out submodule, which only the commands that go
+    /// into one need.
+    fn vet(&self, dir: &Path, bare: bool, submodules: bool) -> Result<Pinned, Refused> {
         let pinned = if bare {
             self.pin_git_dir(dir)
         } else {
-            self.pin_worktree(dir)
+            self.pin_worktree(dir).and_then(|pinned| {
+                match submodules && self.holds_submodule(dir, &pinned)? {
+                    true => Err(Reason::Submodule),
+                    false => Ok(pinned),
+                }
+            })
         };
         let outcome = pinned.map_err(|reason| Refused {
             repo: short_name(dir),
             reason,
         });
-        self.note(dir, &outcome);
+        self.note(dir, &outcome, bare || submodules);
         outcome
     }
 
@@ -464,7 +523,9 @@ impl Guarded {
     fn prepare(&self, dir: &Path, bare: bool, args: &[&str]) -> Result<Command> {
         let mut command = self.command();
         command.args(OVERRIDES);
-        match self.vet(dir, bare) {
+        let command_name = args.iter().find(|arg| !arg.starts_with('-'));
+        let submodules = command_name.is_some_and(|name| ENTER_SUBMODULES.contains(name));
+        match self.vet(dir, bare, submodules) {
             Ok(pinned) => {
                 // Pinned, so that a pointer changed after the check is not
                 // followed: git takes both folders from here. A repository
@@ -525,7 +586,7 @@ impl Git {
     pub fn vet_bare(&self, dir: &Path) -> Option<Refused> {
         match self {
             Git::Plain => None,
-            Git::Guarded(guarded) => guarded.vet(dir, true).err(),
+            Git::Guarded(guarded) => guarded.vet(dir, true, true).err(),
         }
     }
 
@@ -533,7 +594,7 @@ impl Git {
     pub fn vet_tree(&self, dir: &Path) -> Option<Refused> {
         match self {
             Git::Plain => None,
-            Git::Guarded(guarded) => guarded.vet(dir, false).err(),
+            Git::Guarded(guarded) => guarded.vet(dir, false, true).err(),
         }
     }
 
