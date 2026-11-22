@@ -96,12 +96,21 @@ pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
     chosen
 }
 
-pub(crate) fn workspace(environment: &Environment) -> Workspace {
+/// The workspace of one environment as the daemon sees it: git is run
+/// guarded, in repositories it has vetted. A nucleus's repositories must keep
+/// their git data in its `.repos`; a driver's are wherever the owner keeps
+/// them, and only their config is held to the allowlist.
+pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Workspace {
+    let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
     Workspace::new(config::for_root(
         &environment.root,
         environment.github_token_file.clone(),
         environment.branch_prefix.clone(),
     ))
+    .guarded(git::Git::Guarded(git::Guarded::new(
+        repos,
+        settings.git_vetting,
+    )))
 }
 
 /// Run one job for one environment and report what it did.
@@ -126,7 +135,8 @@ pub fn run_job(
         bail!("{} is not a folder", environment.root.display());
     }
     // And no job reaches into a driver's folders from a nucleus beside them.
-    let workspace = workspace(environment).leaving_alone(driver::protected_roots(settings));
+    let workspace =
+        workspace(settings, environment).leaving_alone(driver::protected_roots(settings));
     let mut report = match job {
         Job::Refresh => json!({ "repos": workspace.refresh()? }),
         Job::Cleanup => {
@@ -209,12 +219,23 @@ fn keep_reason(
         }
     }
     let manifest = Workspace::load_manifest(path)?;
+    // A repo the daemon will not run git in cannot be told saved.
+    for (repo, info) in &manifest.repos {
+        if !info.path.exists() || !workspace.git().enforcing() {
+            continue;
+        }
+        if let Some(refused) = workspace.git().vet_tree(&info.path) {
+            return Ok(Some(format!("{repo}: {refused}")));
+        }
+    }
     let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
     for session in &agent_sessions {
         last_change = last_change.max(session.last_event_ms);
     }
     for repo in manifest.repos.values().filter(|repo| repo.path.exists()) {
-        let committed = git::tree(&repo.path, &["log", "-1", "--format=%ct"])
+        let committed = workspace
+            .git()
+            .tree(&repo.path, &["log", "-1", "--format=%ct"])
             .ok()
             .and_then(|seconds| seconds.parse::<u64>().ok())
             .unwrap_or(u64::MAX / 1000);
@@ -322,6 +343,7 @@ fn dashed(branch: &str) -> String {
 }
 
 fn snapshot_one(
+    git: &git::Git,
     worktree: &Path,
     repo: &str,
     keys: &Path,
@@ -336,11 +358,11 @@ fn snapshot_one(
         entry
     };
     let skipped = |reason: &str| Ok(entry("skipped", json!({ "reason": reason })));
-    let branch = git::tree(worktree, &["branch", "--show-current"])?;
+    let branch = git.tree(worktree, &["branch", "--show-current"])?;
     if branch.is_empty() {
         return skipped("not on a branch");
     }
-    let (ok, status, error) = git::tree_raw(worktree, &["status", "--porcelain", "-z"], &[])?;
+    let (ok, status, error) = git.tree_raw(worktree, &["status", "--porcelain", "-z"], &[])?;
     if !ok {
         bail!("git status failed: {error}");
     }
@@ -358,7 +380,7 @@ fn snapshot_one(
 
     // Build the tree in a copy of the index, so neither the session's index
     // nor its branch is touched.
-    let git_dir = PathBuf::from(git::tree(worktree, &["rev-parse", "--absolute-git-dir"])?);
+    let git_dir = PathBuf::from(git.tree(worktree, &["rev-parse", "--absolute-git-dir"])?);
     paths::create_private_dir(keys)?;
     let index = keys.join(format!(".index.{}.{}", std::process::id(), dashed(&branch)));
     if git_dir.join("index").is_file() {
@@ -366,11 +388,11 @@ fn snapshot_one(
     }
     let with_index: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.as_os_str())];
     let built = (|| -> Result<String> {
-        let (ok, _, error) = git::tree_raw(worktree, &["add", "-A"], &with_index)?;
+        let (ok, _, error) = git.tree_raw(worktree, &["add", "-A"], &with_index)?;
         if !ok {
             bail!("git add failed: {error}");
         }
-        let (ok, tree, error) = git::tree_raw(worktree, &["write-tree"], &with_index)?;
+        let (ok, tree, error) = git.tree_raw(worktree, &["write-tree"], &with_index)?;
         if !ok {
             bail!("git write-tree failed: {error}");
         }
@@ -379,7 +401,7 @@ fn snapshot_one(
     let _ = fs::remove_file(&index);
     let tree = built?;
 
-    if tree == git::tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
+    if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
         return skipped("nothing uncommitted");
     }
     let reference = format!("refs/wip/{}", dashed(&branch));
@@ -394,8 +416,9 @@ fn snapshot_one(
         ));
     }
     // commit-tree needs an author; a box with none configured still snapshots.
-    let unnamed =
-        git::try_tree(worktree, &["config", "user.email"]).map_or(true, |o| o.stdout.is_empty());
+    let unnamed = git
+        .try_tree(worktree, &["config", "user.email"])
+        .map_or(true, |o| o.stdout.is_empty());
     let identity: Vec<(&str, &OsStr)> = if unnamed {
         ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"]
             .into_iter()
@@ -410,7 +433,7 @@ fn snapshot_one(
         Vec::new()
     };
     let message = format!("wip snapshot {} {branch}", rfc3339(now));
-    let (ok, commit, error) = git::tree_raw(
+    let (ok, commit, error) = git.tree_raw(
         worktree,
         &["commit-tree", &tree, "-p", "HEAD", "-m", &message],
         &identity,
@@ -419,7 +442,7 @@ fn snapshot_one(
         bail!("git commit-tree failed: {error}");
     }
     let commit = String::from_utf8_lossy(&commit).trim().to_string();
-    let pushed = git::try_tree(
+    let pushed = git.try_tree(
         worktree,
         &[
             "push",
@@ -451,8 +474,23 @@ fn snapshot(
     let keys = state_dir.join("snapshots").join(&environment.name);
     let now = SystemTime::now();
     let mut report = Vec::new();
+    let refused = |repo: &str, worktree: Option<&Path>, refused: &git::Refused| {
+        json!({
+            "repo": repo, "worktree": worktree,
+            "action": "refused", "reason": refused.reason.as_str(),
+        })
+    };
     for item in workspace.available()? {
-        for worktree in Workspace::worktrees(&item.bare).unwrap_or_default() {
+        let worktrees = match workspace.worktrees(&item.bare) {
+            Ok(worktrees) => worktrees,
+            Err(error) => {
+                if let Some(why) = git::refusal(&error) {
+                    report.push(refused(&item.repo, None, why));
+                }
+                Vec::new()
+            }
+        };
+        for worktree in worktrees {
             if !worktree.is_dir() {
                 continue;
             }
@@ -467,12 +505,14 @@ fn snapshot(
                 continue;
             }
             report.push(
-                snapshot_one(&worktree, &item.repo, &keys, dry_run, now).unwrap_or_else(|error| {
-                    json!({
-                        "repo": item.repo, "worktree": worktree,
-                        "action": "failed", "reason": format!("{error:#}"),
-                    })
-                }),
+                snapshot_one(workspace.git(), &worktree, &item.repo, &keys, dry_run, now)
+                    .unwrap_or_else(|error| match git::refusal(&error) {
+                        Some(why) => refused(&item.repo, Some(&worktree), why),
+                        None => json!({
+                            "repo": item.repo, "worktree": worktree,
+                            "action": "failed", "reason": format!("{error:#}"),
+                        }),
+                    }),
             );
         }
     }
@@ -542,7 +582,8 @@ fn nothing_failed(report: &Value) -> bool {
         .filter_map(|name| report[name].as_array())
         .flatten()
         .all(|item| match item["action"].as_str() {
-            Some(action) => action != "failed",
+            // A repo git was not run in was not dealt with.
+            Some(action) => action != "failed" && action != "refused",
             None => item["ok"] == true,
         })
 }

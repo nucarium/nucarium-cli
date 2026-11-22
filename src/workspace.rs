@@ -59,6 +59,9 @@ pub struct Workspace {
     /// snapshotted or counted here. See [`Workspace::left_alone_because`]
     /// for the rule that does not depend on this list.
     protected: Vec<PathBuf>,
+    /// How git is run: as the user would, for `nucleate`, or guarded, for
+    /// the daemon.
+    git: git::Git,
 }
 
 /// What a worktree holds that exists nowhere else. This is the one rule:
@@ -163,7 +166,19 @@ impl Workspace {
             seeds_dir: root.join(".seeds"),
             merges: None,
             protected: Vec::new(),
+            git: git::Git::Plain,
         }
+    }
+
+    /// Run git the daemon's way: each repository vetted first, and nothing
+    /// a repository names run.
+    pub fn guarded(mut self, git: git::Git) -> Self {
+        self.git = git;
+        self
+    }
+
+    pub fn git(&self) -> &git::Git {
+        &self.git
     }
 
     /// Leave everything under these folders alone. The daemon names the
@@ -218,7 +233,7 @@ impl Workspace {
     /// own, so that pruning its records can drop nobody else's. Where git
     /// cannot say, it might not be.
     fn holds_only_its_own(&self, bare: &Path) -> bool {
-        Self::worktrees(bare).is_ok_and(|registered| {
+        self.worktrees(bare).is_ok_and(|registered| {
             registered
                 .iter()
                 .all(|worktree| !self.leaves_alone(worktree))
@@ -252,8 +267,9 @@ impl Workspace {
 
     // ---- repositories -------------------------------------------------
 
-    pub fn remote_url(bare: &Path) -> String {
-        git::try_bare(bare, &["config", "--get", "remote.origin.url"])
+    pub fn remote_url(&self, bare: &Path) -> String {
+        self.git
+            .try_bare(bare, &["config", "--get", "remote.origin.url"])
             .map(|o| o.stdout)
             .unwrap_or_default()
     }
@@ -269,11 +285,23 @@ impl Workspace {
             let Some(name) = file.strip_suffix(".git") else {
                 continue;
             };
-            let is_bare = git::try_bare(&path, &["rev-parse", "--is-bare-repository"])?;
+            // A repo the daemon refuses is still one of the nucleus's: it is
+            // listed, under its folder's name, and every call in it refused.
+            if self.git.enforcing() && self.git.vet_bare(&path).is_some() {
+                found.push(Available {
+                    repo: name.to_string(),
+                    label: name.to_string(),
+                    bare: path,
+                });
+                continue;
+            }
+            let is_bare = self
+                .git
+                .try_bare(&path, &["rev-parse", "--is-bare-repository"])?;
             if !is_bare.ok || is_bare.stdout != "true" {
                 continue;
             }
-            let label = github::slug(&Self::remote_url(&path))
+            let label = github::slug(&self.remote_url(&path))
                 .map(|(owner, repo)| format!("{owner}/{repo}"))
                 .unwrap_or_else(|| name.to_string());
             found.push(Available {
@@ -347,9 +375,11 @@ impl Workspace {
         fs::create_dir_all(&self.repos_dir)?;
         let bare_arg = bare.to_string_lossy().to_string();
         git::git(["init", "-q", "--bare", &bare_arg])?;
-        let fetched = git::bare(&bare, &["remote", "add", "origin", &source])
+        let fetched = self
+            .git
+            .bare(&bare, &["remote", "add", "origin", &source])
             .and_then(|_| {
-                git::bare(
+                self.git.bare(
                     &bare,
                     &[
                         "config",
@@ -358,16 +388,18 @@ impl Workspace {
                     ],
                 )
             })
-            .and_then(|_| git::bare(&bare, &["fetch", "-q", "origin"]));
+            .and_then(|_| self.git.bare(&bare, &["fetch", "-q", "origin"]));
         if let Err(error) = fetched {
             let _ = fs::remove_dir_all(&bare);
             return Err(error);
         }
         // An empty remote has no head to record; sessions then start from "main".
-        let _ = git::try_bare(&bare, &["remote", "set-head", "origin", "--auto"]);
-        let head = format!("refs/heads/{}", Self::default_branch(&bare));
-        let _ = git::try_bare(&bare, &["symbolic-ref", "HEAD", &head]);
-        let label = github::slug(&Self::remote_url(&bare))
+        let _ = self
+            .git
+            .try_bare(&bare, &["remote", "set-head", "origin", "--auto"]);
+        let head = format!("refs/heads/{}", self.default_branch(&bare));
+        let _ = self.git.try_bare(&bare, &["symbolic-ref", "HEAD", &head]);
+        let label = github::slug(&self.remote_url(&bare))
             .map(|(owner, repo)| format!("{owner}/{repo}"))
             .unwrap_or_else(|| name.clone());
         Ok(Available {
@@ -377,13 +409,15 @@ impl Workspace {
         })
     }
 
-    fn default_branch(bare: &Path) -> String {
-        let head = git::try_bare(
-            bare,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .map(|o| o.stdout)
-        .unwrap_or_default();
+    fn default_branch(&self, bare: &Path) -> String {
+        let head = self
+            .git
+            .try_bare(
+                bare,
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            )
+            .map(|o| o.stdout)
+            .unwrap_or_default();
         match head.strip_prefix("origin/") {
             Some(branch) if !branch.is_empty() => branch.to_string(),
             _ => "main".to_string(),
@@ -394,8 +428,20 @@ impl Workspace {
     pub fn refresh(&self) -> Result<Value> {
         let mut results = Vec::new();
         for item in self.available()? {
-            let fetched = git::try_bare(&item.bare, &["fetch", "-q", "--prune", "origin"])?;
-            let _ = git::try_bare(&item.bare, &["remote", "set-head", "origin", "--auto"]);
+            let refused = self.git.enforcing().then(|| self.git.vet_bare(&item.bare));
+            if let Some(refused) = refused.flatten() {
+                results.push(json!({
+                    "repo": item.repo, "ok": false,
+                    "action": "refused", "reason": refused.reason.as_str(),
+                }));
+                continue;
+            }
+            let fetched = self
+                .git
+                .try_bare(&item.bare, &["fetch", "-q", "--prune", "origin"])?;
+            let _ = self
+                .git
+                .try_bare(&item.bare, &["remote", "set-head", "origin", "--auto"]);
             let mut entry = json!({ "repo": item.repo, "ok": fetched.ok });
             if !fetched.ok {
                 entry["error"] = json!(fetched.stderr);
@@ -432,15 +478,15 @@ impl Workspace {
     pub fn prune_worktrees(&self) -> Result<()> {
         for item in self.available()? {
             if self.holds_only_its_own(&item.bare) {
-                let _ = git::try_bare(&item.bare, &["worktree", "prune"]);
+                let _ = self.git.try_bare(&item.bare, &["worktree", "prune"]);
             }
         }
         Ok(())
     }
 
     /// The checked-out worktrees of one bare repo.
-    pub fn worktrees(bare: &Path) -> Result<Vec<PathBuf>> {
-        let listing = git::bare(bare, &["worktree", "list", "--porcelain"])?;
+    pub fn worktrees(&self, bare: &Path) -> Result<Vec<PathBuf>> {
+        let listing = self.git.bare(bare, &["worktree", "list", "--porcelain"])?;
         // Entries are separated by blank lines; the bare repo itself is one of them.
         Ok(listing
             .split("\n\n")
@@ -581,22 +627,29 @@ impl Workspace {
         if !valid_branch(&branch) {
             bail!("invalid branch: {branch:?}");
         }
-        let default = Self::default_branch(&item.bare);
+        let default = self.default_branch(&item.bare);
         let refspec = |b: &str| format!("+refs/heads/{b}:refs/remotes/origin/{b}");
-        git::bare(&item.bare, &["fetch", "-q", "origin", &refspec(&default)])?;
+        self.git
+            .bare(&item.bare, &["fetch", "-q", "origin", &refspec(&default)])?;
         // Also fetch the requested branch, so one pushed from elsewhere is
         // resumed rather than silently recreated from the default branch.
-        let _ = git::try_bare(&item.bare, &["fetch", "-q", "origin", &refspec(&branch)]);
+        let _ = self
+            .git
+            .try_bare(&item.bare, &["fetch", "-q", "origin", &refspec(&branch)]);
 
         let has = |reference: String| -> Result<bool> {
-            Ok(git::try_bare(&item.bare, &["show-ref", "--verify", "-q", &reference])?.ok)
+            Ok(self
+                .git
+                .try_bare(&item.bare, &["show-ref", "--verify", "-q", &reference])?
+                .ok)
         };
         let child_arg = child.to_string_lossy().to_string();
         if has(format!("refs/heads/{branch}"))? {
-            git::bare(&item.bare, &["worktree", "add", &child_arg, &branch])?;
+            self.git
+                .bare(&item.bare, &["worktree", "add", &child_arg, &branch])?;
         } else if has(format!("refs/remotes/origin/{branch}"))? {
             let upstream = format!("origin/{branch}");
-            git::bare(
+            self.git.bare(
                 &item.bare,
                 &[
                     "worktree", "add", "-b", &branch, "--track", &child_arg, &upstream,
@@ -604,7 +657,7 @@ impl Workspace {
             )?;
         } else {
             let start = format!("origin/{default}");
-            git::bare(
+            self.git.bare(
                 &item.bare,
                 &["worktree", "add", "-b", &branch, &child_arg, &start],
             )?;
@@ -616,7 +669,7 @@ impl Workspace {
             bare: item.bare.clone(),
             path: child.clone(),
             branch,
-            base: git::tree(&child, &["rev-parse", "HEAD"])?,
+            base: self.git.tree(&child, &["rev-parse", "HEAD"])?,
         };
         manifest.repos.insert(item.repo.clone(), info.clone());
         Self::save_manifest(session, &manifest)?;
@@ -648,8 +701,9 @@ impl Workspace {
                 if let Ok(partial) = Self::load_manifest(&session) {
                     for info in partial.repos.values() {
                         let path = info.path.to_string_lossy().to_string();
-                        let _ =
-                            git::try_bare(&info.bare, &["worktree", "remove", "--force", &path]);
+                        let _ = self
+                            .git
+                            .try_bare(&info.bare, &["worktree", "remove", "--force", &path]);
                     }
                 }
                 let _ = fs::remove_dir_all(&session);
@@ -664,9 +718,11 @@ impl Workspace {
         // The daemon asks this on a schedule, beside an agent that is using
         // the same worktree. Without the optional lock, asking never makes
         // the agent's own `git add` or `git commit` find the index locked.
-        let status = git::tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
+        let status = self
+            .git
+            .tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
         let uncommitted = !status.is_empty();
-        let upstream = git::try_tree(
+        let upstream = self.git.try_tree(
             child,
             &[
                 "rev-parse",
@@ -676,7 +732,9 @@ impl Workspace {
             ],
         )?;
         if upstream.ok && !upstream.stdout.is_empty() {
-            let ahead = git::tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?;
+            let ahead = self
+                .git
+                .tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?;
             return Ok(Unsaved {
                 uncommitted,
                 unpushed: count(&ahead)?,
@@ -684,14 +742,18 @@ impl Workspace {
             });
         }
         let mut unpushed = 0;
-        if git::tree(child, &["branch", "-r", "--contains", "HEAD"])?.is_empty() {
-            let common = git::tree(
+        if self
+            .git
+            .tree(child, &["branch", "-r", "--contains", "HEAD"])?
+            .is_empty()
+        {
+            let common = self.git.tree(
                 child,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )?;
-            let head = git::tree(child, &["rev-parse", "HEAD"])?;
+            let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
             if !self.merged(Path::new(&common), &head) {
-                let alone = git::tree(
+                let alone = self.git.tree(
                     child,
                     &["rev-list", "--count", "HEAD", "--not", "--remotes"],
                 )?;
@@ -712,7 +774,7 @@ impl Workspace {
     }
 
     fn merged(&self, bare: &Path, sha: &str) -> bool {
-        let remote = Self::remote_url(bare);
+        let remote = self.remote_url(bare);
         let ask = || {
             github::merged(
                 &self.config.github_api,
@@ -767,15 +829,21 @@ impl Workspace {
                 args.push("--force");
             }
             args.push(&path);
-            git::bare(&info.bare, &args)?;
+            self.git.bare(&info.bare, &args)?;
         }
         // Delete the local branch only when its tip is on a remote branch or was merged.
         let reference = format!("refs/heads/{}", info.branch);
-        let tip = git::try_bare(&info.bare, &["rev-parse", "-q", "--verify", &reference])?;
+        let tip = self
+            .git
+            .try_bare(&info.bare, &["rev-parse", "-q", "--verify", &reference])?;
         if tip.ok {
-            let contains = git::try_bare(&info.bare, &["branch", "-r", "--contains", &tip.stdout])?;
+            let contains = self
+                .git
+                .try_bare(&info.bare, &["branch", "-r", "--contains", &tip.stdout])?;
             if !contains.stdout.is_empty() || self.merged(&info.bare, &tip.stdout) {
-                let _ = git::try_bare(&info.bare, &["branch", "-D", &info.branch]);
+                let _ = self
+                    .git
+                    .try_bare(&info.bare, &["branch", "-D", &info.branch]);
             }
         }
         Ok(())
@@ -823,7 +891,7 @@ impl Workspace {
         }
         for info in manifest.repos.values() {
             if self.holds_only_its_own(&info.bare) {
-                let _ = git::try_bare(&info.bare, &["worktree", "prune"]);
+                let _ = self.git.try_bare(&info.bare, &["worktree", "prune"]);
             }
         }
         fs::remove_dir_all(session)?;
@@ -836,9 +904,13 @@ impl Workspace {
         for (name, info) in &manifest.repos {
             let mut entry = serde_json::to_value(info)?;
             if info.path.exists() {
-                entry["dirty"] =
-                    json!(!git::tree(&info.path, &["status", "--porcelain"])?.is_empty());
-                entry["head"] = json!(git::tree(&info.path, &["rev-parse", "--short", "HEAD"])?);
+                entry["dirty"] = json!(!self
+                    .git
+                    .tree(&info.path, &["status", "--porcelain"])?
+                    .is_empty());
+                entry["head"] = json!(self
+                    .git
+                    .tree(&info.path, &["rev-parse", "--short", "HEAD"])?);
                 entry["unsafe_reasons"] = json!(self.unsafe_reasons(&info.path)?);
             } else {
                 entry["missing"] = json!(true);
@@ -872,7 +944,7 @@ impl Workspace {
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         if self.inside_sessions(&cwd) {
             // A worktree requested from inside a session: a sibling checkout of that repo.
-            let top = PathBuf::from(git::tree(&cwd, &["rev-parse", "--show-toplevel"])?);
+            let top = PathBuf::from(self.git.tree(&cwd, &["rev-parse", "--show-toplevel"])?);
             let root = self.find_session_root(&cwd)?;
             let leaf = top
                 .file_name()
@@ -880,13 +952,13 @@ impl Workspace {
                 .unwrap_or_default();
             let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
             fs::create_dir_all(target.parent().unwrap_or(&root))?;
-            let common = git::tree(
+            let common = self.git.tree(
                 &cwd,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )?;
             let branch = format!("{}/{name}", self.config.branch_prefix);
             let target_arg = target.to_string_lossy().to_string();
-            git::bare(
+            self.git.bare(
                 Path::new(&common),
                 &["worktree", "add", "-b", &branch, &target_arg, "HEAD"],
             )?;
@@ -921,12 +993,13 @@ impl Workspace {
                 reasons.join("; ")
             );
         }
-        let common = git::tree(
+        let common = self.git.tree(
             &path,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
         let path_arg = path.to_string_lossy().to_string();
-        git::bare(Path::new(&common), &["worktree", "remove", &path_arg])?;
+        self.git
+            .bare(Path::new(&common), &["worktree", "remove", &path_arg])?;
         Ok(())
     }
 }

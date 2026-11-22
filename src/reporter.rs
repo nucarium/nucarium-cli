@@ -65,6 +65,56 @@ pub struct Nucleus {
     /// nucleus: its unsaved work is counted, and it is never snapshotted.
     #[serde(default)]
     pub driver: bool,
+    /// The repos the daemon would not run git in at this count, by name,
+    /// each with a fixed word for why. When enforcing, any of them makes
+    /// `unsaved` unknown. Shown on the box only; a heartbeat does not carry
+    /// it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<RefusedRepo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedRepo {
+    pub repo: String,
+    pub reason: git::Reason,
+}
+
+/// What one count found: the numbers, the repos that were refused, and
+/// whether a refusal left something out.
+#[derive(Default)]
+struct Tally {
+    counted: Counted,
+    refused: Vec<RefusedRepo>,
+    left_out: bool,
+}
+
+impl Tally {
+    /// Note a refusal, once per repo. True when git is not to be run there:
+    /// what it holds is then not known, and neither is the count.
+    fn refuses(&mut self, git: &git::Git, refused: Option<git::Refused>) -> bool {
+        let Some(refused) = refused else {
+            return false;
+        };
+        if !self.refused.iter().any(|seen| seen.repo == refused.repo) {
+            self.refused.push(RefusedRepo {
+                repo: refused.repo,
+                reason: refused.reason,
+            });
+        }
+        self.left_out |= git.enforcing();
+        git.enforcing()
+    }
+
+    /// The count, when nothing was left out of it.
+    fn finish(self, read: Option<()>) -> (Option<Counted>, Vec<RefusedRepo>) {
+        let counted = read.filter(|_| !self.left_out).map(|_| self.counted);
+        (counted, self.refused)
+    }
+
+    fn add(&mut self, unsaved: crate::workspace::Unsaved) {
+        self.counted.uncommitted_repos += u64::from(unsaved.uncommitted);
+        self.counted.unpushed_commits += u64::from(unsaved.unpushed);
+    }
 }
 
 /// What `unsaved.json` holds: the last count, for the heartbeat to read.
@@ -156,16 +206,18 @@ fn commit_id(text: &str) -> bool {
 
 /// How many commits a session made in one repo: those on its branch since
 /// the commit its worktree started from.
-fn commits_made(info: &RepoInfo) -> Option<u32> {
+fn commits_made(workspace: &Workspace, info: &RepoInfo) -> Option<u32> {
     if !commit_id(&info.base) {
         return None;
     }
-    let made = git::try_tree(
-        &info.path,
-        &["rev-list", "--count", &format!("{}..HEAD", info.base)],
-    )
-    .ok()
-    .filter(|out| out.ok)?;
+    let made = workspace
+        .git()
+        .try_tree(
+            &info.path,
+            &["rev-list", "--count", &format!("{}..HEAD", info.base)],
+        )
+        .ok()
+        .filter(|out| out.ok)?;
     made.stdout.parse().ok()
 }
 
@@ -176,7 +228,9 @@ fn open_pulls(workspace: &Workspace, info: &RepoInfo, made: Option<u32>) -> Opti
     if made == Some(0) {
         return Some(Vec::new());
     }
-    let on_remote = git::try_tree(&info.path, &["branch", "-r", "--contains", "HEAD"])
+    let on_remote = workspace
+        .git()
+        .try_tree(&info.path, &["branch", "-r", "--contains", "HEAD"])
         .ok()
         .filter(|out| out.ok)?;
     // A pull request's head is a commit GitHub has. One that is on no remote
@@ -187,10 +241,13 @@ fn open_pulls(workspace: &Workspace, info: &RepoInfo, made: Option<u32>) -> Opti
     if on_remote.stdout.is_empty() {
         return None;
     }
-    let head = git::tree(&info.path, &["rev-parse", "HEAD"]).ok()?;
+    let head = workspace
+        .git()
+        .tree(&info.path, &["rev-parse", "HEAD"])
+        .ok()?;
     github::open_pulls(
         workspace.github_api(),
-        &Workspace::remote_url(&info.bare),
+        &workspace.remote_url(&info.bare),
         &head,
         workspace.github_token_file(),
     )
@@ -217,7 +274,7 @@ impl Reporter {
     }
 
     fn workspace(&self, settings: &Settings, environment: &Environment) -> Workspace {
-        let workspace = housekeeping::workspace(environment)
+        let workspace = housekeeping::workspace(settings, environment)
             .remembering_merges(settings.state_dir.join("merged.json"));
         match &self.github {
             Some(url) => workspace.asking_github_at(url),
@@ -232,29 +289,50 @@ impl Reporter {
         self.count_if_due(settings, now);
     }
 
-    fn count_nucleus(&self, settings: &Settings, environment: &Environment) -> Option<Counted> {
+    /// The unsaved work in one nucleus, or nothing when a worktree could not
+    /// be read, and the repos that were refused. When enforcing, git is not
+    /// run in a refused repo or a refused worktree of one, and the count is
+    /// then not known: a number that left them out would read as all there
+    /// is. The other repos are still looked at, for the refusals they hold.
+    fn count_nucleus(
+        &self,
+        settings: &Settings,
+        environment: &Environment,
+    ) -> (Option<Counted>, Vec<RefusedRepo>) {
+        let mut tally = Tally::default();
         if !environment.root.is_dir() {
-            return None;
+            return (None, tally.refused);
         }
         let workspace = self
             .workspace(settings, environment)
             .leaving_alone(driver::protected_roots(settings));
-        let mut counted = Counted::default();
-        for item in workspace.available().ok()? {
-            for worktree in Workspace::worktrees(&item.bare).ok()? {
-                // A worktree in a driver's own folders is counted once,
-                // under the driver. Any other worktree of the nucleus's
-                // repos is counted here, the nucleus's own or not: counting
-                // only reads.
-                if !worktree.is_dir() || workspace.under_a_driver(&worktree) {
+        let git = workspace.git();
+        let counted = (|| -> Option<()> {
+            for item in workspace.available().ok()? {
+                if tally.refuses(git, git.vet_bare(&item.bare)) {
                     continue;
                 }
-                let unsaved = workspace.unsaved(&worktree).ok()?;
-                counted.uncommitted_repos += u64::from(unsaved.uncommitted);
-                counted.unpushed_commits += u64::from(unsaved.unpushed);
+                for worktree in workspace.worktrees(&item.bare).ok()? {
+                    // A worktree in a driver's own folders is counted once,
+                    // under the driver. Any other worktree of the nucleus's
+                    // repos is counted here, the nucleus's own or not:
+                    // counting only reads.
+                    if !worktree.is_dir() || workspace.under_a_driver(&worktree) {
+                        continue;
+                    }
+                    let refused = git.vet_tree(&worktree).map(|refused| git::Refused {
+                        repo: item.repo.clone(),
+                        ..refused
+                    });
+                    if tally.refuses(git, refused) {
+                        continue;
+                    }
+                    tally.add(workspace.unsaved(&worktree).ok()?);
+                }
             }
-        }
-        Some(counted)
+            Some(())
+        })();
+        tally.finish(counted)
     }
 
     /// The unsaved work in the worktrees a driver owns, by the same rule as
@@ -262,9 +340,18 @@ impl Reporter {
     /// [`Workspace::unsaved`] says what each holds. It only reads them.
     /// Nothing when a folder cannot be read, or while the driver itself
     /// lists a worktree that is in none of them.
-    fn count_driver(&self, settings: &Settings, environment: &Environment) -> Option<Counted> {
-        let adapter = environment.driver_adapter()?;
-        let worktrees = adapter.worktrees(environment)?;
+    fn count_driver(
+        &self,
+        settings: &Settings,
+        environment: &Environment,
+    ) -> (Option<Counted>, Vec<RefusedRepo>) {
+        let mut tally = Tally::default();
+        let Some(adapter) = environment.driver_adapter() else {
+            return (None, tally.refused);
+        };
+        let Some(worktrees) = adapter.worktrees(environment) else {
+            return (None, tally.refused);
+        };
         // The driver's own last answer listed a worktree that looking in
         // its folders does not find. A number that leaves it out would read
         // as all there is, so there is none until its folder is named.
@@ -272,16 +359,20 @@ impl Reporter {
             .filter(|memory| memory.driver == adapter.name())
             .is_some_and(|memory| memory.uncounted_worktrees > 0);
         if left_out {
-            return None;
+            return (None, tally.refused);
         }
         let workspace = self.workspace(settings, environment);
-        let mut counted = Counted::default();
-        for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
-            let unsaved = workspace.unsaved(worktree).ok()?;
-            counted.uncommitted_repos += u64::from(unsaved.uncommitted);
-            counted.unpushed_commits += u64::from(unsaved.unpushed);
-        }
-        Some(counted)
+        let git = workspace.git();
+        let counted = (|| -> Option<()> {
+            for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
+                if tally.refuses(git, git.vet_tree(worktree)) {
+                    continue;
+                }
+                tally.add(workspace.unsaved(worktree).ok()?);
+            }
+            Some(())
+        })();
+        tally.finish(counted)
     }
 
     /// Count every nucleus now, each once however many environments share
@@ -292,24 +383,32 @@ impl Reporter {
             .environments
             .iter()
             .filter(|environment| environment.driver_owns_worktrees())
-            .map(|environment| Nucleus {
-                environments: vec![environment.name.clone()],
-                unsaved: self.count_driver(settings, environment),
-                last_snapshot_ms: None,
-                driver: true,
+            .map(|environment| {
+                let (unsaved, refused) = self.count_driver(settings, environment);
+                Nucleus {
+                    environments: vec![environment.name.clone()],
+                    unsaved,
+                    last_snapshot_ms: None,
+                    driver: true,
+                    refused,
+                }
             });
         let nuclei = housekeeping::one_per_nucleus(settings)
             .into_iter()
-            .map(|environment| Nucleus {
-                environments: housekeeping::sharing_nucleus(settings, environment),
-                unsaved: self.count_nucleus(settings, environment),
-                // Housekeeping runs a nucleus's jobs under the first of the
-                // environments that share it, which is this one.
-                last_snapshot_ms: ledger
-                    .get(&format!("{}/snapshot", environment.name))
-                    .and_then(|last| last.good_at_s)
-                    .map(|seconds| seconds.saturating_mul(1_000)),
-                driver: false,
+            .map(|environment| {
+                let (unsaved, refused) = self.count_nucleus(settings, environment);
+                Nucleus {
+                    environments: housekeeping::sharing_nucleus(settings, environment),
+                    unsaved,
+                    // Housekeeping runs a nucleus's jobs under the first of
+                    // the environments that share it, which is this one.
+                    last_snapshot_ms: ledger
+                        .get(&format!("{}/snapshot", environment.name))
+                        .and_then(|last| last.good_at_s)
+                        .map(|seconds| seconds.saturating_mul(1_000)),
+                    driver: false,
+                    refused,
+                }
             })
             .chain(owned)
             .collect();
@@ -395,7 +494,7 @@ impl Reporter {
         let mut unsaved = Some((0u32, 0u32));
         let mut pulls = Some(Vec::new());
         for info in manifest.repos.values().filter(|info| info.path.is_dir()) {
-            let made = commits_made(info);
+            let made = commits_made(&workspace, info);
             commits = commits
                 .zip(made)
                 .map(|(sum, made)| sum.saturating_add(made));
@@ -531,6 +630,7 @@ mod tests {
                     }),
                     last_snapshot_ms: None,
                     driver: false,
+                    refused: Vec::new(),
                 },
                 Nucleus {
                     environments: vec!["ops".into()],
