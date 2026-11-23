@@ -12,6 +12,11 @@ pub struct Output {
     pub stderr: String,
 }
 
+/// Git may never ask for anything: nothing answers it. A fetch that needs
+/// credentials git cannot find fails at once, rather than waiting at a
+/// prompt on whatever terminal the session that ran it holds.
+const NO_PROMPT: (&str, &str) = ("GIT_TERMINAL_PROMPT", "0");
+
 /// Run git and return its result whether or not it succeeded.
 pub fn try_git<I, S>(args: I) -> Result<Output>
 where
@@ -19,6 +24,7 @@ where
     S: AsRef<OsStr>,
 {
     let out = Command::new("git")
+        .env(NO_PROMPT.0, NO_PROMPT.1)
         .args(args)
         .output()
         .context("running git (is it installed?)")?;
@@ -79,6 +85,7 @@ pub fn tree_raw(
     envs: &[(&str, &OsStr)],
 ) -> Result<(bool, Vec<u8>, String)> {
     let out = Command::new("git")
+        .env(NO_PROMPT.0, NO_PROMPT.1)
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -368,7 +375,8 @@ impl Guarded {
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_ATTR_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", &self.global);
+            .env("GIT_CONFIG_GLOBAL", &self.global)
+            .env(NO_PROMPT.0, NO_PROMPT.1);
         command
     }
 
@@ -710,7 +718,42 @@ impl Git {
 
 #[cfg(test)]
 mod tests {
-    use super::allowed;
+    use super::{allowed, Git, Guarded, Vetting};
+
+    /// A server that asks for credentials on every request.
+    fn asks_for_credentials() -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/octo/web.git", server.server_addr());
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let header =
+                    tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"web\"")
+                        .unwrap();
+                let _ = request.respond(tiny_http::Response::empty(401).with_header(header));
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn a_fetch_that_needs_credentials_fails_at_once_without_prompting() {
+        let url = asks_for_credentials();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("web.git");
+        for git in [
+            Git::Plain,
+            Git::Guarded(Guarded::new(None, Vetting::Enforce).quiet()),
+        ] {
+            git.init_bare(&repo).unwrap();
+            let out = git.try_bare(&repo, &["ls-remote", &url]).unwrap();
+            assert!(!out.ok, "{git:?}");
+            assert!(
+                out.stderr.contains("terminal prompts disabled"),
+                "{git:?}: {}",
+                out.stderr
+            );
+        }
+    }
 
     #[test]
     fn the_keys_a_clone_and_its_worktrees_write_are_allowed() {
