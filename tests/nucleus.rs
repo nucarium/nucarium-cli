@@ -4,6 +4,7 @@ mod common;
 
 use common::{git, run, stderr, stdout_json, Home, Rig};
 use std::fs;
+use std::path::PathBuf;
 
 #[test]
 fn init_creates_a_nucleus_and_names_it_in_the_config() {
@@ -196,4 +197,27 @@ fn clone_refuses_a_repo_that_is_already_there_or_cannot_be_named() {
     );
     assert_eq!(unnamed.status.code(), Some(1));
     assert!(stderr(&unnamed).contains("--name"));
+}
+
+#[test]
+fn a_worktree_asked_for_inside_a_session_is_made_and_removed_by_the_hooks() {
+    // A repo made by `nucleate clone` holds no local branch until a session
+    // makes one.
+    let rig = Rig::new();
+    let checkout = rig.session("s1");
+    let payload = serde_json::json!({ "name": "helper", "cwd": checkout }).to_string();
+    let out = run(rig.nucleate().arg("hook-create"), &payload);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let sibling = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(
+        sibling,
+        rig.root.join(".worktrees/s1/.subworktrees/helper-web")
+    );
+    assert!(sibling.join("README.md").is_file());
+
+    let payload = serde_json::json!({ "worktree_path": sibling }).to_string();
+    let out = run(rig.nucleate().arg("hook-remove"), &payload);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!sibling.exists());
+    assert!(checkout.join("README.md").is_file());
 }

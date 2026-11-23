@@ -961,7 +961,8 @@ impl Workspace {
         };
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         if self.inside_sessions(&cwd) {
-            // A worktree requested from inside a session: a sibling checkout of that repo.
+            // A worktree requested from inside a session: a sibling checkout
+            // of that repo, at the commit checked out where it was asked for.
             let root = self.find_session_root(&cwd)?;
             let top = Self::worktree_top(&cwd, &root)?;
             let leaf = top
@@ -972,13 +973,17 @@ impl Workspace {
                 &top,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )?;
+            // Not the bare repo's `HEAD`: in a repo `nucleate clone` made it
+            // names a branch that does not exist, and in any other a branch
+            // the session is not on.
+            let start = self.git.tree(&top, &["rev-parse", "HEAD"])?;
             let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
             fs::create_dir_all(target.parent().unwrap_or(&root))?;
             let branch = format!("{}/{name}", self.config.branch_prefix);
             let target_arg = target.to_string_lossy().to_string();
             self.git.bare(
                 Path::new(&common),
-                &["worktree", "add", "-b", &branch, &target_arg, "HEAD"],
+                &["worktree", "add", "-b", &branch, &target_arg, &start],
             )?;
             return Ok(target);
         }
