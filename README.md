@@ -1163,12 +1163,15 @@ records of a repo that holds one. See [Drivers](#drivers).
 
 ### Git in session repos
 
-The daemon runs git on the host, as the agent user, in bare repos and
-worktrees that agent sessions can write. A repo's own config can name a
-program for git to run (`core.fsmonitor`, `core.sshCommand`, a filter's
-`clean`, an `include.path` that brings in more of the same), and a worktree's
-`.git` file or a `worktrees/*/commondir` can send git to another repo whose
-config does. So the daemon checks a repo before every git call it makes there:
+`nucleate` and the daemon run git on the host, as the agent user, in bare
+repos and worktrees that agent sessions can write: `nucleate` from Claude
+Code's worktree hooks, its MCP server and the commands you run, the daemon on
+its own schedule. A repo's own config can name a program for git to run
+(`core.fsmonitor`, `core.sshCommand`, a filter's `clean`, a
+`credential.helper`, an `include.path` that brings in more of the same), and a
+worktree's `.git` file or a `worktrees/*/commondir` can send git to another
+repo whose config does. So both check a repo before every git call they make
+there:
 
 - It reads the repo's `config`, and a worktree's `config.worktree`, with git's
   own parser and no includes, and refuses the repo unless every key is one of
@@ -1179,7 +1182,9 @@ config does. So the daemon checks a repo before every git call it makes there:
   `branch.<name>.vscode-merge-base`, `extensions.worktreeConfig`, and any
   `gc.<key>` set to a number. These are what `git clone`, `git worktree add`
   and `nucleate` write, and the branch keys `nucleate hook-create` adds for
-  each session.
+  each session. A repo's `credential.*` and `url.*.insteadOf` are not on the
+  list: a fetch uses the agent user's own credential helper and rewrites, from
+  the global config below, and never a repo's.
 - It refuses a worktree with no `.git` of its own, or one whose `.git`, or
   whose `commondir`, leads outside the nucleus's `.repos/`, or nowhere. It
   then hands git a worktree's folders as it checked them, so a worktree's
@@ -1197,7 +1202,15 @@ config does. So the daemon checks a repo before every git call it makes there:
   `core.attributesFile=/dev/null` and `diff.ignoreSubmodules=all` on the
   command line, where they win over anything in a repo. That is why `core.hooksPath` may be set: it does nothing.
 
-A refused repo is skipped. The daemon logs it once, by name, in one fixed
+`nucleate` always enforces the check; `vetting` in the daemon's config does
+not change it. A command that would run git in a refused repo fails with
+`refused repo <name>: <why>` and changes nothing: `create-session`, `add` and
+the MCP server's `add_repo` make no worktree, `hook-create` fails so that
+Claude Code shows the session why and starts no worktree, and `hook-remove`,
+`remove`, `remove-session` and `status` leave the session as it is. `refresh`
+reports the repo as `refused`, as the daemon's job does, and exits 1.
+
+A refused repo is skipped by the daemon. It logs it once, by name, in one fixed
 sentence that quotes nothing from its config, and logs it again only if it is
 refused again after passing. `refresh` and `snapshot` report it as `refused`
 with one word for why (`config`, `pointer`, `submodule` or `unreadable`), which counts as a
@@ -1216,7 +1229,7 @@ either way.
 **Checking a box before enforcing.** A repo set up by hand or by another tool
 may hold a key that is not on the list (`submodule.*`, `pull.rebase`, `lfs.*`,
 a `core.hooksPath` set by husky alongside something else). To find out without
-refusing anything:
+the daemon refusing anything (`nucleate` refuses such a repo either way):
 
 1. Set `vetting = "report"` in `[git]` and restart the daemon:
    `systemctl --user restart nucleated`.
