@@ -336,6 +336,39 @@ fn the_create_hook_prints_only_the_new_session_path() {
 }
 
 #[test]
+fn the_create_hook_inside_a_session_checks_out_a_sibling_at_the_sessions_commit() {
+    let f = Fixture::new();
+    let checkout = f.session_with_demo("s1").join("demo");
+    fs::write(checkout.join("work.txt"), "work\n").unwrap();
+    f.git(&checkout, &["add", "."]);
+    f.git(&checkout, &["commit", "-q", "-m", "work"]);
+    let inside = checkout.join("src");
+    fs::create_dir_all(&inside).unwrap();
+
+    let payload = format!(r#"{{"name":"helper","cwd":"{}"}}"#, inside.display());
+    let out = f.with_stdin(&f.root, &["hook-create"], &payload);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sibling = f.session("s1").join(".subworktrees").join("helper-demo");
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()),
+        sibling
+    );
+    assert!(sibling.join("work.txt").is_file());
+    assert_eq!(
+        f.git(&sibling, &["rev-parse", "HEAD"]),
+        f.git(&checkout, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        f.git(&sibling, &["branch", "--show-current"]),
+        "workspace/helper"
+    );
+}
+
+#[test]
 fn the_remove_hook_leaves_a_session_with_unsaved_work() {
     let f = Fixture::new();
     let session = f.session_with_demo("s1");
