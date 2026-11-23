@@ -1,5 +1,5 @@
-//! Thin wrappers around the `git` command line, and the guarded way the
-//! daemon runs it.
+//! Thin wrappers around the `git` command line, and the guarded way
+//! `nucleate` and the daemon run it.
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
@@ -92,14 +92,16 @@ pub fn tree_raw(
     ))
 }
 
-// ---- the daemon's git -----------------------------------------------------
+// ---- the guarded git -------------------------------------------------------
 //
-// The daemon runs git on the host, as the agent user, in bare repos and
-// worktrees that agent sessions can write. A repository's own config can
+// `nucleate` and the daemon run git on the host, as the agent user, in bare
+// repos and worktrees that agent sessions can write: `nucleate` from Claude
+// Code's worktree hooks and from the commands a person runs, the daemon on
+// its own schedule. Both run it the same way. A repository's own config can
 // name programs for git to run (`core.fsmonitor`, `core.sshCommand`, a
 // filter's `clean`, an `include.path` that brings in more), and a worktree's
 // `.git` file or a `commondir` can point git at another repository whose
-// config does. So before the daemon runs git in a repository it reads that
+// config does. So before either runs git in a repository it reads that
 // repository's config with git's own parser, following no includes, and
 // refuses it unless every key is one it knows to name no program. It checks
 // that every pointer leads into the nucleus's `.repos`. And it runs git with
@@ -107,7 +109,7 @@ pub fn tree_raw(
 // hooks, the file-system monitor and an attributes file switched off.
 
 /// Keys of a repository's config that name no program and change nothing
-/// the daemon relies on. Section and key are compared without case, as git
+/// either relies on. Section and key are compared without case, as git
 /// compares them; `*` is a subsection, which must be there.
 const ALLOWED: [(&str, bool, &str); 12] = [
     ("core", false, "repositoryformatversion"),
@@ -147,7 +149,7 @@ const ENTER_SUBMODULES: [&str; 2] = ["status", "add"];
 const MAX_LISTING: u64 = 256 * 1024 * 1024;
 const LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Variables of the daemon's own environment that would point git at
+/// Variables of the caller's own environment that would point git at
 /// another repository or bring in config of their own.
 const INHERITED: [&str; 11] = [
     "GIT_DIR",
@@ -232,7 +234,7 @@ impl Reason {
 
     fn sentence(self) -> &'static str {
         match self {
-            Reason::Config => "its git config sets a key nucleated does not allow",
+            Reason::Config => "its git config sets a key Nucarium does not allow",
             Reason::Pointer => "a git pointer in it leads outside the nucleus's repos",
             Reason::Unreadable => "its git config could not be read",
             Reason::Submodule => "it holds a submodule, whose own git config is not checked",
@@ -240,7 +242,7 @@ impl Reason {
     }
 }
 
-/// A repository the daemon does not run git in. The error a guarded call
+/// A repository git is not run in. The error a guarded call
 /// fails with; find it with [`refusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
@@ -279,10 +281,13 @@ struct Pinned {
     common: PathBuf,
 }
 
-/// The daemon's way of running git.
+/// The guarded way of running git.
 #[derive(Debug, Clone)]
 pub struct Guarded {
     global: PathBuf,
+    /// Whether a refusal is logged. The daemon logs it; `nucleate` fails
+    /// with it instead, and the error says the same.
+    logs: bool,
     /// Where every repository's git data must be: the nucleus's `.repos`.
     /// Nothing for the worktrees of a driver that owns them, which belong to
     /// repositories of the owner's choosing; their config is still vetted.
@@ -294,7 +299,7 @@ pub struct Guarded {
 static LOGGED: std::sync::Mutex<std::collections::BTreeSet<(PathBuf, Reason)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// The global config of the user the daemon runs as: the one its own
+/// The global config of the user git is run as: the one its own
 /// environment names, else `~/.gitconfig`, else git's XDG file, else none.
 fn own_global_config() -> PathBuf {
     if let Some(named) = std::env::var_os("GIT_CONFIG_GLOBAL").filter(|v| !v.is_empty()) {
@@ -343,9 +348,16 @@ impl Guarded {
     pub fn new(repos: Option<PathBuf>, vetting: Vetting) -> Guarded {
         Guarded {
             global: own_global_config(),
+            logs: true,
             repos,
             vetting,
         }
+    }
+
+    /// Log no refusal: the caller fails with it instead.
+    pub fn quiet(mut self) -> Guarded {
+        self.logs = false;
+        self
     }
 
     fn command(&self) -> Command {
@@ -487,6 +499,7 @@ impl Guarded {
         match outcome {
             Ok(_) if !full => {}
             Ok(_) => logged.retain(|(path, _)| path != key),
+            Err(_) if !self.logs => {}
             Err(refused) => {
                 if logged.insert((key.to_path_buf(), refused.reason)) {
                     match self.vetting {
@@ -568,10 +581,10 @@ impl Guarded {
     }
 }
 
-/// How a caller runs git: as the user would, or guarded, as the daemon does.
-#[derive(Debug, Clone, Default)]
+/// How a caller runs git: as the user would, or guarded, as `nucleate` and
+/// the daemon do.
+#[derive(Debug, Clone)]
 pub enum Git {
-    #[default]
     Plain,
     Guarded(Guarded),
 }
@@ -585,9 +598,14 @@ fn collect(command: &mut Command) -> Result<Output> {
     })
 }
 
-fn checked(out: Output, args: &[&str]) -> Result<String> {
+/// The output of a call that must succeed, or an error that names the
+/// repository it was run in, as [`git`] does.
+fn checked(out: Output, place: Option<(&str, &Path)>, args: &[&str]) -> Result<String> {
     if !out.ok {
-        bail!("git {} failed: {}", args.join(" "), out.stderr);
+        let place = place
+            .map(|(flag, dir)| format!("{flag} {} ", dir.display()))
+            .unwrap_or_default();
+        bail!("git {place}{} failed: {}", args.join(" "), out.stderr);
     }
     Ok(out.stdout)
 }
@@ -614,6 +632,26 @@ impl Git {
         }
     }
 
+    /// `git init --bare` a new repository at `dir`. Guarded, git is run from
+    /// `/`, so that no repository around the caller's folder is read, with
+    /// the caller's own global config and nothing else.
+    pub fn init_bare(&self, dir: &Path) -> Result<()> {
+        let shown = dir.to_string_lossy();
+        let args = ["init", "-q", "--bare", &shown];
+        match self {
+            Git::Plain => git(args).map(drop),
+            Git::Guarded(guarded) => {
+                let mut command = guarded.command();
+                command
+                    .current_dir("/")
+                    .args(OVERRIDES)
+                    .args(&args[..3])
+                    .arg(dir);
+                checked(collect(&mut command)?, None, &args).map(drop)
+            }
+        }
+    }
+
     pub fn try_bare(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_bare(dir, args),
@@ -624,7 +662,7 @@ impl Git {
     pub fn bare(&self, dir: &Path, args: &[&str]) -> Result<String> {
         match self {
             Git::Plain => bare(dir, args),
-            Git::Guarded(_) => checked(self.try_bare(dir, args)?, args),
+            Git::Guarded(_) => checked(self.try_bare(dir, args)?, Some(("--git-dir", dir)), args),
         }
     }
 
@@ -638,7 +676,7 @@ impl Git {
     pub fn tree(&self, dir: &Path, args: &[&str]) -> Result<String> {
         match self {
             Git::Plain => tree(dir, args),
-            Git::Guarded(_) => checked(self.try_tree(dir, args)?, args),
+            Git::Guarded(_) => checked(self.try_tree(dir, args)?, Some(("-C", dir)), args),
         }
     }
 

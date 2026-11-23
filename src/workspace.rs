@@ -59,8 +59,8 @@ pub struct Workspace {
     /// snapshotted or counted here. See [`Workspace::left_alone_because`]
     /// for the rule that does not depend on this list.
     protected: Vec<PathBuf>,
-    /// How git is run: as the user would, for `nucleate`, or guarded, for
-    /// the daemon.
+    /// How git is run: always guarded, in repositories vetted first. The
+    /// daemon chooses its own vetting mode; `nucleate` always enforces.
     git: git::Git,
 }
 
@@ -157,21 +157,28 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
 }
 
 impl Workspace {
+    /// A workspace that runs git as `nucleate` does: guarded, with every
+    /// repository's git data held to the nucleus's `.repos`, and a repository
+    /// that fails the check refused, the call failing with why.
     pub fn new(config: Config) -> Self {
         let root = config.root.clone();
+        let repos_dir = root.join(".repos");
+        let git = git::Git::Guarded(
+            git::Guarded::new(Some(repos_dir.clone()), git::Vetting::Enforce).quiet(),
+        );
         Workspace {
             config,
-            repos_dir: root.join(".repos"),
+            repos_dir,
             sessions_dir: root.join(".worktrees"),
             seeds_dir: root.join(".seeds"),
             merges: None,
             protected: Vec::new(),
-            git: git::Git::Plain,
+            git,
         }
     }
 
-    /// Run git the daemon's way: each repository vetted first, and nothing
-    /// a repository names run.
+    /// Run git the daemon's way: each repository vetted as its settings say,
+    /// and refusals logged.
     pub fn guarded(mut self, git: git::Git) -> Self {
         self.git = git;
         self
@@ -373,8 +380,7 @@ impl Workspace {
             _ => url.to_string(),
         };
         fs::create_dir_all(&self.repos_dir)?;
-        let bare_arg = bare.to_string_lossy().to_string();
-        git::git(["init", "-q", "--bare", &bare_arg])?;
+        self.git.init_bare(&bare)?;
         let fetched = self
             .git
             .bare(&bare, &["remote", "add", "origin", &source])
@@ -931,6 +937,18 @@ impl Workspace {
         serde_json::from_str(&text).context("parsing the hook payload on stdin")
     }
 
+    /// The worktree a folder inside a session is in: the nearest folder, up
+    /// to the session's own, with a `.git` of its own. Found here rather than
+    /// by asking git, which would be run in a folder no check has looked at.
+    fn worktree_top(start: &Path, session: &Path) -> Result<PathBuf> {
+        start
+            .ancestors()
+            .take_while(|dir| *dir != session)
+            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow!("not inside a repo of the session: {}", start.display()))
+    }
+
     /// `WorktreeCreate`: make the folder and return its path (the only thing printed).
     pub fn hook_create(&self, defaults: &[String]) -> Result<PathBuf> {
         let payload = Self::read_payload()?;
@@ -944,18 +962,18 @@ impl Workspace {
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         if self.inside_sessions(&cwd) {
             // A worktree requested from inside a session: a sibling checkout of that repo.
-            let top = PathBuf::from(self.git.tree(&cwd, &["rev-parse", "--show-toplevel"])?);
             let root = self.find_session_root(&cwd)?;
+            let top = Self::worktree_top(&cwd, &root)?;
             let leaf = top
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
-            fs::create_dir_all(target.parent().unwrap_or(&root))?;
             let common = self.git.tree(
-                &cwd,
+                &top,
                 &["rev-parse", "--path-format=absolute", "--git-common-dir"],
             )?;
+            let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
+            fs::create_dir_all(target.parent().unwrap_or(&root))?;
             let branch = format!("{}/{name}", self.config.branch_prefix);
             let target_arg = target.to_string_lossy().to_string();
             self.git.bare(

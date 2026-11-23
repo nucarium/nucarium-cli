@@ -403,6 +403,26 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// A program that records that it ran: it leaves the marker file, the
+/// second path returned. Called as a filter, with nothing on its command
+/// line, it passes its input through unchanged; called any other way, it
+/// fails at once.
+pub fn marker_program(home: &Home) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = home.dir.join("a-program-ran");
+    let program = home.dir.join("planted.sh");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\ntouch '{}'\n[ $# -eq 0 ] && exec cat\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (program, marker)
+}
+
 /// A box with one environment, `client-a`: an upstream repo, a nucleus made
 /// with `nucleate init` and `nucleate clone`, and a daemon config whose every
 /// path is inside the test's own folder.

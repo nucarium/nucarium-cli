@@ -16,27 +16,12 @@ use common::{git, run, stderr, stdout_json, Rig};
 use nucleate::reporter::Reporter;
 use serde_json::{json, Value};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-/// A program that records that it ran. Called as a filter, with nothing on
-/// its command line, it passes its input through unchanged; called any other
-/// way, it fails at once.
 fn marker_program(rig: &Rig) -> (PathBuf, PathBuf) {
-    let marker = rig.home.dir.join("a-program-ran");
-    let program = rig.home.dir.join("planted.sh");
-    fs::write(
-        &program,
-        format!(
-            "#!/bin/sh\ntouch '{}'\n[ $# -eq 0 ] && exec cat\nexit 1\n",
-            marker.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-    (program, marker)
+    common::marker_program(&rig.home)
 }
 
 fn bare(rig: &Rig) -> PathBuf {
