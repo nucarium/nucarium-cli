@@ -76,6 +76,10 @@ pub struct Limit {
 /// The last good reading for one environment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reading {
+    /// The login it was read for: [`login`] of the config folder. A reading
+    /// for another login than the environment has now is not its own.
+    #[serde(default)]
+    pub login: Option<String>,
     pub read_at_ms: u64,
     pub limits: Vec<Limit>,
 }
@@ -143,17 +147,35 @@ pub fn reads(environment: &Environment) -> bool {
         && environment.config_dir.is_some()
 }
 
+/// Which login a config folder is: a number made from its path, so the
+/// state folder never holds the path itself.
+pub fn login(config_dir: &Path) -> String {
+    crate::driver::folder_number(config_dir)
+}
+
+/// The login an environment's usage is read for, when it is read.
+fn login_of(environment: &Environment) -> Option<String> {
+    environment
+        .config_dir
+        .as_deref()
+        .filter(|_| reads(environment))
+        .map(login)
+}
+
 /// What a heartbeat says about an environment's plan usage: its last good
-/// reading, held to the shape Watch takes, or nothing.
+/// reading, held to the shape Watch takes, or nothing. A reading made for
+/// another login, before the environment's config folder changed, is not
+/// said.
 pub fn report(
     readings: Option<&Readings>,
     environment: &Environment,
     now: SystemTime,
 ) -> Option<crate::watch::UsageReport> {
-    if !reads(environment) {
-        return None;
-    }
-    let reading = readings?.environments.get(&environment.name)?;
+    let login = login_of(environment)?;
+    let reading = readings?
+        .environments
+        .get(&environment.name)
+        .filter(|reading| reading.login.as_ref() == Some(&login))?;
     Some(crate::watch::UsageReport::new(
         UNIX_EPOCH + Duration::from_millis(reading.read_at_ms),
         &reading.limits,
@@ -161,12 +183,13 @@ pub fn report(
     ))
 }
 
-/// `^[0-9A-Za-z .+-]{1,32}$`: a model's name and nothing longer.
+/// `^[0-9A-Za-z.+-]{1,32}$`: a model's name, with no space, and nothing
+/// longer. Watch holds no string with a space in it.
 fn valid_scope(scope: &str) -> bool {
     (1..=32).contains(&scope.len())
         && scope
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b' ' | b'.' | b'+' | b'-'))
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'+' | b'-'))
 }
 
 /// Hold limits to what Watch takes: a percentage from 0 to 100, a scope that
@@ -450,6 +473,7 @@ pub fn read_one(
     readings.environments.insert(
         environment.name.clone(),
         Reading {
+            login: Some(login(config_dir)),
             read_at_ms: unix_ms(now),
             limits,
         },
@@ -457,15 +481,17 @@ pub fn read_one(
     write_readings(state_dir, &readings).map_err(|_| Failure::NotKept)
 }
 
-/// Drop what was kept for an environment whose usage is no longer read.
-fn forget_others(state_dir: &Path, keep: &BTreeSet<&str>) {
+/// Drop what was kept for an environment whose usage is no longer read, or
+/// is now read for another login. `keep` is each environment read, and its
+/// login.
+fn forget_others(state_dir: &Path, keep: &BTreeMap<String, String>) {
     let Some(mut readings) = read_readings(state_dir) else {
         return;
     };
     let before = readings.environments.len();
     readings
         .environments
-        .retain(|name, _| keep.contains(name.as_str()));
+        .retain(|name, reading| keep.get(name) == reading.login.as_ref());
     if readings.environments.len() != before {
         let _ = write_readings(state_dir, &readings);
     }
@@ -492,7 +518,7 @@ pub fn run_schedule(config: &Path, stop: &AtomicBool) {
     let client = client();
     let mut due: BTreeMap<String, Instant> = BTreeMap::new();
     let mut said: BTreeMap<String, String> = BTreeMap::new();
-    let mut known: Option<BTreeSet<String>> = None;
+    let mut known: Option<BTreeMap<String, String>> = None;
     loop {
         if let Ok(settings) = settings::load_from(config) {
             let read: Vec<&Environment> = settings
@@ -544,11 +570,15 @@ pub fn run_schedule(config: &Path, stop: &AtomicBool) {
             let names: BTreeSet<&str> = read.iter().map(|e| e.name.as_str()).collect();
             due.retain(|name, _| names.contains(name.as_str()));
             said.retain(|name, _| names.contains(name.as_str()));
-            // Only when the environments read have changed: not every pass.
-            let owned: BTreeSet<String> = names.iter().map(|name| name.to_string()).collect();
-            if known.as_ref() != Some(&owned) {
-                forget_others(&settings.state_dir, &names);
-                known = Some(owned);
+            // Only when the environments read, or their logins, have
+            // changed: not every pass.
+            let logins: BTreeMap<String, String> = read
+                .iter()
+                .filter_map(|e| Some((e.name.clone(), login_of(e)?)))
+                .collect();
+            if known.as_ref() != Some(&logins) {
+                forget_others(&settings.state_dir, &logins);
+                known = Some(logins);
             }
         }
         // With nothing to read, there is nothing to be on time for.
@@ -683,11 +713,12 @@ mod tests {
             entry("Opus", json!(-4)),
             entry("Sonnet", Value::Null),
             entry("a model\nwith a sentence in it", json!(5)),
+            entry("Claude Fable", json!(5)),
             entry(&"x".repeat(33), json!(5)),
             json!({ "group": "daily", "percent": 50, "scope": { "model": { "display_name": "Haiku" } } }),
             json!({ "group": "weekly", "percent": 50, "scope": { "surface": "web" } }),
         ];
-        entries.extend((0..30).map(|n| entry(&format!("Model {n}"), json!(n))));
+        entries.extend((0..30).map(|n| entry(&format!("Model-{n}"), json!(n))));
         let body = json!({
             "seven_day": { "utilization": 101.5 },
             "seven_day_opus": { "utilization": 99 },
@@ -711,8 +742,10 @@ mod tests {
             limits[2],
             json!({ "window": "seven_day", "scope": "Opus", "used_pct": 0.0 })
         );
-        assert_eq!(limits[3]["scope"], "Model 0");
+        assert_eq!(limits[3]["scope"], "Model-0");
         assert!(limits.iter().all(|limit| limit["scope"] != "Sonnet"));
+        // A name with a space in it is dropped like any other that does not fit.
+        assert!(limits.iter().all(|limit| limit["scope"] != "Claude Fable"));
     }
 
     #[test]
@@ -835,6 +868,16 @@ mod tests {
         };
         assert_eq!(report(Some(&kept), &codex, later), None);
         assert!(!reads(&claude_env(None)));
+
+        // The environment's config folder now names another login: the old
+        // login's reading is not said for it, though the file still holds it.
+        let other = tempfile::tempdir().unwrap();
+        let moved = claude_env(Some(other.path()));
+        assert_eq!(report(Some(&kept), &moved, later), None);
+        // A reading kept with no login named is no one's.
+        let mut unnamed = kept.clone();
+        unnamed.environments.get_mut("client-a").unwrap().login = None;
+        assert_eq!(report(Some(&unnamed), &environment, later), None);
     }
 
     #[test]
@@ -921,9 +964,10 @@ mod tests {
     }
 
     #[test]
-    fn readings_for_environments_no_longer_read_are_forgotten() {
+    fn readings_for_environments_no_longer_read_or_for_another_login_are_forgotten() {
         let state = tempfile::tempdir().unwrap();
-        let reading = Reading {
+        let reading = |dir: &str| Reading {
+            login: Some(login(Path::new(dir))),
             read_at_ms: unix_ms(now()),
             limits: Vec::new(),
         };
@@ -931,15 +975,31 @@ mod tests {
             state.path(),
             &Readings {
                 environments: BTreeMap::from([
-                    ("client-a".to_string(), reading.clone()),
-                    ("gone".to_string(), reading),
+                    ("client-a".to_string(), reading("/home/agent/.claude-a")),
+                    ("client-b".to_string(), reading("/home/agent/.claude-b")),
+                    ("gone".to_string(), reading("/home/agent/.claude-gone")),
                 ]),
             },
         )
         .unwrap();
-        forget_others(state.path(), &BTreeSet::from(["client-a"]));
+        forget_others(
+            state.path(),
+            &BTreeMap::from([
+                (
+                    "client-a".to_string(),
+                    login(Path::new("/home/agent/.claude-a")),
+                ),
+                (
+                    "client-b".to_string(),
+                    login(Path::new("/home/agent/.claude-new")),
+                ),
+            ]),
+        );
         let kept = read_readings(state.path()).unwrap();
         assert_eq!(kept.environments.keys().collect::<Vec<_>>(), ["client-a"]);
+        // The path itself is never written down.
+        let text = fs::read_to_string(readings_file(state.path())).unwrap();
+        assert!(!text.contains(".claude"), "{text}");
     }
 
     #[test]

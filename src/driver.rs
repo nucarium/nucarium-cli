@@ -534,7 +534,7 @@ fn claims_dir(state_dir: &Path, driver_environment: &str) -> PathBuf {
 
 /// A number made from a folder's path, so that a claim can say where its
 /// hook's session works without the folder's name being written anywhere.
-fn folder_number(folder: &Path) -> String {
+pub(crate) fn folder_number(folder: &Path) -> String {
     // FNV-1a, written out so the hook and the daemon always agree.
     let hash = folder
         .as_os_str()

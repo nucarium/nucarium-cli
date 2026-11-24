@@ -1056,11 +1056,7 @@ pub mod contract {
                 limit,
                 "usage.limit",
                 "scope",
-                string(|v| {
-                    chars(v, 1, 32, |c| {
-                        c.is_ascii_alphanumeric() || " .+-".contains(c)
-                    })
-                }),
+                string(|v| chars(v, 1, 32, |c| c.is_ascii_alphanumeric() || ".+-".contains(c))),
             )?;
             field(limit, "usage.limit", "used_pct", number(0.0, 100.0))?;
             field(limit, "usage.limit", "resets_at", string(date_time))?;

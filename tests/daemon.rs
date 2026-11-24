@@ -390,7 +390,9 @@ fn plan_usage_is_the_last_good_reading_and_goes_only_to_a_watch_that_takes_it() 
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         state.join("usage.json"),
-        json!({ "environments": { "client-a": { "read_at_ms": read_at, "limits": [
+        json!({ "environments": { "client-a": {
+            "login": nucleate::usage::login(&config_dir),
+            "read_at_ms": read_at, "limits": [
             { "window": "five_hour", "used_pct": 23.0, "resets_at_ms": read_at + 7_200_000 },
             { "window": "seven_day", "scope": "Fable", "used_pct": 71.0 },
         ] } } })
