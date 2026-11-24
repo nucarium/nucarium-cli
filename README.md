@@ -296,7 +296,7 @@ if the box were not signed in.
 
 ## nucleated
 
-The daemon runs as the agent user, never as root. It does eleven things:
+The daemon runs as the agent user, never as root. It does twelve things:
 
 | Job | What it does |
 |---|---|
@@ -306,6 +306,7 @@ The daemon runs as the agent user, never as root. It does eleven things:
 | Drivers | For an environment watched through a driver, a tool you run and steer agents with, it asks the driver which agents it has and what each is doing, and reports them as sessions. It reads state and sends the driver no command. See [Drivers](#drivers). |
 | Config sync | With a repository of your own named in the config, it keeps each login's agent settings, instructions and skills at one pinned branch, and each heartbeat says which commit an environment is at. Off by default. See [Config sync](#config-sync). |
 | Environment setup | It reads what the box recipe set each environment up with, its repositories, network access, counts of variables and secrets, and how its setup script last ran, and each heartbeat says so. It writes nothing there and runs no script. See [Environment setup](#environment-setup). |
+| Plan usage | For each Claude Code login, every five minutes it asks the agent vendor how much of the plan is used, and each heartbeat says so. See [Plan usage](#plan-usage). |
 | Unsaved work and outcomes | It counts what exists only on the box, on a schedule, and when a session stops or ends it reports what the session left behind: commits made, work not saved, and the addresses of its open pull requests. See [Unsaved work and outcomes](#unsaved-work-and-outcomes). |
 | Housekeeping | Fetch and prune, remove sessions that are finished and hold nothing unsaved, and snapshot uncommitted work to a hidden ref. These call the same code as `nucleate`. |
 | Maintenance pause | `nucleated pause 2h` tells Watch to hold its alerts for this box going dark while you work on it. See [The maintenance pause](#the-maintenance-pause). |
@@ -503,6 +504,7 @@ and all mode 600:
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 | `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
 | `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `usage.json` | Per Claude Code environment, its last good plan usage reading: a number made from the config folder's path, for the login it was read for, when it was read, and per limit its window, the model it is for, a percentage and when it resets. No token. |
 | `config-sync.json` | Per environment: the commit its config was applied from, whether a synced file was changed by hand, one fixed word for how the sync stands, and two times. No address, branch, path or name. Only with `[config_sync]` set. |
 
 One folder is kept outside it, because it holds content: `~/.cache/nucleated/`
@@ -881,13 +883,42 @@ in `setup_problems` why anything was left out. `setup` goes only to a Watch
 that has said it takes it (see
 [Fields Watch has to ask for](#fields-watch-has-to-ask-for)).
 
+### Plan usage
+
+Each environment whose agent is Claude Code, with `config_dir` set and no
+driver, is one login on a Claude subscription. Every five minutes, the first
+time a little after the daemon starts and spread so the logins on a box are
+not all asked at once, the daemon reads that login's access token from
+`<config_dir>/.credentials.json` and asks
+`https://api.anthropic.com/api/oauth/usage` how much of each limit is used:
+the five-hour window, the weekly one, and any weekly limit on one model.
+
+This is an endpoint the vendor does not document, and it may change. The
+daemon reads the few fields it knows and passes over the rest; an answer it
+cannot read counts as a failed read. The token is used for that one request
+and nothing else: it is never refreshed, never logged and never written
+down, and nothing is ever written into the config folder. A token that has
+expired is left for Claude Code to refresh, and that round is skipped.
+
+A good reading is kept in `usage.json`, and survives a restart. A failed
+read changes nothing: the heartbeat goes on carrying the last good reading,
+with the time it was read, and the log says once, with the environment's
+name and a fixed word or an HTTP status, that the read failed. An
+environment that has never had a good reading says nothing.
+
+Each heartbeat then carries, per environment, a `usage` object: `read_at`,
+and `limits`, each with a `window` (`five_hour` or `seven_day`), a `scope`
+for a limit on one model, `used_pct` from 0 to 100, and `resets_at` once the
+window has started. `usage` goes only to a Watch that has said it takes it
+(see [Fields Watch has to ask for](#fields-watch-has-to-ask-for)).
+
 ### Fields Watch has to ask for
 
-Six fields of a heartbeat are newer than the contract every Watch holds:
-`driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`
-and `setup`. Watch refuses a heartbeat that carries a field it does not
+Seven fields of a heartbeat are newer than the contract every Watch holds:
+`driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`,
+`setup` and `usage`. Watch refuses a heartbeat that carries a field it does not
 name, and a refused heartbeat is a box gone dark, with every environment on
-it looking down and no event sent. So the daemon sends none of the six on a
+it looking down and no event sent. So the daemon sends none of the seven on a
 guess.
 
 - Every heartbeat carries what every Watch takes. Watch's answer to a
@@ -905,8 +936,8 @@ guess.
 Until the Watch you report to names them, an environment watched through a
 driver is reported like any other: its server, its sessions and their
 events, with no link into the driver, config sync runs on the box with
-nothing said of it to Watch, and an environment's setup is shown only by
-`nucleated status`.
+nothing said of it to Watch, and an environment's setup and plan usage are
+shown only by `nucleated status`.
 
 ### What leaves the box
 
@@ -932,6 +963,7 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, per environment | `server_restarts`, systemd's running count of restarts of the agent server's unit. `unsaved`: `uncommitted_repos`, `unpushed_commits` and `counted_at`, two numbers and a time. `last_snapshot_at`, when the snapshot job last finished for that nucleus with nothing failed. |
 | Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
 | Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
+| Heartbeat, per Claude Code environment with a good plan usage reading, to a Watch that names the field in `accepts` | `usage`: `read_at`, a timestamp, and `limits`, at most 16, each a `window`, one of two fixed words, a `scope`, a model's name of at most 32 letters, digits, `.`, `+` and `-`, with no space, `used_pct`, a number from 0 to 100, and `resets_at`, a timestamp. |
 | Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |
 | Heartbeat, per environment the box recipe set up, to a Watch that names the field in `accepts` | `setup`: `network`, one of three fixed words; `allowed_hosts`, `variables` and `secrets`, numbers; `repos`, each an `owner/name` or a `name`; and `script`, the setup script's last run: `state`, one of three fixed words, `started_at` and `finished_at`, timestamps, and `exit_code`, a number. |
 
@@ -972,12 +1004,13 @@ Never sent from an environment's setup: the setup script, its hash and its
 output, the names and values of its variables and secrets, the hosts it may
 reach, and the paths of the recipe's files.
 
-Two things leave the box for somewhere other than Watch, and neither goes to
+Three things leave the box for somewhere other than Watch, and none goes to
 Nucarium. The hourly snapshot pushes uncommitted work, which is code, to
 `refs/wip/<branch>` on the repository's own remote: your Git host, under your
-credentials. And with `[notify]` set, the box posts a machine name, an
-environment name and a time to the address you gave it, while it cannot reach
-Watch.
+credentials. The plan usage request carries a Claude Code login's own access
+token to the agent vendor, and nothing else. And with `[notify]` set, the box
+posts a machine name, an environment name and a time to the address you gave
+it, while it cannot reach Watch.
 
 `tests/privacy.rs` is the release gate for this. It feeds every hook event a
 payload with a sentinel string in every content-bearing field, in the working
