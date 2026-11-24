@@ -32,6 +32,18 @@ pub fn api_url() -> String {
         .unwrap_or_else(|| API_URL.to_string())
 }
 
+/// GitHub's git host for the API at `api`: github.com for GitHub's own, and
+/// the stand-in itself, scheme and address only, for one on this machine.
+pub fn git_origin(api: &str) -> String {
+    stand_in(api)
+        .and_then(|url| {
+            let (scheme, rest) = url.split_once("://")?;
+            let authority = rest.split('/').next()?;
+            Some(format!("{scheme}://{authority}"))
+        })
+        .unwrap_or_else(|| crate::git::GITHUB_ORIGIN.to_string())
+}
+
 /// Extract `(owner, repo)` from a GitHub remote URL, or `None` for any other remote.
 pub fn slug(url: &str) -> Option<(String, String)> {
     let rest = url.split("github.com").nth(1)?;
