@@ -175,12 +175,25 @@ impl Workspace {
             protected: Vec::new(),
             git,
         }
+        .signing_in()
     }
 
     /// Run git the daemon's way: each repository vetted as its settings say,
     /// and refusals logged.
     pub fn guarded(mut self, git: git::Git) -> Self {
         self.git = git;
+        self.signing_in()
+    }
+
+    /// Have git sign in to GitHub with the config's token file, when it
+    /// names one, in place of the user's own credential helper for GitHub.
+    fn signing_in(mut self) -> Self {
+        if let git::Git::Guarded(guarded) = self.git {
+            self.git = git::Git::Guarded(guarded.signing_in_to(
+                &github::git_origin(&self.config.github_api),
+                self.config.github_token_file.as_deref(),
+            ));
+        }
         self
     }
 
@@ -255,13 +268,13 @@ impl Workspace {
         self
     }
 
-    /// Ask a stand-in on this machine in place of GitHub. Any other address
-    /// is ignored.
+    /// Ask a stand-in on this machine in place of GitHub, for its API and
+    /// for the repositories git signs in to. Any other address is ignored.
     pub fn asking_github_at(mut self, url: &str) -> Self {
         if let Some(url) = github::stand_in(url) {
             self.config.github_api = url;
         }
-        self
+        self.signing_in()
     }
 
     pub fn github_api(&self) -> &str {

@@ -634,6 +634,63 @@ fn refresh_fetches_every_repo() {
 }
 
 #[test]
+fn refresh_signs_in_to_github_with_the_environments_token_file() {
+    let rig = Rig::new();
+    fs::write(rig.upstream.join("NEW.md"), "new\n").unwrap();
+    git(&rig.upstream, &["add", "."]);
+    git(&rig.upstream, &["commit", "-q", "-m", "more"]);
+    git(&rig.upstream, &["update-server-info"]);
+    // GitHub's stand-in takes `x-access-token` with this environment's token
+    // and nothing else.
+    let github = common::git_host(
+        &rig.upstream.join(".git"),
+        "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX2NsaWVudF9hX3Rva2Vu",
+    );
+    let bare = rig.root.join(".repos/web.git");
+    git(
+        &bare,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            &format!("{github}/octo/web.git"),
+        ],
+    );
+    let token_file = rig.home.dir.join("client-a-github-token");
+    fs::write(&token_file, "ghs_client_a_token\n").unwrap();
+    rig.configure_with(
+        &format!(
+            "check = \"true\"\ngithub_token_file = \"{}\"",
+            token_file.display()
+        ),
+        "",
+    );
+    // The box-wide helper signs in as another account.
+    fs::write(
+        rig.home.gitconfig(),
+        format!(
+            "[credential \"{github}\"]\n\thelper = \"!f() {{ echo username=x-access-token; \
+             echo password=ghs_another_accounts_token; }}; f\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = run(
+        rig.nucleated()
+            .env("NUCLEATE_GITHUB_API_URL", &github)
+            .args(["housekeeping", "run", "refresh"]),
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = &stdout_json(&out)[0];
+    assert_eq!(report["repos"], json!([{ "repo": "web", "ok": true }]));
+    assert_eq!(
+        git(&bare, &["rev-parse", "refs/remotes/origin/main"]),
+        git(&rig.upstream, &["rev-parse", "HEAD"])
+    );
+}
+
+#[test]
 fn snapshot_pushes_uncommitted_work_to_a_hidden_ref_and_touches_nothing() {
     let rig = Rig::new();
     let worktree = rig.session("fix-login");

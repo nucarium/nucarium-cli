@@ -135,8 +135,11 @@ config file, or the nearest folder above the current one that contains `.repos`.
 
 ```toml
 root = "/home/agent/work"
-# A file holding a GitHub token, for the merged-pull-request check on private
-# repositories. GH_TOKEN or GITHUB_TOKEN in the environment take precedence.
+# A file holding a GitHub token. Every git call nucleate makes signs in to
+# https://github.com with it, as x-access-token, in place of the user's own
+# credential helper for GitHub; the file is read each time git asks. The
+# merged-pull-request check on private repositories uses it too, where
+# GH_TOKEN or GITHUB_TOKEN in the environment take precedence.
 github_token_file = "/run/agent-tokens/github"
 # Session branches are named <branch_prefix>/<session>. Default: "workspace".
 branch_prefix = "workspace"
@@ -536,7 +539,10 @@ systemctl --user enable --now nucleated.service
 The agent user needs lingering (`loginctl enable-linger agent`) for the unit to
 start at boot. The daemon picks up a new token or a changed config file by
 itself; neither needs a restart. It runs `git` as the agent user, with that
-user's git credentials, for housekeeping and for the count of unsaved work.
+user's git credentials, for housekeeping and for the count of unsaved work. In
+an environment whose `github_token_file` names a file, its git signs in to
+GitHub with that file's token instead, so one box can host nuclei whose
+repositories belong to different GitHub accounts.
 
 ### Hooks
 
@@ -1184,7 +1190,9 @@ there:
   and `nucleate` write, and the branch keys `nucleate hook-create` adds for
   each session. A repo's `credential.*` and `url.*.insteadOf` are not on the
   list: a fetch uses the agent user's own credential helper and rewrites, from
-  the global config below, and never a repo's.
+  the global config below, and never a repo's. Where a `github_token_file` is
+  set, the helper for `https://github.com` is replaced on the command line by
+  one that reads that file; only the file's path is on the command line.
 - It refuses a worktree with no `.git` of its own, or one whose `.git`, or
   whose `commondir`, leads outside the nucleus's `.repos/`, or nowhere. It
   then hands git a worktree's folders as it checked them, so a worktree's

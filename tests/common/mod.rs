@@ -222,6 +222,41 @@ pub fn github(pulls: impl Fn(&str, &str) -> Reply + Send + 'static) -> Mock {
     })
 }
 
+/// A stand-in for GitHub's git host: it serves the repository whose git
+/// folder is `git_dir` as `/octo/web.git`, over git's dumb HTTP, to a client
+/// whose `Authorization` is `accepted`, and asks every other who it is.
+/// Returns its origin.
+pub fn git_host(git_dir: &Path, accepted: &str) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", server.server_addr());
+    let git_dir = git_dir.to_path_buf();
+    let accepted = accepted.to_string();
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let signed_in = request.headers().iter().any(|header| {
+                header.field.equiv("Authorization") && header.value.as_str() == accepted
+            });
+            if !signed_in {
+                let header =
+                    tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"web\"")
+                        .unwrap();
+                let _ = request.respond(tiny_http::Response::empty(401).with_header(header));
+                continue;
+            }
+            let path = request.url().split('?').next().unwrap_or_default();
+            let file = path
+                .strip_prefix("/octo/web.git/")
+                .filter(|rest| !rest.split('/').any(|part| part == ".."))
+                .and_then(|rest| std::fs::read(git_dir.join(rest)).ok());
+            let _ = match file {
+                Some(bytes) => request.respond(tiny_http::Response::from_data(bytes)),
+                None => request.respond(tiny_http::Response::empty(404)),
+            };
+        }
+    });
+    origin
+}
+
 /// A folder of stand-in programs, each a shell script, to go first on a
 /// command's `PATH`. Returns the `PATH` to use.
 pub fn path_with(home: &Home, programs: &[(&str, &str)]) -> std::ffi::OsString {

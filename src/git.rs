@@ -2,7 +2,7 @@
 //! `nucleate` and the daemon run it.
 
 use anyhow::{bail, Context, Result};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -113,7 +113,9 @@ pub fn tree_raw(
 // refuses it unless every key is one it knows to name no program. It checks
 // that every pointer leads into the nucleus's `.repos`. And it runs git with
 // nothing from the system's config or attributes, its own global config, and
-// hooks, the file-system monitor and an attributes file switched off.
+// hooks, the file-system monitor and an attributes file switched off. Where
+// the nucleus's config names a GitHub token file, git signs in to GitHub with
+// it, in place of whatever helper the global config names for GitHub.
 
 /// Keys of a repository's config that name no program and change nothing
 /// either relies on. Section and key are compared without case, as git
@@ -288,10 +290,68 @@ struct Pinned {
     common: PathBuf,
 }
 
+/// GitHub's git host, where its repositories are fetched from and pushed to.
+pub const GITHUB_ORIGIN: &str = "https://github.com";
+
+/// The token file git signs in to GitHub with.
+#[derive(Debug, Clone)]
+struct SignIn {
+    /// [`GITHUB_ORIGIN`], or a stand-in on this machine, for tests.
+    origin: String,
+    /// An absolute path: git runs the helper from the folder it is run in.
+    token_file: PathBuf,
+}
+
+/// A path quoted for `sh`, byte for byte.
+fn sh_quoted(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut quoted = vec![b'\''];
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b'\'' => quoted.extend_from_slice(b"'\\''"),
+            byte => quoted.push(byte),
+        }
+    }
+    quoted.push(b'\'');
+    quoted
+}
+
+impl SignIn {
+    /// The settings that put this helper in place of every credential helper
+    /// the user's config names for the origin: an empty one first, which
+    /// empties git's list, then this one. Git runs it with `get` when a
+    /// server asks who it is; it reads the file then, and hands the token to
+    /// git on its output, so the token is in no command line and no
+    /// environment. A file that is not there gives git nothing, and the call
+    /// fails as one with no credentials does.
+    fn args(&self) -> [OsString; 4] {
+        use std::os::unix::ffi::OsStringExt;
+        let key = format!("credential.{}.helper=", self.origin);
+        let file = sh_quoted(&self.token_file);
+        let mut helper = key.clone().into_bytes();
+        helper.extend_from_slice(b"!f() { test \"$1\" = get || return 0; test -s ");
+        helper.extend_from_slice(&file);
+        helper.extend_from_slice(
+            b" || return 0; printf 'username=x-access-token\\npassword='; tr -d '[:space:]' < ",
+        );
+        helper.extend_from_slice(&file);
+        helper.extend_from_slice(b"; printf '\\n'; }; f");
+        [
+            "-c".into(),
+            key.into(),
+            "-c".into(),
+            OsString::from_vec(helper),
+        ]
+    }
+}
+
 /// The guarded way of running git.
 #[derive(Debug, Clone)]
 pub struct Guarded {
     global: PathBuf,
+    /// How git signs in to GitHub, when a token file is named. Without one,
+    /// the user's own config says.
+    github: Option<SignIn>,
     /// Whether a refusal is logged. The daemon logs it; `nucleate` fails
     /// with it instead, and the error says the same.
     logs: bool,
@@ -355,6 +415,7 @@ impl Guarded {
     pub fn new(repos: Option<PathBuf>, vetting: Vetting) -> Guarded {
         Guarded {
             global: own_global_config(),
+            github: None,
             logs: true,
             repos,
             vetting,
@@ -364,6 +425,17 @@ impl Guarded {
     /// Log no refusal: the caller fails with it instead.
     pub fn quiet(mut self) -> Guarded {
         self.logs = false;
+        self
+    }
+
+    /// Sign in to GitHub at `origin` as `x-access-token`, with the token in
+    /// `token_file`, read again each time git asks. Nothing changes without
+    /// a file.
+    pub fn signing_in_to(mut self, origin: &str, token_file: Option<&Path>) -> Guarded {
+        self.github = token_file.map(|file| SignIn {
+            origin: origin.to_string(),
+            token_file: std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf()),
+        });
         self
     }
 
@@ -560,6 +632,9 @@ impl Guarded {
     ) -> Result<Command> {
         let mut command = self.command();
         command.args(OVERRIDES);
+        if let Some(github) = &self.github {
+            command.args(github.args());
+        }
         let command_name = args.iter().find(|arg| !arg.starts_with('-'));
         let submodules = command_name.is_some_and(|name| ENTER_SUBMODULES.contains(name));
         match self.vet(dir, bare, submodules, index) {
@@ -719,6 +794,205 @@ impl Git {
 #[cfg(test)]
 mod tests {
     use super::{allowed, Git, Guarded, Vetting};
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// The tokens a test signs in with, and the Basic credentials each makes
+    /// as `x-access-token`.
+    const TOKEN: &str = "ghs_test1token2value3";
+    const TOKEN_BASIC: &str = "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX3Rlc3QxdG9rZW4ydmFsdWUz";
+    const NEW_TOKEN: &str = "ghs_new4token5value6";
+    const NEW_TOKEN_BASIC: &str = "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX25ldzR0b2tlbjV2YWx1ZTY=";
+
+    /// Run git as a person would, with nothing from their own config.
+    fn plain_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A repository with one commit, ready to be served over git's dumb HTTP.
+    fn upstream(dir: &Path) -> PathBuf {
+        let repo = dir.join("upstream");
+        std::fs::create_dir_all(&repo).unwrap();
+        plain_git(&repo, &["init", "-q", "-b", "main"]);
+        plain_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        plain_git(&repo, &["update-server-info"]);
+        repo
+    }
+
+    /// A server that serves `repo` as `/octo/web.git` to a client whose
+    /// `Authorization` is the one `accepted` holds at the time, and asks
+    /// every other who it is. Returns the server's origin.
+    fn serves_with_auth(repo: &Path, accepted: Arc<Mutex<String>>) -> String {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", server.server_addr());
+        let git_dir = repo.join(".git");
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                let signed_in = request.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str() == accepted.lock().unwrap().as_str()
+                });
+                if !signed_in {
+                    let header =
+                        tiny_http::Header::from_bytes("WWW-Authenticate", "Basic realm=\"web\"")
+                            .unwrap();
+                    let _ = request.respond(tiny_http::Response::empty(401).with_header(header));
+                    continue;
+                }
+                let path = request.url().split('?').next().unwrap_or_default();
+                let file = path
+                    .strip_prefix("/octo/web.git/")
+                    .filter(|rest| !rest.split('/').any(|part| part == ".."))
+                    .and_then(|rest| std::fs::read(git_dir.join(rest)).ok());
+                let _ = match file {
+                    Some(bytes) => request.respond(tiny_http::Response::from_data(bytes)),
+                    None => request.respond(tiny_http::Response::empty(404)),
+                };
+            }
+        });
+        origin
+    }
+
+    /// A global config whose credential helpers, the one for every host and
+    /// the one for `origin`, answer with `password`, as the box-wide helpers
+    /// of another account would.
+    fn global_helper(dir: &Path, origin: &str, password: &str) -> PathBuf {
+        let file = dir.join("gitconfig");
+        let helper = format!(
+            "\thelper = \"!f() {{ echo username=x-access-token; echo password={password}; }}; f\"\n"
+        );
+        std::fs::write(
+            &file,
+            format!("[credential]\n{helper}[credential \"{origin}\"]\n{helper}"),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn a_fetch_signs_in_with_the_token_file_in_place_of_the_users_own_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = upstream(dir.path());
+        let accepted = Arc::new(Mutex::new(TOKEN_BASIC.to_string()));
+        let origin = serves_with_auth(&upstream, accepted.clone());
+        let url = format!("{origin}/octo/web.git");
+        // A path the helper must quote.
+        let token_file = dir.path().join("it's a token");
+        std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
+
+        let mut guarded = Guarded::new(None, Vetting::Enforce)
+            .quiet()
+            .signing_in_to(&origin, Some(&token_file));
+        // The box-wide helper signs in as another account, which this server refuses.
+        guarded.global = global_helper(dir.path(), &origin, "ghs_another_accounts_token");
+        let git = Git::Guarded(guarded.clone());
+        let repo = dir.path().join("web.git");
+        git.init_bare(&repo).unwrap();
+
+        let fetched = git
+            .try_bare(
+                &repo,
+                &["fetch", "-q", &url, "+refs/heads/*:refs/remotes/origin/*"],
+            )
+            .unwrap();
+        assert!(fetched.ok, "{}", fetched.stderr);
+        assert_eq!(
+            git.bare(&repo, &["rev-parse", "refs/remotes/origin/main"])
+                .unwrap(),
+            plain_git(&upstream, &["rev-parse", "HEAD"])
+        );
+
+        // The token is on no command line and in no environment: not git's,
+        // and not those of the programs git runs, whose command lines the
+        // trace records.
+        let trace = dir.path().join("trace");
+        let mut command = guarded
+            .prepare(&repo, true, &["ls-remote", &url], None)
+            .unwrap();
+        command.env("GIT_TRACE", &trace);
+        let shown = |text: &OsStr| text.to_string_lossy().contains(TOKEN);
+        assert!(!command.get_args().any(shown));
+        assert!(!command
+            .get_envs()
+            .any(|(name, value)| shown(name) || value.is_some_and(shown)));
+        assert!(!std::env::vars_os().any(|(name, value)| shown(&name) || shown(&value)));
+        let listed = command.output().unwrap();
+        assert!(listed.status.success());
+        let trace = std::fs::read_to_string(&trace).unwrap();
+        assert!(trace.contains("run_command"), "{trace}");
+        assert!(!trace.contains(TOKEN));
+
+        // A replaced file is read on the next call.
+        *accepted.lock().unwrap() = NEW_TOKEN_BASIC.to_string();
+        std::fs::write(&token_file, NEW_TOKEN).unwrap();
+        let listed = git.try_bare(&repo, &["ls-remote", &url]).unwrap();
+        assert!(listed.ok, "{}", listed.stderr);
+
+        // A file that is gone gives git nothing to sign in with.
+        std::fs::remove_file(&token_file).unwrap();
+        let listed = git.try_bare(&repo, &["ls-remote", &url]).unwrap();
+        assert!(!listed.ok);
+        assert!(
+            listed.stderr.contains("terminal prompts disabled"),
+            "{}",
+            listed.stderr
+        );
+    }
+
+    #[test]
+    fn without_a_token_file_git_signs_in_with_the_users_own_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = upstream(dir.path());
+        let origin = serves_with_auth(&upstream, Arc::new(Mutex::new(TOKEN_BASIC.to_string())));
+        let url = format!("{origin}/octo/web.git");
+        let mut guarded = Guarded::new(None, Vetting::Enforce)
+            .quiet()
+            .signing_in_to(&origin, None);
+        guarded.global = global_helper(dir.path(), &origin, TOKEN);
+        let git = Git::Guarded(guarded);
+        let repo = dir.path().join("web.git");
+        git.init_bare(&repo).unwrap();
+        let listed = git.try_bare(&repo, &["ls-remote", &url]).unwrap();
+        assert!(listed.ok, "{}", listed.stderr);
+    }
+
+    #[test]
+    fn a_token_file_signs_in_to_github_and_nowhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = upstream(dir.path());
+        let origin = serves_with_auth(&upstream, Arc::new(Mutex::new(TOKEN_BASIC.to_string())));
+        let url = format!("{origin}/octo/web.git");
+        let token_file = dir.path().join("github-token");
+        std::fs::write(&token_file, TOKEN).unwrap();
+        let mut guarded = Guarded::new(None, Vetting::Enforce)
+            .quiet()
+            .signing_in_to(super::GITHUB_ORIGIN, Some(&token_file));
+        guarded.global = PathBuf::from("/dev/null");
+        let git = Git::Guarded(guarded);
+        let repo = dir.path().join("web.git");
+        git.init_bare(&repo).unwrap();
+        let listed = git.try_bare(&repo, &["ls-remote", &url]).unwrap();
+        assert!(!listed.ok);
+        assert!(
+            listed.stderr.contains("terminal prompts disabled"),
+            "{}",
+            listed.stderr
+        );
+    }
 
     /// A server that asks for credentials on every request.
     fn asks_for_credentials() -> String {
