@@ -1351,9 +1351,15 @@ Nobody tags a release by hand. Three workflows do it:
 
 | Workflow       | Runs on                       | Does                                                                                                   |
 | -------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `build.yml`    | Every pull request and `main` | fmt, clippy and the tests on Linux; the tests and both macOS builds on macOS                            |
-| `release.yml`  | Every push to `main`          | Creates the GitHub Release and its tag with semantic-release, from the Conventional Commits since the last tag |
+| `build.yml`    | Every pull request, and called by `release.yml` | fmt, clippy and the tests on Linux; the tests and both macOS builds on macOS              |
+| `release.yml`  | Every push to `main`          | Runs `build.yml` on the pushed commit; only if all of it passes, creates the GitHub Release and its tag on that commit with semantic-release, from the Conventional Commits since the last tag |
 | `binaries.yml` | A published release           | Builds the four archives with the tag as their version, attaches them to the release, tells the Homebrew tap and the box recipe |
+
+A test gates every release. The whole suite runs on the pushed commit before
+semantic-release does, the privacy gate in `tests/privacy.rs` and the setup
+gate in `tests/setup.rs` among it. If any test fails, there is no tag, no
+GitHub Release, no archives and no new pin in the tap or the recipe; the next
+push to `main` that passes releases everything since the last tag.
 
 A `fix:` commit makes a patch release and a `feat:` commit a minor one; a
 push with neither makes no release. The version in `Cargo.toml` is a

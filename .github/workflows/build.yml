@@ -1,9 +1,15 @@
 name: Build
 
+# fmt, clippy and the whole test suite, the privacy gate in tests/privacy.rs
+# and the setup gate in tests/setup.rs among them, on Linux and on macOS.
+#
+# Runs on every pull request. A push to main does not start it here:
+# release.yml calls it on that push and creates a release only if it passes,
+# so the commit a release tags is the commit these jobs tested.
+
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read

@@ -5,6 +5,13 @@ name: Release
 # publishes the release notes. It does not build or change any file.
 # Publishing the release is what starts binaries.yml, which builds the
 # archives and attaches them.
+#
+# Nothing is tagged until build.yml has passed on the pushed commit: fmt,
+# clippy and every test on Linux and macOS, the privacy gate in
+# tests/privacy.rs and the setup gate in tests/setup.rs among them. If any of
+# it fails, the release job does not run, so there is no tag, no release, no
+# archives and no new pin in the Homebrew tap or the box recipe. The next push
+# to main that passes releases everything since the last tag.
 
 on:
   push:
@@ -18,7 +25,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    uses: ./.github/workflows/build.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       # A release created with the default GITHUB_TOKEN does not start other
@@ -36,6 +47,15 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Check the checkout is the commit the tests passed on
+        run: |
+          head=$(git rev-parse HEAD)
+          test "$head" = "$GITHUB_SHA" || { echo "::error::Checked out $head, but the tests ran on $GITHUB_SHA."; exit 1; }
+
+      # semantic-release tags the checked-out commit, the one the test job
+      # passed, and publishes nothing if main has moved past it since; the
+      # run for the newer commit tests and releases that one.
+      #
       # Third-party and handed a token that can write to the repository, so
       # pinned to a commit. Dependabot moves the pin and the version comment
       # together.
