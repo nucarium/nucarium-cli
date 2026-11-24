@@ -27,5 +27,6 @@ pub mod settings;
 pub mod setup;
 pub mod spool;
 pub mod status;
+pub mod usage;
 pub mod watch;
 pub mod workspace;

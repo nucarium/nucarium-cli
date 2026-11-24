@@ -671,13 +671,14 @@ pub mod contract {
     }
 
     /// The fields of a heartbeat's environment that are ahead of 0.5.0.
-    pub const AHEAD: [&str; 6] = [
+    pub const AHEAD: [&str; 7] = [
         "driver",
         "driver_ref",
         "config_commit",
         "config_modified",
         "config_state",
         "setup",
+        "usage",
     ];
 
     const NETWORKS: [&str; 3] = ["none", "limited", "full"];
@@ -929,6 +930,9 @@ pub mod contract {
             if let Some(setup) = environment.get("setup") {
                 setup_object(setup, &top["client_ts"])?;
             }
+            if let Some(usage) = environment.get("usage") {
+                usage_object(usage, &top["client_ts"])?;
+            }
             if let Some(unsaved) = environment.get("unsaved") {
                 let unsaved = object(unsaved, "unsaved")?;
                 closed(
@@ -1015,6 +1019,56 @@ pub mod contract {
             if finished < started {
                 return Err("setup.script finished before it started".to_string());
             }
+        }
+        Ok(())
+    }
+
+    /// `EnvironmentUsage`: `additionalProperties: false` at both levels, at
+    /// most 16 limits and no two for one window and scope, read in the past
+    /// of the heartbeat that carries it.
+    fn usage_object(value: &Value, client_ts: &Value) -> Check {
+        let usage = object(value, "usage")?;
+        closed(usage, "usage", &["read_at", "limits"], &[])?;
+        field(usage, "usage", "read_at", string(date_time))?;
+        if usage["read_at"].as_str() > client_ts.as_str() {
+            return Err("usage.read_at is ahead of client_ts".to_string());
+        }
+        let limits = usage["limits"]
+            .as_array()
+            .filter(|list| list.len() <= 16)
+            .ok_or("usage.limits is not a list of at most 16")?;
+        let mut seen = Vec::new();
+        for limit in limits {
+            let limit = object(limit, "usage.limit")?;
+            closed(
+                limit,
+                "usage.limit",
+                &["window", "used_pct"],
+                &["scope", "resets_at"],
+            )?;
+            field(
+                limit,
+                "usage.limit",
+                "window",
+                string(|v| ["five_hour", "seven_day"].contains(&v)),
+            )?;
+            field(
+                limit,
+                "usage.limit",
+                "scope",
+                string(|v| {
+                    chars(v, 1, 32, |c| {
+                        c.is_ascii_alphanumeric() || " .+-".contains(c)
+                    })
+                }),
+            )?;
+            field(limit, "usage.limit", "used_pct", number(0.0, 100.0))?;
+            field(limit, "usage.limit", "resets_at", string(date_time))?;
+            let key = (limit.get("window"), limit.get("scope"));
+            if seen.contains(&key) {
+                return Err("usage has two limits for one window and scope".to_string());
+            }
+            seen.push(key);
         }
         Ok(())
     }

@@ -21,7 +21,7 @@ use crate::spool::Spool;
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
-use crate::{agent, config_sync, driver, housekeeping, paths, pause, setup};
+use crate::{agent, config_sync, driver, housekeeping, paths, pause, setup, usage};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -277,6 +277,7 @@ pub fn sample(settings: &Settings, now: SystemTime) -> (Heartbeat, Vec<(String, 
         .with_unsaved(unsaved)
         .with_snapshot(snapshot.map(at_ms), now);
     let synced = config_sync::read_status(settings);
+    let usage = usage::read_readings(&settings.state_dir);
     let mut problems = Vec::new();
     let environments = settings
         .environments
@@ -292,6 +293,7 @@ pub fn sample(settings: &Settings, now: SystemTime) -> (Heartbeat, Vec<(String, 
             );
             environment_report(settings, environment, counts.as_ref(), synced.as_ref(), now)
                 .with_setup(setup.report)
+                .with_usage(usage::report(usage.as_ref(), environment, now))
         })
         .collect();
     let beat = Heartbeat::new(machine, environments, now)
@@ -978,6 +980,12 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
         let path = settings.path.clone();
         std::thread::spawn(move || config_sync::run_schedule(&path, &stop))
     };
+    // Plan usage is asked of the agent vendor on a thread of its own as well.
+    let plan = {
+        let stop = stop.clone();
+        let path = settings.path.clone();
+        std::thread::spawn(move || usage::run_schedule(&path, &stop))
+    };
     let timings = Timings::default();
     let tick = timings.tick;
     let mut daemon = Daemon::new(settings, timings);
@@ -995,5 +1003,6 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
     drop(reporter);
     drop(drivers);
     drop(config);
+    drop(plan);
     Ok(())
 }

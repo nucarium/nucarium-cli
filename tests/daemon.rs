@@ -373,6 +373,73 @@ fn a_watch_that_says_it_takes_the_newer_fields_is_sent_them_without_waiting_a_be
 }
 
 #[test]
+fn plan_usage_is_the_last_good_reading_and_goes_only_to_a_watch_that_takes_it() {
+    let rig = Rig::new();
+    let config_dir = rig.home.dir.join(".claude-client-a");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    rig.configure_with(
+        &format!(
+            "check = \"true\"\nconfig_dir = \"{}\"",
+            config_dir.display()
+        ),
+        "",
+    );
+    // What the usage thread kept an hour ago; later reads have failed.
+    let read_at = unix_ms(SystemTime::now()) - 3_600_000;
+    let state = rig.home.state_dir();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("usage.json"),
+        json!({ "environments": { "client-a": { "read_at_ms": read_at, "limits": [
+            { "window": "five_hour", "used_pct": 23.0, "resets_at_ms": read_at + 7_200_000 },
+            { "window": "seven_day", "scope": "Fable", "used_pct": 71.0 },
+        ] } } })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Watch as it is is never sent it, and the box says what it held back.
+    let mock = common::gate::watch();
+    rig.sign_in(&mock.url);
+    let mut plain = daemon(&rig);
+    let start = Instant::now();
+    plain.tick(start);
+    plain.tick(start + Duration::from_millis(500));
+    let beats = mock.to(contract::HEARTBEATS);
+    assert!(beats.iter().all(|beat| ahead_in(beat).is_empty()));
+    assert_eq!(plain.state(true).heartbeat.withheld, ["usage"]);
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+
+    // A Watch that takes it is sent the reading, with the time it was read.
+    let mock = common::gate::watch_taking(&["usage"]);
+    rig.sign_in(&mock.url);
+    let mut taking = daemon(&rig);
+    taking.tick(start);
+    taking.tick(start + Duration::from_millis(500));
+    let said = common::gate::said(&mock);
+    assert_eq!(
+        said["environments"][0]["usage"],
+        json!({
+            "read_at": nucleate::envelope::rfc3339(
+                std::time::UNIX_EPOCH + Duration::from_millis(read_at)
+            ),
+            "limits": [
+                {
+                    "window": "five_hour",
+                    "used_pct": 23.0,
+                    "resets_at": nucleate::envelope::rfc3339(
+                        std::time::UNIX_EPOCH + Duration::from_millis(read_at + 7_200_000)
+                    ),
+                },
+                { "window": "seven_day", "scope": "Fable", "used_pct": 71.0 },
+            ],
+        })
+    );
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    common::gate::only_listed_fields(&mock);
+}
+
+#[test]
 fn a_watch_that_refuses_a_field_it_said_it_takes_still_hears_from_the_box() {
     let rig = box_with_more_to_say();
     // It names every newer field, and then will not have `driver_ref`.

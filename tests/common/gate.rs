@@ -87,6 +87,9 @@ pub const SETUP_FIELDS: [&str; 6] = [
     "script",
 ];
 pub const SCRIPT_FIELDS: [&str; 4] = ["state", "started_at", "finished_at", "exit_code"];
+/// Every field of an environment's plan usage, and of one of its limits.
+pub const USAGE_FIELDS: [&str; 2] = ["read_at", "limits"];
+pub const LIMIT_FIELDS: [&str; 4] = ["window", "scope", "used_pct", "resets_at"];
 
 /// Every key of every object the box sent is one this file lists, or, about
 /// an environment, a field ahead of the contract that the stand-in it was
@@ -126,6 +129,12 @@ pub fn only_listed_fields(mock: &Mock) {
                 listed("setup", setup, &SETUP_FIELDS);
                 if let Some(script) = setup.get("script") {
                     listed("setup.script", script, &SCRIPT_FIELDS);
+                }
+            }
+            if let Some(usage) = environment.get("usage") {
+                listed("usage", usage, &USAGE_FIELDS);
+                for limit in usage["limits"].as_array().into_iter().flatten() {
+                    listed("usage.limit", limit, &LIMIT_FIELDS);
                 }
             }
         }

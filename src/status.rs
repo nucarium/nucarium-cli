@@ -173,6 +173,7 @@ pub fn view(settings: &Settings) -> Value {
             "config": config,
             "setup": report.setup,
             "setup_problems": problems,
+            "usage": report.usage,
             "agent_version": report.agent_version,
             "login_expires_at": report.login_expires_at,
             "server_alive": alive,

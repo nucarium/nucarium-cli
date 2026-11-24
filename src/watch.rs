@@ -10,6 +10,7 @@ use crate::envelope::{
 };
 use crate::sessions::ACTIVITY_BEAT;
 use crate::setup::{Network, ScriptState};
+use crate::usage::{self, Window};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -363,19 +364,61 @@ impl ScriptReport {
     }
 }
 
+/// How much of its plan an environment's agent login has used, as the box
+/// last read it: when, and per limit a fixed word for its window, the model
+/// it is for, a percentage and when it resets. Held to what Watch takes by
+/// [`usage::tidy`].
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UsageReport {
+    pub read_at: String,
+    pub limits: Vec<UsageLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UsageLimit {
+    pub window: Window,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    pub used_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+}
+
+impl UsageReport {
+    /// A reading as Watch takes one. A time it was read ahead of now, from a
+    /// clock that has since moved back, is sent as now.
+    pub fn new(read_at: SystemTime, limits: &[usage::Limit], now: SystemTime) -> UsageReport {
+        UsageReport {
+            read_at: rfc3339(read_at.min(now)),
+            limits: usage::tidy(limits.iter().cloned())
+                .into_iter()
+                .map(|limit| UsageLimit {
+                    window: limit.window,
+                    scope: limit.scope,
+                    used_pct: limit.used_pct,
+                    resets_at: limit
+                        .resets_at_ms
+                        .map(|ms| rfc3339(std::time::UNIX_EPOCH + Duration::from_millis(ms))),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// The fields of a heartbeat's environment that are ahead of the contract
 /// every Watch holds. Watch refuses a heartbeat that carries a field it does
 /// not name, and to its owner a refused heartbeat is a machine gone dark, so
 /// none of these is sent until Watch has said it takes it: in `accepts`, in
 /// its answer to a heartbeat. Until then each stays on the box, where
 /// `nucleated status` shows it.
-pub const AHEAD: [&str; 6] = [
+pub const AHEAD: [&str; 7] = [
     "driver",
     "driver_ref",
     "config_commit",
     "config_modified",
     "config_state",
     "setup",
+    "usage",
 ];
 
 /// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
@@ -438,6 +481,9 @@ pub struct EnvironmentReport {
     /// What the environment is set up with on the box.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupReport>,
+    /// How much of its plan the environment's login has used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageReport>,
 }
 
 impl EnvironmentReport {
@@ -466,6 +512,7 @@ impl EnvironmentReport {
             config_modified: None,
             config_state: None,
             setup: None,
+            usage: None,
         }
     }
 
@@ -495,6 +542,14 @@ impl EnvironmentReport {
     /// down and [`SetupReport::new`] held it to its shape.
     pub fn with_setup(mut self, setup: Option<SetupReport>) -> Self {
         self.setup = setup;
+        self
+    }
+
+    /// Say how much of its plan the environment's login has used: the last
+    /// good reading, however old, since a heartbeat without it clears what
+    /// Watch has.
+    pub fn with_usage(mut self, usage: Option<UsageReport>) -> Self {
+        self.usage = usage;
         self
     }
 
@@ -536,6 +591,9 @@ impl EnvironmentReport {
         if !taken.takes("setup") {
             report.setup = None;
         }
+        if !taken.takes("usage") {
+            report.usage = None;
+        }
         report
     }
 
@@ -548,6 +606,7 @@ impl EnvironmentReport {
             self.config_modified.is_some(),
             self.config_state.is_some(),
             self.setup.is_some(),
+            self.usage.is_some(),
         ]
         .into_iter()
         .zip(AHEAD)
@@ -1290,7 +1349,17 @@ mod tests {
                 state: Some(config_sync::State::Ok),
                 detail: None,
             })
-            .with_setup(setup(None));
+            .with_setup(setup(None))
+            .with_usage(Some(UsageReport::new(
+                now,
+                &[usage::Limit {
+                    window: Window::SevenDay,
+                    scope: None,
+                    used_pct: 40.0,
+                    resets_at_ms: None,
+                }],
+                now,
+            )));
         let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
         assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
             let mut all = AHEAD.to_vec();
@@ -1335,6 +1404,15 @@ mod tests {
             })
         );
         assert!(sent(&["driver", "config_state"]).get("setup").is_none());
+        // So does plan usage.
+        assert_eq!(
+            sent(&["usage"])["usage"],
+            json!({
+                "read_at": "2026-11-19T12:00:00.000Z",
+                "limits": [{ "window": "seven_day", "used_pct": 40.0 }],
+            })
+        );
+        assert!(sent(&["setup"]).get("usage").is_none());
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
     }
