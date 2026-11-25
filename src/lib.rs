@@ -31,3 +31,4 @@ pub mod status;
 pub mod usage;
 pub mod watch;
 pub mod workspace;
+pub mod worktrees;

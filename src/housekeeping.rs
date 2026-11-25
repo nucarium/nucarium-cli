@@ -15,7 +15,7 @@ use crate::driver;
 use crate::envelope::{rfc3339, unix_ms};
 use crate::git;
 use crate::paths;
-use crate::sessions::{Status, Store};
+use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{RepoInfo, Workspace};
 use anyhow::{anyhow, bail, Result};
@@ -209,6 +209,36 @@ fn modified_ms(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// The agent sessions, of any of the logins sharing a nucleus, that work in
+/// the session folder `name`.
+pub(crate) fn agent_sessions(store: &Store, sharing: &[String], name: &str) -> Vec<Session> {
+    sharing
+        .iter()
+        .flat_map(|environment| store.list(environment))
+        .filter(|session| session.workspace.as_deref() == Some(name))
+        .collect()
+}
+
+/// Why a session folder is in use, or nothing when it is not: an agent
+/// session that has not ended names it, or a process has its working
+/// directory inside it. Where the system cannot say, it might be.
+pub(crate) fn in_use_because(agent_sessions: &[Session], path: &Path) -> Option<&'static str> {
+    // Two logins may share one nucleus, so the folder is live while an agent
+    // session of any of them is working in it.
+    if agent_sessions
+        .iter()
+        .any(|session| session.status != Status::Ended)
+    {
+        return Some("its agent session has not ended");
+    }
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    match in_use(&resolved) {
+        Some(false) => None,
+        Some(true) => Some("a process is working in it"),
+        None => Some("this system cannot say whether a process is working in it"),
+    }
+}
+
 /// Why a session must be kept, or nothing if it can go.
 fn keep_reason(
     workspace: &Workspace,
@@ -218,28 +248,9 @@ fn keep_reason(
     path: &Path,
     min_age: Duration,
 ) -> Result<Option<String>> {
-    // Two logins may share one nucleus, so the folder is live while an agent
-    // session of any of them is working in it.
-    let agent_sessions: Vec<_> = sharing
-        .iter()
-        .flat_map(|environment| store.list(environment))
-        .filter(|session| session.workspace.as_deref() == Some(name))
-        .collect();
-    if agent_sessions
-        .iter()
-        .any(|session| session.status != Status::Ended)
-    {
-        return Ok(Some("its agent session has not ended".to_string()));
-    }
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    match in_use(&resolved) {
-        Some(false) => {}
-        Some(true) => return Ok(Some("a process is working in it".to_string())),
-        None => {
-            return Ok(Some(
-                "this system cannot say whether a process is working in it".to_string(),
-            ))
-        }
+    let agent_sessions = agent_sessions(store, sharing, name);
+    if let Some(why) = in_use_because(&agent_sessions, path) {
+        return Ok(Some(why.to_string()));
     }
     // Every worktree in it, its subagents' included, and anything else at
     // its root that nucleate did not put there.
@@ -441,11 +452,52 @@ fn snapshot_one(
         return skipped("being written to");
     }
 
-    // Build the tree in a copy of the index, so neither the session's index
-    // nor its branch is touched.
+    let tree = working_tree(git, worktree, keys, &branch)?;
+    if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
+        return skipped("nothing uncommitted");
+    }
+    let reference = wip_ref(&branch);
+    let key = keys.join(format!("{repo}-{}", dashed(&branch)));
+    if fs::read_to_string(&key).is_ok_and(|pushed| pushed.trim() == tree) {
+        return skipped("already snapshotted");
+    }
+    if dry_run {
+        return Ok(entry(
+            "would_snapshot",
+            json!({ "branch": branch, "ref": reference }),
+        ));
+    }
+    let commit = wip_commit(git, worktree, &tree, &branch, now)?;
+    if !push_wip(git, worktree, &commit, &reference)? {
+        return Ok(entry(
+            "failed",
+            json!({ "branch": branch, "reason": "the push was refused" }),
+        ));
+    }
+    fs::write(&key, format!("{tree}\n"))?;
+    Ok(entry(
+        "snapshot",
+        json!({ "branch": branch, "ref": reference }),
+    ))
+}
+
+/// Where uncommitted work on `branch` is pushed: a ref that is not a branch.
+pub(crate) fn wip_ref(branch: &str) -> String {
+    format!("refs/wip/{}", dashed(branch))
+}
+
+/// The tree of a worktree as it stands, its uncommitted and untracked files
+/// included and its ignored ones not. It is built in a copy of the index, in
+/// `keys`, so neither the session's index nor its branch is touched.
+pub(crate) fn working_tree(
+    git: &git::Git,
+    worktree: &Path,
+    keys: &Path,
+    branch: &str,
+) -> Result<String> {
     let git_dir = PathBuf::from(git.tree(worktree, &["rev-parse", "--absolute-git-dir"])?);
     paths::create_private_dir(keys)?;
-    let index = keys.join(format!(".index.{}.{}", std::process::id(), dashed(&branch)));
+    let index = keys.join(format!(".index.{}.{}", std::process::id(), dashed(branch)));
     if git_dir.join("index").is_file() {
         fs::copy(git_dir.join("index"), &index)?;
     }
@@ -462,22 +514,17 @@ fn snapshot_one(
         Ok(String::from_utf8_lossy(&tree).trim().to_string())
     })();
     let _ = fs::remove_file(&index);
-    let tree = built?;
+    built
+}
 
-    if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
-        return skipped("nothing uncommitted");
-    }
-    let reference = format!("refs/wip/{}", dashed(&branch));
-    let key = keys.join(format!("{repo}-{}", dashed(&branch)));
-    if fs::read_to_string(&key).is_ok_and(|pushed| pushed.trim() == tree) {
-        return skipped("already snapshotted");
-    }
-    if dry_run {
-        return Ok(entry(
-            "would_snapshot",
-            json!({ "branch": branch, "ref": reference }),
-        ));
-    }
+/// A commit of `tree` on top of `HEAD`, made without moving the branch.
+pub(crate) fn wip_commit(
+    git: &git::Git,
+    worktree: &Path,
+    tree: &str,
+    branch: &str,
+    now: SystemTime,
+) -> Result<String> {
     // commit-tree needs an author; a box with none configured still snapshots.
     let unnamed = git
         .try_tree(worktree, &["config", "user.email"])
@@ -498,13 +545,23 @@ fn snapshot_one(
     let message = format!("wip snapshot {} {branch}", rfc3339(now));
     let (ok, commit, error) = git.tree_raw(
         worktree,
-        &["commit-tree", &tree, "-p", "HEAD", "-m", &message],
+        &["commit-tree", tree, "-p", "HEAD", "-m", &message],
         &identity,
     )?;
     if !ok {
         bail!("git commit-tree failed: {error}");
     }
-    let commit = String::from_utf8_lossy(&commit).trim().to_string();
+    Ok(String::from_utf8_lossy(&commit).trim().to_string())
+}
+
+/// Push `commit` to `reference` on the remote, over whatever is there. True
+/// when the remote took it.
+pub(crate) fn push_wip(
+    git: &git::Git,
+    worktree: &Path,
+    commit: &str,
+    reference: &str,
+) -> Result<bool> {
     let pushed = git.try_tree(
         worktree,
         &[
@@ -515,17 +572,7 @@ fn snapshot_one(
             &format!("{commit}:{reference}"),
         ],
     )?;
-    if !pushed.ok {
-        return Ok(entry(
-            "failed",
-            json!({ "branch": branch, "reason": "the push was refused" }),
-        ));
-    }
-    fs::write(&key, format!("{tree}\n"))?;
-    Ok(entry(
-        "snapshot",
-        json!({ "branch": branch, "ref": reference }),
-    ))
+    Ok(pushed.ok)
 }
 
 fn snapshot(

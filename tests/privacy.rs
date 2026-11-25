@@ -575,7 +575,8 @@ fn what_a_session_left_behind_leaves_the_box_as_counts_times_and_one_address() {
     assert!(common::git(&worktree, &["status", "--porcelain"]).contains(MARK));
     assert!(common::git(&worktree, &["diff"]).contains(MARK));
 
-    let mock = watch();
+    // A Watch that takes the session folders, so they are sent too.
+    let mock = common::gate::watch_taking(&["worktrees"]);
     rig.sign_in(&mock.url);
     let stub = github_full_of_content();
     for (event, allowed) in events() {
@@ -595,9 +596,8 @@ fn what_a_session_left_behind_leaves_the_box_as_counts_times_and_one_address() {
     Reporter::default()
         .asking_github_at(&stub.url)
         .tick(&rig.settings(), SystemTime::now() + Duration::from_secs(11));
-    assert_eq!(
-        stub.requests().len(),
-        1,
+    assert!(
+        !stub.requests().is_empty(),
         "GitHub was not asked, so nothing was proved"
     );
     daemon.tick(start + Duration::from_secs(30));
@@ -626,6 +626,15 @@ fn what_a_session_left_behind_leaves_the_box_as_counts_times_and_one_address() {
     assert_eq!(counted["uncommitted_repos"], 1);
     assert_eq!(counted["unpushed_commits"], 0);
     assert_eq!(beats[1].json()["machine"]["uncommitted_repos"], 1);
+    // The session folder: its name, its repo, its branch and the one address.
+    let folders = &beats[1].json()["environments"][0]["worktrees"];
+    assert_eq!(folders[0]["folder"], "fix-login");
+    assert_eq!(folders[0]["repos"][0]["repo"], "your-org/web");
+    assert_eq!(folders[0]["repos"][0]["branch"], "workspace/fix-login");
+    assert_eq!(
+        folders[0]["repos"][0]["open_pull_request"],
+        "https://github.com/your-org/web/pull/412"
+    );
 
     let sent = mock.everything();
     assert!(!sent.contains(MARK), "content on the wire:\n{sent}");

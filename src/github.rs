@@ -3,6 +3,8 @@
 //! call, "list pull requests associated with a commit", and five of its
 //! fields. A merged pull request whose head is some later commit is then
 //! checked against "list commits on a pull request", for the commit ids alone.
+//! The addresses of a merged pull request that holds a commit and of an open
+//! one whose head it is come from the same answer.
 
 use crate::envelope::pull_request_repo;
 use crate::watch::normalize_api_url;
@@ -184,28 +186,64 @@ fn among_commits(
     false
 }
 
-/// True when this commit is one of the commits of a merged pull request:
-/// its head, or one before it. A commit made after the last one a pull
-/// request held is in none, however that pull request ended.
+/// What GitHub says about one commit: whether a merged pull request holds
+/// it, and the addresses of that pull request and of an open one whose head
+/// it is. An address is kept only when it is a pull request on this same
+/// repo, so nothing else GitHub might put in the field is passed on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lookup {
+    pub merged: bool,
+    pub merged_pull: Option<String>,
+    pub open_pull: Option<String>,
+}
+
+/// Ask GitHub about one commit. Nothing when there was no answer, or when
+/// the remote is not on GitHub.
+///
+/// A commit is merged when it is one of the commits of a merged pull
+/// request: its head, or one before it. A commit made after the last one a
+/// pull request held is in none, however that pull request ended.
+pub fn lookup(api: &str, remote_url: &str, sha: &str, token_file: Option<&Path>) -> Option<Lookup> {
+    let (owner, repo) = slug(remote_url)?;
+    let here = format!("{owner}/{repo}");
+    let address = |pull: &Pull| {
+        pull.html_url.clone().filter(|url| {
+            pull_request_repo(url).is_some_and(|named| named.eq_ignore_ascii_case(&here))
+        })
+    };
+    let pulls = pulls(api, &owner, &repo, sha, token_file)?;
+    let merged = pulls
+        .iter()
+        .filter(|pull| pull.merged_at.is_some())
+        .find(|pull| pull.head_is(sha))
+        .or_else(|| {
+            pulls
+                .iter()
+                .filter(|pull| pull.merged_at.is_some() && !pull.head_is(sha))
+                .find(|pull| {
+                    pull.number.is_some_and(|number| {
+                        among_commits(api, &owner, &repo, number, sha, token_file)
+                    })
+                })
+        });
+    let open = pulls
+        .iter()
+        .find(|pull| pull.state.as_deref() == Some("open") && pull.head_is(sha));
+    Some(Lookup {
+        merged: merged.is_some(),
+        merged_pull: merged.and_then(address),
+        open_pull: open.and_then(address),
+    })
+}
+
+/// True when this commit is one of the commits of a merged pull request, by
+/// the rule [`lookup`] gives.
 ///
 /// A squash merge rewrites the commits and the branch is then deleted, so
 /// asking GitHub is the only way to recognise finished work. Any failure to
 /// get an answer counts as "no": nucleate never deletes on doubt.
 pub fn merged(api: &str, remote_url: &str, sha: &str, token_file: Option<&Path>) -> bool {
-    let Some((owner, repo)) = slug(remote_url) else {
-        return false;
-    };
-    pulls(api, &owner, &repo, sha, token_file).is_some_and(|pulls| {
-        pulls
-            .iter()
-            .filter(|pull| pull.merged_at.is_some())
-            .any(|pull| {
-                pull.head_is(sha)
-                    || pull.number.is_some_and(|number| {
-                        among_commits(api, &owner, &repo, number, sha, token_file)
-                    })
-            })
-    })
+    lookup(api, remote_url, sha, token_file).is_some_and(|found| found.merged)
 }
 
 /// The addresses of the open pull requests whose head is exactly this commit.

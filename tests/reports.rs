@@ -429,16 +429,15 @@ fn a_session_that_stops_reports_what_it_left_behind() {
         outcome["pull_requests"],
         json!(["https://github.com/your-org/web/pull/412"])
     );
-    // GitHub was asked the one question, about the session's own commit.
+    // GitHub was asked the one question, about the session's own commit:
+    // for the outcome, and for the session folder's report.
     let asked = stub.requests();
-    assert_eq!(asked.len(), 1);
-    assert_eq!(
-        asked[0].path,
-        format!(
-            "/repos/your-org/web/commits/{}/pulls",
-            git(&worktree, &["rev-parse", "HEAD"])
-        )
+    assert!(!asked.is_empty());
+    let question = format!(
+        "/repos/your-org/web/commits/{}/pulls",
+        git(&worktree, &["rev-parse", "HEAD"])
     );
+    assert!(asked.iter().all(|request| request.path == question));
 
     // The session is where it was: an outcome moves nothing.
     let session = Store::new(&rig.home.state_dir())
@@ -604,7 +603,7 @@ fn when_github_gives_no_answer_the_outcome_says_nothing_about_pull_requests() {
 
     let sent = outcomes(&mock);
     assert_eq!(sent.len(), 1);
-    assert_eq!(stub.requests().len(), 1);
+    assert!(!stub.requests().is_empty());
     // Not known is not none: the field is left out, and what Watch had stands.
     assert!(sent[0].get("pull_requests").is_none());
     assert_eq!(sent[0]["commits"], 1);

@@ -11,6 +11,7 @@ use crate::envelope::{
 use crate::sessions::ACTIVITY_BEAT;
 use crate::setup::{Network, ScriptState};
 use crate::usage::{self, Window};
+use crate::worktrees::{self, Action, ActionResult, Worktree};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -405,13 +406,22 @@ impl UsageReport {
     }
 }
 
+/// The size of a value as JSON, for keeping a heartbeat within its limit.
+fn json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
 /// The fields of a heartbeat's environment that are ahead of the contract
 /// every Watch holds. Watch refuses a heartbeat that carries a field it does
 /// not name, and to its owner a refused heartbeat is a machine gone dark, so
 /// none of these is sent until Watch has said it takes it: in `accepts`, in
 /// its answer to a heartbeat. Until then each stays on the box, where
 /// `nucleated status` shows it.
-pub const AHEAD: [&str; 7] = [
+///
+/// `worktrees` stands for three fields, `worktrees`,
+/// `worktree_action_results` and `worktree_actions_allowed`: a Watch that
+/// takes one takes all three.
+pub const AHEAD: [&str; 8] = [
     "driver",
     "driver_ref",
     "config_commit",
@@ -419,6 +429,7 @@ pub const AHEAD: [&str; 7] = [
     "config_state",
     "setup",
     "usage",
+    "worktrees",
 ];
 
 /// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
@@ -484,6 +495,15 @@ pub struct EnvironmentReport {
     /// How much of its plan the environment's login has used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageReport>,
+    /// Every session folder in the environment's nucleus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<Worktree>>,
+    /// How the worktree actions the box has finished ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_action_results: Option<Vec<ActionResult>>,
+    /// Whether the box runs worktree actions, or refuses each one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_actions_allowed: Option<bool>,
 }
 
 impl EnvironmentReport {
@@ -513,6 +533,9 @@ impl EnvironmentReport {
             config_state: None,
             setup: None,
             usage: None,
+            worktrees: None,
+            worktree_action_results: None,
+            worktree_actions_allowed: None,
         }
     }
 
@@ -550,6 +573,21 @@ impl EnvironmentReport {
     /// Watch has.
     pub fn with_usage(mut self, usage: Option<UsageReport>) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Say what the session folders of the environment's nucleus hold, as
+    /// the reporter last found, and how the actions the box has finished
+    /// since the last answered heartbeat ended.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: Option<Vec<Worktree>>,
+        results: Option<Vec<ActionResult>>,
+        allowed: bool,
+    ) -> Self {
+        self.worktrees = worktrees;
+        self.worktree_action_results = results.filter(|results| !results.is_empty());
+        self.worktree_actions_allowed = Some(allowed);
         self
     }
 
@@ -594,6 +632,11 @@ impl EnvironmentReport {
         if !taken.takes("usage") {
             report.usage = None;
         }
+        if !taken.takes("worktrees") {
+            report.worktrees = None;
+            report.worktree_action_results = None;
+            report.worktree_actions_allowed = None;
+        }
         report
     }
 
@@ -607,6 +650,9 @@ impl EnvironmentReport {
             self.config_state.is_some(),
             self.setup.is_some(),
             self.usage.is_some(),
+            self.worktrees.is_some()
+                || self.worktree_action_results.is_some()
+                || self.worktree_actions_allowed.is_some(),
         ]
         .into_iter()
         .zip(AHEAD)
@@ -670,6 +716,46 @@ impl Heartbeat {
         }
     }
 
+    /// Keep the heartbeat to at most `limit` bytes by leaving session
+    /// folders out of it: saved ones before unsaved ones, and the longest
+    /// unchanged first. Nothing else is ever left out for its size.
+    pub fn fit_worktrees(&mut self, limit: usize) {
+        let mut total = json_len(self);
+        if total <= limit {
+            return;
+        }
+        let mut candidates: Vec<(bool, String, usize, usize, usize)> = Vec::new();
+        for (at, report) in self.environments.iter().enumerate() {
+            for (index, folder) in report.worktrees.iter().flatten().enumerate() {
+                candidates.push((
+                    !folder.is_saved(),
+                    folder.last_change_at.clone().unwrap_or_default(),
+                    at,
+                    index,
+                    json_len(folder) + 1,
+                ));
+            }
+        }
+        candidates.sort();
+        let mut dropped = BTreeSet::new();
+        for (_, _, at, index, bytes) in candidates {
+            if total <= limit {
+                break;
+            }
+            dropped.insert((at, index));
+            total = total.saturating_sub(bytes);
+        }
+        for (at, report) in self.environments.iter_mut().enumerate() {
+            if let Some(folders) = &mut report.worktrees {
+                let mut index = 0;
+                folders.retain(|_| {
+                    index += 1;
+                    !dropped.contains(&(at, index - 1))
+                });
+            }
+        }
+    }
+
     /// The [`AHEAD`] fields this heartbeat carries, for any environment.
     pub fn ahead(&self) -> BTreeSet<&'static str> {
         self.environments
@@ -687,6 +773,15 @@ pub struct HeartbeatAck {
     /// nothing takes none of them.
     #[serde(default, deserialize_with = "names")]
     pub accepts: Vec<String>,
+    /// What Watch asks the box to do with its session folders. An older
+    /// Watch says nothing, which is none.
+    #[serde(default, deserialize_with = "actions")]
+    pub worktree_actions: Vec<Action>,
+}
+
+/// Worktree actions, read without ever failing the answer they are part of.
+fn actions<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Action>, D::Error> {
+    Ok(worktrees::actions_from(&Value::deserialize(deserializer)?))
 }
 
 /// A list of names, read without ever failing the answer it is part of: what
@@ -1359,7 +1454,22 @@ mod tests {
                     resets_at_ms: None,
                 }],
                 now,
-            )));
+            )))
+            .with_worktrees(
+                Some(vec![Worktree {
+                    folder: "fix-login".into(),
+                    in_use: false,
+                    last_change_at: None,
+                    repos: Vec::new(),
+                }]),
+                Some(vec![ActionResult {
+                    id: "wta_abcdefghijklmnop".into(),
+                    outcome: worktrees::Outcome::Done,
+                    detail: "Cleaned up.".into(),
+                    finished_at: "2026-11-19T12:00:00.000Z".into(),
+                }]),
+                false,
+            );
         let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
         assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
             let mut all = AHEAD.to_vec();
@@ -1413,8 +1523,68 @@ mod tests {
             })
         );
         assert!(sent(&["setup"]).get("usage").is_none());
+        // A Watch that takes worktrees takes the results of their actions.
+        assert_eq!(
+            sent(&["worktrees"]),
+            json!({
+                "env_id": "t3", "server_alive": true, "server_restarts": 4,
+                "worktrees": [{ "folder": "fix-login", "in_use": false, "repos": [] }],
+                "worktree_action_results": [{
+                    "id": "wta_abcdefghijklmnop", "outcome": "done",
+                    "detail": "Cleaned up.", "finished_at": "2026-11-19T12:00:00.000Z",
+                }],
+                "worktree_actions_allowed": false,
+            })
+        );
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
+    }
+
+    #[test]
+    fn a_heartbeat_too_big_for_watch_leaves_out_saved_and_old_folders_first() {
+        let now = at(1_795_089_600_000);
+        let folder = |name: &str, saved: bool, changed: &str| Worktree {
+            folder: name.to_string(),
+            in_use: false,
+            last_change_at: Some(changed.to_string()),
+            repos: vec![worktrees::WorktreeRepo {
+                repo: "octo/web".to_string(),
+                branch: "x".repeat(200),
+                uncommitted: !saved,
+                unpushed_commits: 0,
+                merged_pull_request: None,
+                open_pull_request: None,
+            }],
+        };
+        let folders = vec![
+            folder("unsaved-old", false, "2026-01-01T00:00:00.000Z"),
+            folder("saved-new", true, "2026-11-01T00:00:00.000Z"),
+            folder("saved-old", true, "2026-02-01T00:00:00.000Z"),
+            folder("unsaved-new", false, "2026-11-02T00:00:00.000Z"),
+        ];
+        let report = EnvironmentReport::new("client-a", true, None, None, now).with_worktrees(
+            Some(folders),
+            None,
+            true,
+        );
+        let mut beat = Heartbeat::new(MachineHealth::default(), vec![report], now);
+        let whole = json_len(&beat);
+        let names = |beat: &Heartbeat| -> Vec<String> {
+            beat.environments[0]
+                .worktrees
+                .iter()
+                .flatten()
+                .map(|folder| folder.folder.clone())
+                .collect()
+        };
+        beat.fit_worktrees(whole);
+        assert_eq!(names(&beat).len(), 4);
+        // Room for three folders, then for two.
+        beat.fit_worktrees(whole - 100);
+        assert_eq!(names(&beat), ["unsaved-old", "saved-new", "unsaved-new"]);
+        beat.fit_worktrees(whole - 400);
+        assert_eq!(names(&beat), ["unsaved-old", "unsaved-new"]);
+        assert!(json_len(&beat) <= whole - 400);
     }
 
     #[test]
@@ -1434,6 +1604,25 @@ mod tests {
             assert_eq!(odd.heartbeat_interval_s, Some(300));
             assert_eq!(Taken::from_names(&odd.accepts), Taken::default());
         }
+        // An older Watch sends no actions, and an answer with actions Watch
+        // has since added fields to, or ones that are not actions, is read
+        // for those that are.
+        assert!(today.worktree_actions.is_empty());
+        let asked = ack(json!({
+            "heartbeat_interval_s": 60,
+            "something_new": { "a": 1 },
+            "worktree_actions": [
+                { "id": "wta_abcdefghijklmnop", "env_id": "client-a", "folder": "fix-login",
+                  "kind": "push", "discard": false, "requested_at": "2026-11-19T12:00:00Z",
+                  "added_later": true },
+                { "id": "nope", "kind": "push" },
+            ],
+        }));
+        assert_eq!(asked.heartbeat_interval_s, Some(60));
+        assert_eq!(asked.worktree_actions.len(), 1);
+        assert_eq!(asked.worktree_actions[0].folder, "fix-login");
+        let odd = ack(json!({ "heartbeat_interval_s": 60, "worktree_actions": "none" }));
+        assert!(odd.worktree_actions.is_empty());
     }
 
     #[test]
