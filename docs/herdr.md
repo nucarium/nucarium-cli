@@ -149,7 +149,8 @@ is already reported by `nucleated hook`, and in more detail. The hook wins,
 and the driver does not report that terminal a second time.
 
 A terminal outlives the agent in it. An agent killed without its
-`SessionEnd` hook leaves a session that never ends, and another agent, with
+`SessionEnd` hook leaves a session open until the daemon sees its process
+has gone, and another agent, with
 no hooks, may be started in the same terminal. So a hook's hold on a
 terminal or a pane lapses when the hook has said nothing for two minutes and
 Herdr then shows the agent there at work or blocked while the hook's session

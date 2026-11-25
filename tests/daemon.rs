@@ -852,6 +852,7 @@ fn a_limit_reset_time_goes_out_with_the_failed_stop_when_an_agent_gives_one() {
                 event: Envelope::new(kind, draft(session), now).unwrap(),
                 at_ms: unix_ms(now),
                 workspace: None,
+                process: None,
             })
             .unwrap();
     }
@@ -1528,4 +1529,264 @@ fn the_daemons_state_file_is_private_and_holds_no_token() {
             path.display()
         );
     }
+}
+
+// ---- sessions whose agent has gone ------------------------------------
+
+/// A stand-in for `/proc`, already holding one process: the daemon's own.
+struct Procs(tempfile::TempDir);
+
+impl Procs {
+    fn new() -> Procs {
+        let procs = Procs(tempfile::tempdir().unwrap());
+        procs.start(&[7], 500);
+        procs
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+
+    /// Start a process: its pid in each pid namespace, outermost first, and
+    /// its start time in clock ticks after boot.
+    fn start(&self, pids: &[u32], start: u64) {
+        let dir = self.path().join(pids[0].to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let nspid: Vec<String> = pids.iter().map(u32::to_string).collect();
+        std::fs::write(
+            dir.join("status"),
+            format!(
+                "Name:\tnode\nPid:\t{}\nNSpid:\t{}\n",
+                pids[0],
+                nspid.join("\t")
+            ),
+        )
+        .unwrap();
+        let filler = vec!["0"; 17].join(" ");
+        std::fs::write(
+            dir.join("stat"),
+            format!("{} (node) S 1 {filler} {start} 0 0\n", pids[0]),
+        )
+        .unwrap();
+    }
+
+    fn stop(&self, host_pid: u32) {
+        std::fs::remove_dir_all(self.path().join(host_pid.to_string())).unwrap();
+    }
+}
+
+/// Write an event to the spool as a hook in a nucleus session would, from
+/// an agent the hook saw as `pid`, started at `start`.
+fn emit_from(rig: &Rig, kind: EventType, session: &str, pid: u32, start: u64) {
+    let process = nucleate::process::Identity { pid, start };
+    spool_event(rig, kind, session, Some(process));
+}
+
+/// Write an event to the spool as a hook in a nucleus session would, from
+/// the agent `process`, if the hook could tell which that was.
+fn spool_event(
+    rig: &Rig,
+    kind: EventType,
+    session: &str,
+    process: Option<nucleate::process::Identity>,
+) {
+    static CLOCK: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now() + Duration::from_millis(CLOCK.fetch_add(1, Ordering::SeqCst));
+    let draft = Draft {
+        env_id: "client-a".into(),
+        session_id: session.into(),
+        repos: vec!["web".into()],
+        branch: Some("workspace/fix-login".into()),
+        ..Draft::default()
+    };
+    Spool::new(&rig.spool_dir())
+        .write(&Record {
+            event: Envelope::new(kind, draft, now).unwrap(),
+            at_ms: unix_ms(now),
+            workspace: Some("fix-login".into()),
+            process,
+        })
+        .unwrap();
+}
+
+fn status_of(rig: &Rig, session: &str) -> nucleate::sessions::Status {
+    nucleate::sessions::Store::new(&rig.home.state_dir())
+        .load("client-a", session)
+        .unwrap()
+        .status
+}
+
+#[test]
+fn a_session_whose_agent_is_killed_ends_after_two_looks_and_once() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    // In a container: 40 to the hook, 5040 to the daemon on the host.
+    procs.start(&[5040, 40], 1_000);
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
+    daemon.tick(start + secs(1));
+    daemon.tick(start + secs(15));
+    assert_eq!(types(&batches(&mock).concat()), ["user_prompt_submit"]);
+
+    // Killed: no SessionEnd hook ran.
+    procs.stop(5040);
+    daemon.tick(start + secs(61));
+    daemon.tick(start + secs(75));
+    assert_eq!(
+        status_of(&rig, "s1"),
+        nucleate::sessions::Status::Working,
+        "one look is not enough"
+    );
+    daemon.tick(start + secs(121));
+    assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Ended);
+    for later in [135, 181, 241, 301] {
+        daemon.tick(start + secs(later));
+    }
+
+    let sent = batches(&mock).concat();
+    assert_eq!(types(&sent), ["user_prompt_submit", "session_end"]);
+    // The end is an envelope like any other, and says nothing of the process.
+    let ended = sent[1].as_object().unwrap();
+    let mut keys: Vec<&str> = ended.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "branch",
+            "client_ts",
+            "env_id",
+            "event_id",
+            "repos",
+            "session_id",
+            "type"
+        ]
+    );
+    assert_eq!(ended["session_id"], "s1");
+    assert_eq!(ended["repos"], json!(["web"]));
+    assert_ne!(ended["event_id"], sent[0]["event_id"]);
+    // The reporter is asked what the session left behind, as for a real end.
+    assert!(rig
+        .home
+        .state_dir()
+        .join("outcomes/client-a/s1.json")
+        .exists());
+    assert!(rig.spooled().is_empty());
+}
+
+#[test]
+fn a_session_whose_agent_still_runs_or_whose_pid_was_not_recorded_is_never_ended() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    procs.start(&[40], 1_000);
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "alive", 40, 1_000);
+    // No process recorded, as from a hook on another system.
+    spool_event(&rig, EventType::UserPromptSubmit, "unknown", None);
+    for at in (1..=601).step_by(60) {
+        daemon.tick(start + secs(at));
+    }
+    assert_eq!(
+        status_of(&rig, "alive"),
+        nucleate::sessions::Status::Working
+    );
+    assert_eq!(
+        status_of(&rig, "unknown"),
+        nucleate::sessions::Status::Working
+    );
+    assert!(!types(&batches(&mock).concat()).contains(&"session_end".to_string()));
+}
+
+#[test]
+fn a_pid_used_again_by_another_process_is_not_the_agent() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    // Something else now runs as 40, started after the agent did.
+    procs.start(&[40], 9_000);
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::Stop, "s1", 40, 1_000);
+    for at in [1, 61, 121, 135] {
+        daemon.tick(start + secs(at));
+    }
+    assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Ended);
+    assert_eq!(types(&batches(&mock).concat()), ["stop", "session_end"]);
+}
+
+#[test]
+fn a_session_that_ended_itself_is_not_ended_again_when_its_agent_exits() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    procs.start(&[40], 1_000);
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
+    daemon.tick(start + secs(1));
+    // The SessionEnd hook runs, then the agent exits, before the next look.
+    emit_from(&rig, EventType::SessionEnd, "s1", 40, 1_000);
+    procs.stop(40);
+    for at in [61, 121, 181, 241] {
+        daemon.tick(start + secs(at));
+    }
+    assert_eq!(
+        types(&batches(&mock).concat()),
+        ["user_prompt_submit", "session_end"]
+    );
+}
+
+#[test]
+fn a_session_seen_again_by_a_new_agent_is_looked_for_as_that_one() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    procs.start(&[40], 1_000);
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
+    daemon.tick(start + secs(1));
+    // The agent goes, and the session is resumed by another before the
+    // second look: that one is the session's agent now.
+    procs.stop(40);
+    daemon.tick(start + secs(61));
+    procs.start(&[41], 2_000);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 41, 2_000);
+    for at in [62, 121, 181, 241] {
+        daemon.tick(start + secs(at));
+    }
+    assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Working);
+    assert!(!types(&batches(&mock).concat()).contains(&"session_end".to_string()));
+}
+
+#[test]
+fn a_hook_records_its_agents_process_on_the_box_and_only_on_linux() {
+    let rig = Rig::new();
+    let out = rig.hook(
+        "UserPromptSubmit",
+        &json!({ "session_id": "s1", "cwd": rig.root }),
+    );
+    assert!(out.status.success());
+    let spooled = rig.spooled();
+    assert_eq!(spooled.len(), 1);
+    // The test is the agent here: the process that ran the hook.
+    if cfg!(target_os = "linux") {
+        assert_eq!(spooled[0]["process"]["pid"], std::process::id());
+    } else {
+        assert!(spooled[0].get("process").is_none());
+    }
+    assert!(spooled[0]["event"].get("process").is_none());
 }

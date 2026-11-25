@@ -493,7 +493,7 @@ and all mode 600:
 |---|---|
 | `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. |
 | `spool/rejected/` | Events Watch refused. Kept for `max_age`, never retried. |
-| `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, and when an event for it was last sent. `nucleated status` reads these. |
+| `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, when an event for it was last sent, and the agent process its hooks last ran from. `nucleated status` reads these. |
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
@@ -640,6 +640,17 @@ or a `SessionEnd` in a nucleus session, the daemon sends an `outcome`: what the
 session left behind. It moves the session to no other status. See
 [Unsaved work and outcomes](#unsaved-work-and-outcomes).
 
+A session also ends when its agent goes without running `SessionEnd`: killed,
+or stopped with the container it ran in. Each hook notes the agent process
+that ran it, by its pid and start time; that stays on the box and is never
+sent. Once a minute the daemon looks for each open session's process, and when
+two looks in a row do not find it, it ends the session as the hook would have:
+`session_end` goes to Watch once, and the session counts as ended for its
+outcome and for housekeeping. This works on Linux, also for hooks that run in
+rootless containers sharing the spool. Elsewhere, for a session whose hooks
+noted no process, and while `/proc` hides other users' processes, a session
+ends only by its hook.
+
 `PostToolUse` is how a session leaves "needs input" after you grant a
 permission: the tool ran, so the agent is working again. It fires on every tool
 call. The daemon sends the one that changes the session's status, and after
@@ -713,7 +724,8 @@ What holds for every driver, whatever its adapter:
   sessions it is running in, and for as long as the hook's session lives the
   driver's view of that agent is not reported. A hook that has stopped
   speaking does not win for ever: an agent killed without its `SessionEnd`
-  leaves a session that never ends, and must not hide whatever runs in its
+  leaves a session that stays open until the daemon sees its process has
+  gone, or for ever where it cannot, and must not hide whatever runs in its
   place. So when the hook has said nothing for two minutes and the driver
   then sees the session at work or waiting on its owner while the hook's
   session is not, for two minutes more with still no word from the hook, the

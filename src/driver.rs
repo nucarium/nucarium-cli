@@ -951,6 +951,7 @@ pub fn apply(
                     event,
                     at_ms: unix_ms(at),
                     workspace: place.workspace.clone(),
+                    process: None,
                 };
                 if spool.write(&record).is_ok() {
                     *written += 1;
@@ -1747,6 +1748,7 @@ mod tests {
                 .unwrap(),
             at_ms: unix_ms(now) + ms,
             workspace: None,
+            process: None,
         };
         let started = sessions::apply(None, &hook_event(EventType::UserPromptSubmit, 1)).unwrap();
         store.save(&started.session).unwrap();
@@ -1805,6 +1807,7 @@ mod tests {
             .unwrap(),
             at_ms: unix_ms(now) + ms,
             workspace: None,
+            process: None,
         };
         let store = Store::new(&settings.state_dir);
         let started = sessions::apply(None, &hook_event(EventType::SessionStart, 0)).unwrap();
@@ -1845,6 +1848,7 @@ mod tests {
             .unwrap(),
             at_ms: unix_ms(at(45)),
             workspace: None,
+            process: None,
         };
         let known = sessions::apply(None, &applied).unwrap();
         store.save(&known.session).unwrap();
@@ -1868,6 +1872,7 @@ mod tests {
                 event: Envelope::new(*kind, draft, at).unwrap(),
                 at_ms: unix_ms(at),
                 workspace: None,
+                process: None,
             };
             session = Some(sessions::apply(session, &record).unwrap().session);
         }

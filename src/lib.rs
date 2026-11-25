@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod notifier;
 pub mod paths;
 pub mod pause;
+pub mod process;
 pub mod reporter;
 pub mod sessions;
 pub mod settings;

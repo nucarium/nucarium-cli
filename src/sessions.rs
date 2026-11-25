@@ -11,6 +11,7 @@
 
 use crate::envelope::{valid_env_key, valid_session_id, EventType};
 use crate::paths;
+use crate::process::Identity;
 use crate::spool::Record;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -69,6 +70,10 @@ pub struct Session {
     /// The nucleus session folder this agent session works in.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The agent process its hooks last ran from. The daemon ends the
+    /// session when that process has gone. Never sent.
+    #[serde(default)]
+    pub process: Option<Identity>,
     pub started_ms: u64,
     pub last_event_ms: u64,
     #[serde(default)]
@@ -192,6 +197,7 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
             branch: None,
             bridge_session_id: None,
             workspace: None,
+            process: None,
             started_ms: record.at_ms,
             last_event_ms: record.at_ms,
             ended_ms: None,
@@ -237,6 +243,9 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
     }
     if record.workspace.is_some() {
         session.workspace = record.workspace.clone();
+    }
+    if record.process.is_some() {
+        session.process = record.process;
     }
     session.last_event_ms = record.at_ms;
     session.last_event_id = event.event_id.clone();
@@ -325,6 +334,7 @@ mod tests {
             event: Envelope::new(kind, draft, now).unwrap(),
             at_ms,
             workspace: None,
+            process: None,
         }
     }
 
@@ -538,6 +548,7 @@ mod tests {
             event: Envelope::new(Outcome, draft, now).unwrap(),
             at_ms,
             workspace: None,
+            process: None,
         }
     }
 
@@ -628,6 +639,35 @@ mod tests {
         let late = apply(Some(again.clone()), &outcome(15_000, |_| {})).unwrap();
         assert!(!late.changed);
         assert_eq!(late.session, again);
+    }
+
+    #[test]
+    fn a_session_keeps_the_last_agent_process_its_hooks_ran_from() {
+        let from = |kind: EventType, at_ms: u64, pid: Option<u32>| Record {
+            process: pid.map(|pid| Identity { pid, start: 1_000 }),
+            ..record(kind, at_ms)
+        };
+        let first = apply(None, &from(SessionStart, 1_000, Some(40)))
+            .unwrap()
+            .session;
+        assert_eq!(first.process.map(|p| p.pid), Some(40));
+        // An event from no known process leaves the last one known.
+        let quiet = apply(Some(first), &from(UserPromptSubmit, 2_000, None))
+            .unwrap()
+            .session;
+        assert_eq!(quiet.process.map(|p| p.pid), Some(40));
+        let resumed = apply(Some(quiet), &from(Stop, 3_000, Some(41)))
+            .unwrap()
+            .session;
+        assert_eq!(resumed.process.map(|p| p.pid), Some(41));
+        // A new start after an end is a new session, with only its own.
+        let ended = apply(Some(resumed), &from(SessionEnd, 4_000, None))
+            .unwrap()
+            .session;
+        let again = apply(Some(ended), &from(SessionStart, 5_000, None))
+            .unwrap()
+            .session;
+        assert_eq!(again.process, None);
     }
 
     #[test]

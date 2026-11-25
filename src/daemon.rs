@@ -3,6 +3,8 @@
 //! One loop, ticking twice a second. Each tick it notices a changed config,
 //! token or maintenance pause, sends a heartbeat when one is due, applies new
 //! spool files to the local session state, and sends what is worth sending.
+//! Once a minute it also ends the sessions whose agent process has gone
+//! without a `SessionEnd`.
 //! Housekeeping and the reporter run beside it in threads of their own, so a
 //! long fetch or a slow `git status` never delays a heartbeat.
 //!
@@ -11,13 +13,14 @@
 //! reports and tidies, and starts, stops or pauses nothing.
 
 use crate::credentials::{self, Stored, Token};
-use crate::envelope::{rfc3339, unix_ms, Envelope, EventType};
+use crate::envelope::{rfc3339, unix_ms, Draft, Envelope, EventType};
 use crate::health;
 use crate::notifier::{Notifier, Waiting};
+use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
-use crate::spool::Spool;
+use crate::spool::{Record, Spool};
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
@@ -26,7 +29,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -50,6 +53,9 @@ pub struct Timings {
     /// After Watch refuses a heartbeat carrying a field it had said it
     /// takes, no such field is sent for this long.
     pub ahead_hold: Duration,
+    /// How often the daemon looks for sessions whose agent process has gone.
+    /// A session is ended once two looks in a row have not found it.
+    pub process_check: Duration,
 }
 
 impl Default for Timings {
@@ -64,6 +70,7 @@ impl Default for Timings {
             jitter: true,
             http_timeout: Duration::from_secs(15),
             ahead_hold: Duration::from_secs(3_600),
+            process_check: Duration::from_secs(60),
         }
     }
 }
@@ -353,6 +360,13 @@ pub struct Daemon {
     notifier: Notifier,
     /// The name Watch knows this box by, for what the box posts itself.
     machine_name: Option<String>,
+
+    /// Where agent processes are looked for; nothing where they cannot be.
+    proc_root: Option<PathBuf>,
+    last_process_check: Option<Instant>,
+    /// The sessions whose agent process the last look did not find, with
+    /// the process it looked for.
+    unseen: BTreeMap<(String, String), Identity>,
 }
 
 impl Daemon {
@@ -364,6 +378,9 @@ impl Daemon {
             pause_stamp: modified(&pause::file(&settings.state_dir)),
             notifier: Notifier::new(&settings.state_dir),
             machine_name: None,
+            proc_root: process::proc_root(),
+            last_process_check: None,
+            unseen: BTreeMap::new(),
             heartbeat: HeartbeatState {
                 interval_s: settings.heartbeat_interval.as_secs(),
                 ..HeartbeatState::default()
@@ -394,6 +411,12 @@ impl Daemon {
             written: None,
             last_prune: None,
         }
+    }
+
+    /// Look for agent processes in `proc` rather than the system's `/proc`.
+    pub fn with_proc(mut self, proc: &Path) -> Daemon {
+        self.proc_root = Some(proc.to_path_buf());
+        self
     }
 
     fn hosted(&self) -> bool {
@@ -674,6 +697,89 @@ impl Daemon {
         }
     }
 
+    /// End the sessions whose agent process has gone without a
+    /// `SessionEnd`: killed, or stopped with its container. A session is
+    /// ended once two looks in a row, `process_check` apart, have not found
+    /// its process. The end is written to the spool as a hook writes one, so
+    /// it is applied and sent like any other. A session whose hooks recorded
+    /// no process is left alone. Returns true when an end was written.
+    fn end_vanished(&mut self, now: Instant) -> bool {
+        let Some(proc_root) = &self.proc_root else {
+            return false;
+        };
+        if self
+            .last_process_check
+            .is_some_and(|last| now.saturating_duration_since(last) < self.timings.process_check)
+        {
+            return false;
+        }
+        self.last_process_check = Some(now);
+        let live: Vec<(sessions::Session, Identity)> = self
+            .settings
+            .environments
+            .iter()
+            .flat_map(|environment| self.sessions.list(&environment.name))
+            .filter(|session| session.status != Status::Ended)
+            .filter_map(|session| session.process.map(|process| (session, process)))
+            .collect();
+        let wanted = live.iter().map(|(_, process)| *process).collect();
+        // A look that cannot tell is no look: it neither ends a session nor
+        // counts towards ending one.
+        let Some(found) = process::running(proc_root, &wanted) else {
+            return false;
+        };
+        let spool = self.spool.clone();
+        let mut unseen = BTreeMap::new();
+        let mut wrote = false;
+        for (session, process) in live {
+            if found.contains(&process) {
+                continue;
+            }
+            let key = (session.env.clone(), session.session_id.clone());
+            if self.unseen.get(&key) != Some(&process) {
+                unseen.insert(key, process);
+                continue;
+            }
+            // A spool nobody is emptying is not allowed to fill the disk.
+            // The next look tries again.
+            if spool.holds_at_least(self.settings.spool_max_events.saturating_mul(2)) {
+                unseen.insert(key, process);
+                continue;
+            }
+            // After the session's last event, whatever the clock says, so it
+            // is never taken for one older than that.
+            let at = SystemTime::now().max(at_ms(session.last_event_ms + 1));
+            let draft = Draft {
+                env_id: session.env.clone(),
+                session_id: session.session_id.clone(),
+                bridge_session_id: session.bridge_session_id.clone(),
+                repos: session.repos.clone(),
+                branch: session.branch.clone(),
+                ..Draft::default()
+            };
+            let Some(event) = Envelope::new(EventType::SessionEnd, draft, at) else {
+                continue;
+            };
+            let record = Record {
+                event,
+                at_ms: unix_ms(at),
+                workspace: session.workspace.clone(),
+                process: None,
+            };
+            if spool.write(&record).is_ok() {
+                log(&format!(
+                    "environment {}: a session's agent process has gone; ended it",
+                    session.env
+                ));
+                wrote = true;
+            } else {
+                unseen.insert(key, process);
+            }
+        }
+        self.unseen = unseen;
+        wrote
+    }
+
     fn drop_event(&mut self, id: &str) {
         self.pending.remove(id);
         self.spool.remove(id);
@@ -893,6 +999,11 @@ impl Daemon {
             self.beat(now);
         }
         self.take_in(now);
+        // After the spool is taken in, so an end a hook wrote just before its
+        // agent went is the one applied.
+        if self.end_vanished(now) {
+            self.take_in(now);
+        }
         self.enforce_limits();
         self.flush(now);
         self.notify(now);

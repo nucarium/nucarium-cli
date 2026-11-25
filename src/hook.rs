@@ -9,6 +9,7 @@ use crate::agent::{self, Agent, Lifecycle};
 use crate::driver;
 use crate::envelope::{unix_ms, Draft, Envelope};
 use crate::github;
+use crate::process;
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
 use crate::workspace::Manifest;
@@ -302,6 +303,7 @@ pub fn record_as(
         event: Envelope::new(kind, draft, now)?,
         at_ms: unix_ms(now),
         workspace: place.workspace,
+        process: process::of_this_hook(),
     };
     let spool = Spool::new(&settings.spool_dir);
     // A spool nobody is emptying is not allowed to fill the disk.
