@@ -1630,20 +1630,22 @@ fn a_session_whose_agent_is_killed_ends_after_two_looks_and_once() {
     emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
     daemon.tick(start + secs(1));
     daemon.tick(start + secs(15));
+    // A look finds it running.
+    daemon.tick(start + secs(61));
     assert_eq!(types(&batches(&mock).concat()), ["user_prompt_submit"]);
 
     // Killed: no SessionEnd hook ran.
     procs.stop(5040);
-    daemon.tick(start + secs(61));
-    daemon.tick(start + secs(75));
+    daemon.tick(start + secs(121));
+    daemon.tick(start + secs(135));
     assert_eq!(
         status_of(&rig, "s1"),
         nucleate::sessions::Status::Working,
         "one look is not enough"
     );
-    daemon.tick(start + secs(121));
+    daemon.tick(start + secs(181));
     assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Ended);
-    for later in [135, 181, 241, 301] {
+    for later in [195, 241, 301, 361] {
         daemon.tick(start + secs(later));
     }
 
@@ -1710,13 +1712,17 @@ fn a_pid_used_again_by_another_process_is_not_the_agent() {
     let (mock, _) = api();
     rig.sign_in(&mock.url);
     let procs = Procs::new();
-    // Something else now runs as 40, started after the agent did.
-    procs.start(&[40], 9_000);
+    procs.start(&[40], 1_000);
     let mut daemon = daemon(&rig).with_proc(procs.path());
     let start = Instant::now();
     daemon.tick(start);
     emit_from(&rig, EventType::Stop, "s1", 40, 1_000);
-    for at in [1, 61, 121, 135] {
+    daemon.tick(start + secs(1));
+    daemon.tick(start + secs(61));
+    // The agent goes, and something else now runs as 40.
+    procs.stop(40);
+    procs.start(&[40], 9_000);
+    for at in [121, 181, 195] {
         daemon.tick(start + secs(at));
     }
     assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Ended);
@@ -1759,13 +1765,14 @@ fn a_session_seen_again_by_a_new_agent_is_looked_for_as_that_one() {
     daemon.tick(start);
     emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
     daemon.tick(start + secs(1));
+    daemon.tick(start + secs(61));
     // The agent goes, and the session is resumed by another before the
     // second look: that one is the session's agent now.
     procs.stop(40);
-    daemon.tick(start + secs(61));
+    daemon.tick(start + secs(121));
     procs.start(&[41], 2_000);
     emit_from(&rig, EventType::UserPromptSubmit, "s1", 41, 2_000);
-    for at in [62, 121, 181, 241] {
+    for at in [122, 181, 241, 301] {
         daemon.tick(start + secs(at));
     }
     assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Working);
@@ -1789,4 +1796,50 @@ fn a_hook_records_its_agents_process_on_the_box_and_only_on_linux() {
         assert!(spooled[0].get("process").is_none());
     }
     assert!(spooled[0]["event"].get("process").is_none());
+}
+
+#[test]
+fn a_process_the_daemon_never_found_running_never_ends_its_session() {
+    // A hook run through a wrapper that exits at once, or an agent the
+    // daemon cannot see: either way, nothing to find gone.
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    let mut daemon = daemon(&rig).with_proc(procs.path());
+    let start = Instant::now();
+    daemon.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
+    for at in (1..=601).step_by(60) {
+        daemon.tick(start + secs(at));
+    }
+    assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Working);
+    assert!(!types(&batches(&mock).concat()).contains(&"session_end".to_string()));
+}
+
+#[test]
+fn a_process_found_running_before_a_restart_is_found_gone_after_it() {
+    let rig = Rig::new();
+    let (mock, _) = api();
+    rig.sign_in(&mock.url);
+    let procs = Procs::new();
+    procs.start(&[40], 1_000);
+    let start = Instant::now();
+    let mut first = daemon(&rig).with_proc(procs.path());
+    first.tick(start);
+    emit_from(&rig, EventType::UserPromptSubmit, "s1", 40, 1_000);
+    first.tick(start + secs(1));
+    first.tick(start + secs(61));
+    drop(first);
+
+    procs.stop(40);
+    let mut second = daemon(&rig).with_proc(procs.path());
+    for at in [62, 122, 136] {
+        second.tick(start + secs(at));
+    }
+    assert_eq!(status_of(&rig, "s1"), nucleate::sessions::Status::Ended);
+    assert_eq!(
+        types(&batches(&mock).concat()),
+        ["user_prompt_submit", "session_end"]
+    );
 }

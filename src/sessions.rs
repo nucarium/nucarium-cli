@@ -74,6 +74,11 @@ pub struct Session {
     /// session when that process has gone. Never sent.
     #[serde(default)]
     pub process: Option<Identity>,
+    /// Whether the daemon has found that process running. Only a process
+    /// once found can be found gone: one the daemon never sees may be a
+    /// wrapper that exited at once, or one it cannot see at all.
+    #[serde(default)]
+    pub process_seen: bool,
     pub started_ms: u64,
     pub last_event_ms: u64,
     #[serde(default)]
@@ -198,6 +203,7 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
             bridge_session_id: None,
             workspace: None,
             process: None,
+            process_seen: false,
             started_ms: record.at_ms,
             last_event_ms: record.at_ms,
             ended_ms: None,
@@ -244,8 +250,10 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
     if record.workspace.is_some() {
         session.workspace = record.workspace.clone();
     }
-    if record.process.is_some() {
-        session.process = record.process;
+    // Another process is another thing to find, and it has not been found.
+    if let Some(process) = record.process.filter(|p| session.process != Some(*p)) {
+        session.process = Some(process);
+        session.process_seen = false;
     }
     session.last_event_ms = record.at_ms;
     session.last_event_id = event.event_id.clone();
@@ -647,19 +655,29 @@ mod tests {
             process: pid.map(|pid| Identity { pid, start: 1_000 }),
             ..record(kind, at_ms)
         };
-        let first = apply(None, &from(SessionStart, 1_000, Some(40)))
+        let mut first = apply(None, &from(SessionStart, 1_000, Some(40)))
             .unwrap()
             .session;
         assert_eq!(first.process.map(|p| p.pid), Some(40));
-        // An event from no known process leaves the last one known.
-        let quiet = apply(Some(first), &from(UserPromptSubmit, 2_000, None))
+        assert!(!first.process_seen);
+        // The daemon has found it running.
+        first.process_seen = true;
+        // An event from the same process, or from no known one, leaves the
+        // last one known, and found.
+        let same = apply(Some(first), &from(Activity, 1_500, Some(40)))
+            .unwrap()
+            .session;
+        let quiet = apply(Some(same), &from(UserPromptSubmit, 2_000, None))
             .unwrap()
             .session;
         assert_eq!(quiet.process.map(|p| p.pid), Some(40));
+        assert!(quiet.process_seen);
+        // Another process has not been found yet.
         let resumed = apply(Some(quiet), &from(Stop, 3_000, Some(41)))
             .unwrap()
             .session;
         assert_eq!(resumed.process.map(|p| p.pid), Some(41));
+        assert!(!resumed.process_seen);
         // A new start after an end is a new session, with only its own.
         let ended = apply(Some(resumed), &from(SessionEnd, 4_000, None))
             .unwrap()

@@ -60,12 +60,14 @@ fn stat(proc: &Path, pid: u32) -> Option<Stat> {
 }
 
 /// The agent that ran a hook whose parent is `parent`: the first process up
-/// from there that is not a shell. Nothing when it cannot be read, or when
-/// the climb reaches the first process without finding one.
+/// from there that is not a shell. That may be the first process of the
+/// hook's pid namespace, as an agent run alone in a container is, but the
+/// climb never goes above it. Nothing when it cannot be read, or when only
+/// shells lie on the way.
 pub fn agent_of(proc: &Path, parent: u32) -> Option<Identity> {
     let mut pid = parent;
     for _ in 0..MAX_SHELLS {
-        if pid <= 1 {
+        if pid == 0 {
             return None;
         }
         let stat = stat(proc, pid)?;
@@ -74,6 +76,9 @@ pub fn agent_of(proc: &Path, parent: u32) -> Option<Identity> {
                 pid,
                 start: stat.start,
             });
+        }
+        if pid == 1 {
+            return None;
         }
         pid = stat.parent;
     }
@@ -230,10 +235,22 @@ mod tests {
     #[test]
     fn a_hook_with_only_shells_above_it_or_none_readable_has_no_agent() {
         let proc = tempfile::tempdir().unwrap();
+        process(proc.path(), &[1], "sh", 0, 10);
         process(proc.path(), &[41], "bash", 1, 1_100);
         process(proc.path(), &[42], "sh", 41, 1_200);
         assert_eq!(agent_of(proc.path(), 42), None);
         assert_eq!(agent_of(proc.path(), 99), None);
+    }
+
+    #[test]
+    fn an_agent_that_is_the_first_process_of_its_container_is_the_agent() {
+        let proc = tempfile::tempdir().unwrap();
+        process(proc.path(), &[1], "node", 0, 10);
+        process(proc.path(), &[41], "sh", 1, 1_100);
+        assert_eq!(
+            agent_of(proc.path(), 41),
+            Some(Identity { pid: 1, start: 10 })
+        );
     }
 
     #[test]

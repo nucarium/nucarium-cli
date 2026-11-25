@@ -54,7 +54,8 @@ pub struct Timings {
     /// takes, no such field is sent for this long.
     pub ahead_hold: Duration,
     /// How often the daemon looks for sessions whose agent process has gone.
-    /// A session is ended once two looks in a row have not found it.
+    /// A session is ended once a look has found its process and two later
+    /// looks in a row have not.
     pub process_check: Duration,
 }
 
@@ -365,8 +366,8 @@ pub struct Daemon {
     proc_root: Option<PathBuf>,
     last_process_check: Option<Instant>,
     /// The sessions whose agent process the last look did not find, with
-    /// the process it looked for.
-    unseen: BTreeMap<(String, String), Identity>,
+    /// the process it looked for and when it first missed it.
+    unseen: BTreeMap<(String, String), (Identity, SystemTime)>,
 }
 
 impl Daemon {
@@ -699,12 +700,14 @@ impl Daemon {
 
     /// End the sessions whose agent process has gone without a
     /// `SessionEnd`: killed, or stopped with its container. A session is
-    /// ended once two looks in a row, `process_check` apart, have not found
-    /// its process. The end is written to the spool as a hook writes one, so
-    /// it is applied and sent like any other. A session whose hooks recorded
-    /// no process is left alone. Returns true when an end was written.
+    /// ended once a look has found its process running and two later looks
+    /// in a row, `process_check` apart, have not. A process never found is
+    /// never found gone. The end is written to the spool as a hook writes
+    /// one, so it is applied and sent like any other. A session whose hooks
+    /// recorded no process is left alone. Returns true when an end was
+    /// written.
     fn end_vanished(&mut self, now: Instant) -> bool {
-        let Some(proc_root) = &self.proc_root else {
+        let Some(proc_root) = self.proc_root.clone() else {
             return false;
         };
         if self
@@ -714,6 +717,7 @@ impl Daemon {
             return false;
         }
         self.last_process_check = Some(now);
+        let wall = SystemTime::now();
         let live: Vec<(sessions::Session, Identity)> = self
             .settings
             .environments
@@ -722,33 +726,68 @@ impl Daemon {
             .filter(|session| session.status != Status::Ended)
             .filter_map(|session| session.process.map(|process| (session, process)))
             .collect();
+        if live.is_empty() {
+            self.unseen.clear();
+            return false;
+        }
         let wanted = live.iter().map(|(_, process)| *process).collect();
         // A look that cannot tell is no look: it neither ends a session nor
         // counts towards ending one.
-        let Some(found) = process::running(proc_root, &wanted) else {
+        let Some(found) = process::running(&proc_root, &wanted) else {
             return false;
         };
-        let spool = self.spool.clone();
         let mut unseen = BTreeMap::new();
-        let mut wrote = false;
-        for (session, process) in live {
+        let mut gone = Vec::new();
+        for (mut session, process) in live {
+            let key = (session.env.clone(), session.session_id.clone());
             if found.contains(&process) {
+                if !session.process_seen {
+                    session.process_seen = true;
+                    let _ = self.sessions.save(&session);
+                }
+                continue;
+            }
+            if !session.process_seen {
+                continue;
+            }
+            match self.unseen.get(&key) {
+                Some(&(missed, since)) if missed == process => gone.push((session, process, since)),
+                _ => {
+                    unseen.insert(key, (process, wall));
+                }
+            }
+        }
+        if gone.is_empty() {
+            self.unseen = unseen;
+            return false;
+        }
+        // A hook may have written while the look went on: an end of its
+        // own, or a resumed agent's start. What it wrote is applied first,
+        // and a session it moved is not ended.
+        self.take_in(now);
+        let spool = self.spool.clone();
+        let mut wrote = false;
+        for (session, process, since) in gone {
+            let Some(current) = self.sessions.load(&session.env, &session.session_id) else {
+                continue;
+            };
+            if current.last_event_id != session.last_event_id
+                || current.process != session.process
+                || current.status == Status::Ended
+            {
                 continue;
             }
             let key = (session.env.clone(), session.session_id.clone());
-            if self.unseen.get(&key) != Some(&process) {
-                unseen.insert(key, process);
-                continue;
-            }
             // A spool nobody is emptying is not allowed to fill the disk.
             // The next look tries again.
             if spool.holds_at_least(self.settings.spool_max_events.saturating_mul(2)) {
-                unseen.insert(key, process);
+                unseen.insert(key, (process, since));
                 continue;
             }
-            // After the session's last event, whatever the clock says, so it
-            // is never taken for one older than that.
-            let at = SystemTime::now().max(at_ms(session.last_event_ms + 1));
+            // When the process was first missed, and after the session's last
+            // event whatever the clock says, so it is never taken for one
+            // older than that.
+            let at = since.max(at_ms(session.last_event_ms + 1));
             let draft = Draft {
                 env_id: session.env.clone(),
                 session_id: session.session_id.clone(),
@@ -773,7 +812,7 @@ impl Daemon {
                 ));
                 wrote = true;
             } else {
-                unseen.insert(key, process);
+                unseen.insert(key, (process, since));
             }
         }
         self.unseen = unseen;

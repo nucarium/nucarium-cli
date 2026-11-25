@@ -643,13 +643,14 @@ session left behind. It moves the session to no other status. See
 A session also ends when its agent goes without running `SessionEnd`: killed,
 or stopped with the container it ran in. Each hook notes the agent process
 that ran it, by its pid and start time; that stays on the box and is never
-sent. Once a minute the daemon looks for each open session's process, and when
-two looks in a row do not find it, it ends the session as the hook would have:
-`session_end` goes to Watch once, and the session counts as ended for its
-outcome and for housekeeping. This works on Linux, also for hooks that run in
-rootless containers sharing the spool. Elsewhere, for a session whose hooks
-noted no process, and while `/proc` hides other users' processes, a session
-ends only by its hook.
+sent. Once a minute the daemon looks for each open session's process. When a
+look has found it running and two later looks in a row do not, the daemon ends
+the session as the hook would have: `session_end` goes to Watch once, and the
+session counts as ended for its outcome and for housekeeping. A process the
+daemon never finds running never ends its session this way. This works on
+Linux, also for hooks that run in rootless containers sharing the spool.
+Elsewhere, for a session whose hooks noted no process, and while `/proc` hides
+other users' processes, a session ends only by its hook.
 
 `PostToolUse` is how a session leaves "needs input" after you grant a
 permission: the tool ran, so the agent is working again. It fires on every tool
