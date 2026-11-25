@@ -13,14 +13,20 @@ use crate::{git, github};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// The folder for repos with no GitHub owner.
 pub const NO_OWNER: &str = "_";
 
 /// Held while repos are moved, so that two runs never move the same one.
 const LOCK: &str = ".layout.lock";
+
+/// The longest a run waits for another to finish before leaving the move to
+/// the next one. A daemon starting must not wait on whatever holds it.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// The most a worktree pointer file is read to.
 const MAX_POINTER: u64 = 4096;
@@ -151,6 +157,40 @@ fn needs_repair(bare: &Path) -> bool {
     })
 }
 
+/// Take the lock that lets one run at a time move repos, or nothing if
+/// another holds it for longer than [`LOCK_WAIT`]. `.repos` is writable from
+/// a session, so what is found there may be anything: a link is not
+/// followed, a pipe is not waited on, and anything but a plain file is an
+/// error.
+fn take_turn(path: &Path) -> Result<Option<fs::File>> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !lock.metadata()?.is_file() {
+        anyhow::bail!("{} is not a plain file", path.display());
+    }
+    let started = Instant::now();
+    loop {
+        // SAFETY: flock on a descriptor this function owns; released when
+        // the file is dropped.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(lock));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(error).with_context(|| format!("locking {}", path.display()));
+        }
+        if started.elapsed() >= LOCK_WAIT {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// What one run of the move did.
 #[derive(Debug, Default, Serialize)]
 pub struct Moved {
@@ -202,18 +242,17 @@ impl Workspace {
             return Ok(moved);
         }
         let lock_path = self.repos_dir.join(LOCK);
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("opening {}", lock_path.display()))?;
-        // SAFETY: flock on a descriptor this function owns; released when
-        // `lock` is dropped at the end of the call.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("locking {}", lock_path.display()));
-        }
+        let Some(lock) = take_turn(&lock_path)? else {
+            moved.left.push((
+                self.repos_dir.clone(),
+                format!(
+                    "another run held {} for {}s; trying again next time",
+                    lock_path.display(),
+                    LOCK_WAIT.as_secs()
+                ),
+            ));
+            return Ok(moved);
+        };
 
         for entry in fs::read_dir(&self.repos_dir)?.flatten() {
             let from = entry.path();

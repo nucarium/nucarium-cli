@@ -843,3 +843,38 @@ fn a_refused_flat_repo_stays_where_it_is_and_is_still_listed() {
         .iter()
         .any(|a| a["repo"] == "demo" && a["label"] == "demo"));
 }
+
+#[test]
+fn a_pipe_planted_as_the_move_lock_is_not_waited_on() {
+    let f = Fixture::new();
+    f.flatten();
+    let lock = f.root.join(".repos/.layout.lock");
+    assert!(Command::new("mkfifo")
+        .arg(&lock)
+        .status()
+        .unwrap()
+        .success());
+    let mut child = f
+        .command(&f.root, &["refresh"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            child.kill().unwrap();
+            panic!("refresh waited on a pipe planted as the lock");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    // The refresh itself goes on; the move says why it did not run.
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("moving repos to owner folders"));
+    assert!(f.root.join(".repos/demo.git").is_dir());
+}
