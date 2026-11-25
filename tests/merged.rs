@@ -210,13 +210,72 @@ fn a_worktree_of_another_repo_planted_in_a_session_keeps_it_and_is_not_touched()
     );
     let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
     assert!(!out.status.success(), "the session was removed");
+    assert!(planted.join("a.txt").is_file());
+    assert!(git(&other, &["worktree", "list"]).contains("planted"));
+}
+
+#[test]
+fn a_file_at_a_sessions_root_keeps_it() {
+    let rig = Rig::new();
+    rig.session("parent");
+    fs::write(session_dir(&rig, "parent").join("NOTES.md"), "mine\n").unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
     assert!(
-        stderr(&out).contains("not a worktree of this nucleus's repos"),
+        stderr(&out).contains("it holds other files: NOTES.md"),
         "{}",
         stderr(&out)
     );
-    assert!(planted.join("a.txt").is_file());
-    assert!(git(&other, &["worktree", "list"]).contains("planted"));
+    assert!(session_dir(&rig, "parent").join("NOTES.md").is_file());
+}
+
+#[test]
+fn a_worktree_added_at_a_sessions_root_keeps_it() {
+    let rig = Rig::new();
+    rig.session("parent");
+    let extra = session_dir(&rig, "parent").join("extra");
+    git(
+        &rig.bare(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "extra",
+            extra.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    fs::write(extra.join("only-here.txt"), "only here\n").unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    assert!(
+        stderr(&out).contains("other files: extra"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(extra.join("only-here.txt").is_file());
+}
+
+#[test]
+fn a_manifest_that_names_another_sessions_worktree_removes_nothing() {
+    let rig = Rig::new();
+    rig.session("a");
+    let theirs = rig.session("b");
+    fs::write(theirs.join("only-here.txt"), "b's work\n").unwrap();
+    let manifest = session_dir(&rig, "a").join(".workspace.json");
+    let mut text: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+    text["repos"]["web"]["path"] = json!(theirs);
+    fs::write(&manifest, text.to_string()).unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "a"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    assert!(
+        stderr(&out).contains("its worktree is not in the session"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(theirs.join("only-here.txt").is_file());
+    assert!(git(&rig.bare(), &["worktree", "list"]).contains("/b/web"));
 }
 
 // ---- housekeeping ----------------------------------------------------------
@@ -374,6 +433,17 @@ mod housekeeping {
             json!({ "session": "with-notes", "action": "kept", "reason": "it changed too recently" })
         );
         assert!(session_dir(&rig, "with-notes").join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn cleanup_keeps_merged_work_with_a_file_at_the_folders_root() {
+        let rig = Rig::new();
+        let (_, commits) = merged_session(&rig, "parent", false);
+        fs::write(session_dir(&rig, "parent").join("NOTES.md"), "mine\n").unwrap();
+        let github = github(&commits);
+        let report = cleanup(&rig, &github);
+        assert_eq!(verdict(&report, "parent")["action"], "kept", "{report}");
+        assert!(session_dir(&rig, "parent").join("NOTES.md").is_file());
     }
 }
 

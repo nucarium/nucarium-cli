@@ -168,7 +168,12 @@ that is the remote's default branch, or one whose remote branch was deleted
 after a merge, counts as none: a branch that was squash-merged and deleted is
 then recognised from GitHub, even when its tip is an earlier commit of the
 pull request than the last. A worktree a subagent made inside a session, under
-its `.subworktrees/`, counts as one of the session's repos.
+its `.subworktrees/`, counts as one of the session's repos. Anything else at a
+session's root, a file or a folder nucleate did not put there, is unsaved
+too, and keeps the session. A worktree counts as the session's only when it
+is a folder directly in it (or in its `.subworktrees/`), not a link, and the
+nucleus's repo has it registered at that path: a manifest that names a folder
+anywhere else keeps the session rather than reach outside it.
 
 ## Configuration
 

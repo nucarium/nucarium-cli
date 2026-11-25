@@ -241,9 +241,11 @@ fn keep_reason(
             ))
         }
     }
-    // Every worktree in it, its subagents' included.
-    let worktrees: Vec<_> = workspace
-        .session_worktrees(path)?
+    // Every worktree in it, its subagents' included, and anything else at
+    // its root that nucleate did not put there.
+    let listed = workspace.session_worktrees(path)?;
+    let other = Workspace::other_files(path, &listed);
+    let worktrees: Vec<_> = listed
         .into_iter()
         .filter(|(_, info)| info.path.exists())
         .collect();
@@ -256,12 +258,18 @@ fn keep_reason(
             return Ok(Some(format!("{repo}: {refused}")));
         }
     }
-    // What each holds that exists nowhere else, asked once.
+    // What it holds that exists nowhere else, asked once.
     let mut unsaved = Vec::new();
     for (repo, info) in &worktrees {
-        unsaved.push((repo, workspace.unsafe_reasons(&info.path)?));
+        let reasons = workspace.unsafe_reasons(&info.path)?;
+        if !reasons.is_empty() {
+            unsaved.push(format!("{repo}: {}", reasons.join("; ")));
+        }
     }
-    if !merged_and_done(workspace, path, &worktrees, &unsaved)? {
+    if !other.is_empty() {
+        unsaved.push(format!("it holds other files: {}", other.join(", ")));
+    }
+    if !(unsaved.is_empty() && merged_and_done(workspace, path, &worktrees)?) {
         let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
         for session in &agent_sessions {
             last_change = last_change.max(session.last_event_ms);
@@ -280,31 +288,25 @@ fn keep_reason(
             return Ok(Some("it changed too recently".to_string()));
         }
     }
-    for (repo, reasons) in unsaved {
-        if !reasons.is_empty() {
-            return Ok(Some(format!("{repo}: {}", reasons.join("; "))));
-        }
-    }
-    Ok(None)
+    Ok(unsaved.into_iter().next())
 }
 
-/// True when a folder's work is finished with, so that it need not wait out
-/// the age limit: every worktree in it is saved, each either holds nothing
-/// beyond the remote's default branch or has its `HEAD` in a merged pull
-/// request, and at least one was merged. A folder with no worktree that
-/// holds nothing but what nucleate wrote in it is finished with too. Work that was only pushed is not finished: a
-/// branch on GitHub may still be worked on, and waits as before.
+/// True when a folder that holds nothing unsaved, nor any file nucleate did
+/// not put there, is finished with, so that it need not wait out the age
+/// limit: each worktree in it holds nothing beyond the remote's default
+/// branch or has its `HEAD` in a merged pull request, and at least one was
+/// merged. A folder with no worktree and an empty `.subworktrees` is
+/// finished with too. Work that was only pushed is not finished: a branch
+/// on GitHub may still be worked on, and waits as before.
 fn merged_and_done(
     workspace: &Workspace,
     path: &Path,
     worktrees: &[(String, RepoInfo)],
-    unsaved: &[(&String, Vec<String>)],
 ) -> Result<bool> {
     if worktrees.is_empty() {
-        return Ok(Workspace::holds_only_its_own_files(path));
-    }
-    if unsaved.iter().any(|(_, reasons)| !reasons.is_empty()) {
-        return Ok(false);
+        let subs = path.join(".subworktrees");
+        return Ok(fs::symlink_metadata(&subs).is_err()
+            || fs::read_dir(&subs).is_ok_and(|mut inside| inside.next().is_none()));
     }
     let mut merged = false;
     for (_, info) in worktrees {
