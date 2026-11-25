@@ -413,6 +413,10 @@ target = "hosted"
 # Environment setup). Read, never written.
 # setup_dir = "/var/lib/nucarium/environments"
 
+# Whether the box runs what Watch asks it to do with a session folder, Push
+# and Clean up (see Worktrees in Watch). Off unless set: each is refused.
+worktree_actions = false
+
 [watch]
 # Only for a Watch API on this machine, in development.
 # url = "http://localhost:8787"
@@ -546,13 +550,15 @@ and all mode 600:
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
-| `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times, and the name of each repo the daemon would not run git in, with one word for why. The heartbeat reads the numbers and times, never the names. |
+| `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times, and the name of each repo the daemon would not run git in, with one word for why. The heartbeat reads the numbers and times, never the names. Beside them, the list of session folders for Watch (see Worktrees in Watch). |
 | `outcomes/<environment>/<session_id>.json` | A note that a session stopped or ended and its repos are to be looked at. Removed when they have been. |
-| `merged.json` | GitHub's answers to "was this commit merged?", so the count and `cleanup` ask about a commit once an hour at most and never again once it was merged. |
+| `merged.json` | GitHub's answers about a commit, whether it was merged and the addresses of a merged and an open pull request for it, so the count, the list of session folders and `cleanup` ask about a commit once an hour at most and never again once it was merged. |
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 | `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
 | `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `worktree-actions/` | Watch's actions waiting to run, each with when it reached the box; the result of each that has run, until a heartbeat carrying it is answered; and the ids of those that ran in the last day. |
+| `recount` | Left by an action that has run, for the reporter to make its next count at once. |
 | `usage.json` | Per Claude Code environment, its last good plan usage reading: a number made from the config folder's path, for the login it was read for, when it was read, and per limit its window, the model it is for, a percentage and when it resets. No token. |
 | `config-sync.json` | Per environment: the commit its config was applied from, whether a synced file was changed by hand, one fixed word for how the sync stands, and two times. No address, branch, path or name. Only with `[config_sync]` set. |
 
@@ -974,14 +980,57 @@ for a limit on one model, `used_pct` from 0 to 100, and `resets_at` once the
 window has started. `usage` goes only to a Watch that has said it takes it
 (see [Fields Watch has to ask for](#fields-watch-has-to-ask-for)).
 
+### Worktrees in Watch
+
+Watch's machine page lists every session folder in each environment's
+nucleus, with **Push** and **Clean up** on each.
+
+The reporter builds the list on the schedule it counts unsaved work on (see
+`[report]`), and again at once after an action has run, and keeps it beside
+the count in `unsaved.json`. For each folder, at most 200, it says whether it
+is in use (an agent session that has not ended names it, or a process works
+in it, or the system cannot say, as cleanup decides), when a file in it git
+tracks or would track last changed, and for each repo, at most 20, its name,
+its branch, whether it holds uncommitted changes, how many commits are on no
+remote and in no merged pull request, and the addresses of a merged pull
+request that holds its commit and an open one whose head it is. GitHub is
+asked about a commit at most once an hour, never again once it was merged,
+and not at all about one on the default branch or one ahead of its own
+upstream. A folder one of whose repos cannot be read is left out.
+
+Watch sends its actions in the answer to a heartbeat. The daemon's loop only
+writes each down, in `worktree-actions/`; a thread of its own runs them, so
+a slow push never holds up a heartbeat. An action runs once: its id is
+remembered for a day. One that reached the box, or was asked for, more than
+fifteen minutes before it would start is dropped unrun, as Watch has given
+up on it. Each result is a fixed word and one plain sentence with no path,
+host or token in it, and goes in every heartbeat until one carrying it is
+answered.
+
+- **Push** runs `git push -u origin <branch>`, never forced, for each repo
+  with commits that are not on GitHub. It is done when every push went,
+  failed when one did not, and refused when there was nothing to push.
+- **Clean up** is refused while the folder is in use or belongs to a driver.
+  A folder with nothing unsaved is removed as `nucleate remove-session` does.
+  One with unsaved work is refused, unless Watch asked to discard it. Then
+  the unsaved work of each repo is pushed first to `refs/wip/<branch>`, as
+  the snapshot job does, uncommitted changes as a commit on no branch; if any
+  backup fails, nothing is removed. A folder already gone is done.
+
+Both run only on a box whose config sets `worktree_actions = true`. Without
+it every action is refused with "Actions are off on this box." and nothing
+runs; the folders are listed all the same, and each heartbeat says
+`worktree_actions_allowed`.
+
 ### Fields Watch has to ask for
 
-Seven fields of a heartbeat are newer than the contract every Watch holds:
+Eight fields of a heartbeat are newer than the contract every Watch holds:
 `driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`,
-`setup` and `usage`. Watch refuses a heartbeat that carries a field it does not
-name, and a refused heartbeat is a box gone dark, with every environment on
-it looking down and no event sent. So the daemon sends none of the seven on a
-guess.
+`setup`, `usage` and `worktrees`, which brings `worktree_action_results` and
+`worktree_actions_allowed` with it. Watch refuses a heartbeat that carries a
+field it does not name, and a refused heartbeat is a box gone dark, with every
+environment on it looking down and no event sent. So the daemon sends none of
+them on a guess.
 
 - Every heartbeat carries what every Watch takes. Watch's answer to a
   heartbeat may name, in `accepts`, the newer fields it takes; the daemon
@@ -1027,6 +1076,7 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
 | Heartbeat, per Claude Code environment with a good plan usage reading, to a Watch that names the field in `accepts` | `usage`: `read_at`, a timestamp, and `limits`, at most 16, each a `window`, one of two fixed words, a `scope`, a model's name of at most 32 letters, digits, `.`, `+` and `-`, with no space, `used_pct`, a number from 0 to 100, and `resets_at`, a timestamp. |
 | Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |
+| Heartbeat, per environment with a nucleus, to a Watch that names `worktrees` in `accepts` | `worktrees`, each a session folder's name under `.worktrees/` (letters, digits, `.`, `_` and `-`), `in_use`, yes or no, `last_change_at`, a timestamp, and `repos`, each an `owner/name` or a `name`, the checked-out branch (blank when it is detached or has a space in it), `uncommitted`, yes or no, `unpushed_commits`, a number, and `merged_pull_request` and `open_pull_request`, addresses held to the same pattern as `pull_requests`. `worktree_action_results`, each an action's id, one of three fixed words, a sentence the box makes from fixed words, repo names, counts and ref names, and a timestamp. `worktree_actions_allowed`, yes or no. |
 | Heartbeat, per environment the box recipe set up, to a Watch that names the field in `accepts` | `setup`: `network`, one of three fixed words; `allowed_hosts`, `variables` and `secrets`, numbers; `repos`, each an `owner/name` or a `name`; and `script`, the setup script's last run: `state`, one of three fixed words, `started_at` and `finished_at`, timestamps, and `exit_code`, a number. |
 
 Each value is checked against the shape Watch accepts before it is written

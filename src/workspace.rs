@@ -120,11 +120,26 @@ impl Unsaved {
     }
 }
 
-/// One answer from GitHub about one commit, and when it was given.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One answer from GitHub about one commit, and when it was given: whether
+/// it was merged, and the addresses of a merged pull request that holds it
+/// and of an open one whose head it is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Asked {
     merged: bool,
     at_s: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merged_pull: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_pull: Option<String>,
+}
+
+/// The pull requests a worktree's commit is in, as far as GitHub said.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PullRequests {
+    /// A merged pull request that holds the commit.
+    pub merged: Option<String>,
+    /// An open pull request whose head is the commit.
+    pub open: Option<String>,
 }
 
 /// "Not merged" is asked again after this long. "Merged" never changes.
@@ -969,37 +984,82 @@ impl Workspace {
     }
 
     fn merged(&self, bare: &Path, sha: &str) -> bool {
+        self.asked(bare, sha).merged
+    }
+
+    /// The pull requests a worktree's commit is in: a merged one that holds
+    /// it, and an open one whose head it is. GitHub is not asked about a
+    /// commit already on the remote's default branch, which every pull
+    /// request merged before it would answer for, nor about one in a repo
+    /// that is not on GitHub, nor about one ahead of its branch's upstream.
+    pub fn pull_requests(&self, child: &Path) -> Result<PullRequests> {
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common = Path::new(&common);
+        let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
+        let default = format!("refs/remotes/origin/{}", self.default_branch(common));
+        let on_default = self
+            .git
+            .try_tree(child, &["merge-base", "--is-ancestor", &head, &default])?
+            .ok;
+        if on_default || github::slug(&self.remote_url(common)).is_none() {
+            return Ok(PullRequests::default());
+        }
+        // A commit ahead of the branch's own upstream was never pushed, so
+        // GitHub knows nothing of it.
+        let on_remote = !self
+            .git
+            .tree(child, &["branch", "-r", "--contains", "HEAD"])?
+            .is_empty();
+        if !on_remote && self.has_own_upstream(child, common)? {
+            return Ok(PullRequests::default());
+        }
+        let asked = self.asked(common, &head);
+        Ok(PullRequests {
+            merged: asked.merged_pull.filter(|_| asked.merged),
+            open: asked.open_pull,
+        })
+    }
+
+    /// What GitHub said about a commit: remembered when the workspace was
+    /// told where, asked again after an hour unless it was merged, and asked
+    /// afresh each time otherwise.
+    fn asked(&self, bare: &Path, sha: &str) -> Asked {
         let remote = self.remote_url(bare);
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
         let ask = || {
-            github::merged(
+            let found = github::lookup(
                 &self.config.github_api,
                 &remote,
                 sha,
                 self.config.github_token_file.as_deref(),
             )
+            .unwrap_or_default();
+            Asked {
+                merged: found.merged,
+                at_s: now_s,
+                merged_pull: found.merged_pull,
+                open_pull: found.open_pull,
+            }
         };
         let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(&remote)) else {
             return ask();
         };
         let key = format!("{owner}/{repo}@{sha}");
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
         match read_merges(file).get(&key) {
-            Some(answer) if answer.merged => return true,
-            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => return false,
+            Some(answer) if answer.merged => return answer.clone(),
+            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => {
+                return answer.clone()
+            }
             _ => {}
         }
-        let merged = ask();
-        remember_merge(
-            file,
-            key,
-            Asked {
-                merged,
-                at_s: now_s,
-            },
-        );
-        merged
+        let answer = ask();
+        remember_merge(file, key, answer.clone());
+        answer
     }
 
     fn remove_one(&self, name: &str, info: &RepoInfo, force: bool) -> Result<()> {
@@ -1253,6 +1313,13 @@ impl Workspace {
     /// Remove a whole session, or nothing at all if any worktree in it, its
     /// subagents' included, holds unsaved work.
     pub fn remove_session(&self, session: &Path) -> Result<Value> {
+        self.remove_session_with(session, false)
+    }
+
+    /// Remove a whole session. With `force`, unsaved work in it goes too;
+    /// without, any worktree that holds some keeps all of it. Either way, one
+    /// worktree that is not this nucleus's own keeps the whole session.
+    pub fn remove_session_with(&self, session: &Path, force: bool) -> Result<Value> {
         let worktrees = self.session_worktrees(session)?;
         let mut problems = Vec::new();
         let other = Self::other_files(session, &worktrees);
@@ -1264,7 +1331,7 @@ impl Workspace {
             // ours to remove keeps the whole session.
             if let Some(why) = self.left_alone_because(&info.path) {
                 problems.push(format!("{name}: its worktree is {why}"));
-            } else if info.path.exists() {
+            } else if info.path.exists() && !force {
                 let reasons = self.unsafe_reasons(&info.path)?;
                 if !reasons.is_empty() {
                     problems.push(format!("{name}: {}", reasons.join("; ")));
@@ -1280,7 +1347,7 @@ impl Workspace {
         // A subagent's worktree first: it may be in a repo the session's own
         // worktree of it is not.
         for (name, info) in worktrees.iter().rev() {
-            self.remove_one(name, info, false)?;
+            self.remove_one(name, info, force)?;
         }
         for (_, info) in &worktrees {
             if self.holds_only_its_own(&info.bare) {
@@ -1465,6 +1532,7 @@ mod tests {
                         let answer = Asked {
                             merged: n % 2 == 0,
                             at_s,
+                            ..Asked::default()
                         };
                         remember_merge(file, format!("octo/web@{thread}-{n}"), answer);
                     }

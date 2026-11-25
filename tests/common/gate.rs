@@ -90,6 +90,18 @@ pub const SCRIPT_FIELDS: [&str; 4] = ["state", "started_at", "finished_at", "exi
 /// Every field of an environment's plan usage, and of one of its limits.
 pub const USAGE_FIELDS: [&str; 2] = ["read_at", "limits"];
 pub const LIMIT_FIELDS: [&str; 4] = ["window", "scope", "used_pct", "resets_at"];
+/// Every field of a session folder, of one of its repos, and of the result of
+/// an action on one.
+pub const WORKTREE_FIELDS: [&str; 4] = ["folder", "in_use", "last_change_at", "repos"];
+pub const WORKTREE_REPO_FIELDS: [&str; 6] = [
+    "repo",
+    "branch",
+    "uncommitted",
+    "unpushed_commits",
+    "merged_pull_request",
+    "open_pull_request",
+];
+pub const RESULT_FIELDS: [&str; 4] = ["id", "outcome", "detail", "finished_at"];
 
 /// Every key of every object the box sent is one this file lists, or, about
 /// an environment, a field ahead of the contract that the stand-in it was
@@ -101,6 +113,13 @@ pub fn only_listed_fields(mock: &Mock) {
             contract::AHEAD
                 .iter()
                 .filter(|field| mock.ahead.contains(field)),
+        )
+        .chain(
+            mock.ahead
+                .contains(&"worktrees")
+                .then_some(["worktree_action_results", "worktree_actions_allowed"].iter())
+                .into_iter()
+                .flatten(),
         )
         .copied()
         .collect();
@@ -136,6 +155,19 @@ pub fn only_listed_fields(mock: &Mock) {
                 for limit in usage["limits"].as_array().into_iter().flatten() {
                     listed("usage.limit", limit, &LIMIT_FIELDS);
                 }
+            }
+            for worktree in environment["worktrees"].as_array().into_iter().flatten() {
+                listed("a worktree", worktree, &WORKTREE_FIELDS);
+                for repo in worktree["repos"].as_array().into_iter().flatten() {
+                    listed("a worktree's repo", repo, &WORKTREE_REPO_FIELDS);
+                }
+            }
+            for result in environment["worktree_action_results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                listed("a worktree action result", result, &RESULT_FIELDS);
             }
         }
     }

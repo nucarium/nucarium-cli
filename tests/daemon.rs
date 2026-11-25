@@ -302,12 +302,12 @@ fn watch_as_it_is_refuses_nothing_from_a_box_with_drivers_and_config_sync() {
     // What stayed behind is said on the box, by name.
     assert_eq!(
         state.heartbeat.withheld,
-        ["config_state", "driver", "driver_ref"]
+        ["config_state", "driver", "driver_ref", "worktrees"]
     );
     let shown = common::gate::status_shown(&rig);
     assert_eq!(
         shown["watch"]["withheld"],
-        json!(["config_state", "driver", "driver_ref"])
+        json!(["config_state", "driver", "driver_ref", "worktrees"])
     );
     assert_eq!(shown["environments"][1]["driver"]["link_ref"], "env_01HZX");
     assert_eq!(shown["environments"][0]["config"]["state"], "pending");
@@ -409,7 +409,7 @@ fn plan_usage_is_the_last_good_reading_and_goes_only_to_a_watch_that_takes_it() 
     plain.tick(start + Duration::from_millis(500));
     let beats = mock.to(contract::HEARTBEATS);
     assert!(beats.iter().all(|beat| ahead_in(beat).is_empty()));
-    assert_eq!(plain.state(true).heartbeat.withheld, ["usage"]);
+    assert_eq!(plain.state(true).heartbeat.withheld, ["usage", "worktrees"]);
     assert_eq!(contract::violations(&mock), Vec::<String>::new());
 
     // A Watch that takes it is sent the reading, with the time it was read.
@@ -488,7 +488,7 @@ fn a_watch_that_refuses_a_field_it_said_it_takes_still_hears_from_the_box() {
     assert_eq!(state.heartbeat.last_error, None);
     assert_eq!(
         state.heartbeat.withheld,
-        ["config_state", "driver", "driver_ref"]
+        ["config_state", "driver", "driver_ref", "worktrees"]
     );
     // The box never went dark, and what waits on its owner left it.
     assert_eq!(mock.to(contract::EVENTS).len(), 1);

@@ -24,7 +24,7 @@ use crate::spool::{Record, Spool};
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
-use crate::{agent, config_sync, driver, housekeeping, paths, pause, setup, usage};
+use crate::{agent, config_sync, driver, housekeeping, paths, pause, setup, usage, worktrees};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -219,6 +219,11 @@ fn environment_report(
         driver_ref,
     )
     .with_config(&config_sync::report(synced, &environment.name, now))
+    .with_worktrees(
+        nucleus.and_then(|nucleus| nucleus.worktrees.clone()),
+        worktrees::results(&settings.state_dir, &environment.name),
+        settings.worktree_actions,
+    )
 }
 
 /// The whole box's unsaved work, each nucleus counted once, and the time
@@ -583,6 +588,15 @@ impl Daemon {
                         log("heartbeat accepted");
                     }
                     self.server_interval = ack.heartbeat_interval_s.map(Duration::from_secs);
+                    // The results Watch has now heard are forgotten, and the
+                    // actions it asks for are written down for the thread
+                    // that runs them. Nothing runs here.
+                    for report in &body.environments {
+                        if let Some(results) = &report.worktree_action_results {
+                            worktrees::forget(&self.settings.state_dir, &report.env_id, results);
+                        }
+                    }
+                    worktrees::take(&self.settings, &ack.worktree_actions, wall);
                     self.heartbeat.last_ok_at = Some(stamp);
                     self.heartbeat.last_error = None;
                     self.heartbeat_failures = 0;
@@ -1157,6 +1171,13 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
         let path = settings.path.clone();
         std::thread::spawn(move || usage::run_schedule(&path, &stop))
     };
+    // And what Watch asks the box to do with a session folder is done on a
+    // thread of its own, so a slow push never holds up a heartbeat.
+    let actions = {
+        let stop = stop.clone();
+        let path = settings.path.clone();
+        std::thread::spawn(move || worktrees::run_schedule(&path, &stop))
+    };
     let timings = Timings::default();
     let tick = timings.tick;
     let mut daemon = Daemon::new(settings, timings);
@@ -1175,5 +1196,6 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
     drop(drivers);
     drop(config);
     drop(plan);
+    drop(actions);
     Ok(())
 }

@@ -166,6 +166,10 @@ pub struct Settings {
     /// What happens to a repository whose git config or pointers the daemon
     /// will not run git in: refused, the default, or only reported.
     pub git_vetting: git::Vetting,
+    /// Whether the box runs what Watch asks it to do with a session folder,
+    /// Push and Clean up. Off unless the config turns it on: each action is
+    /// then refused, and nothing runs.
+    pub worktree_actions: bool,
 }
 
 // Every table refuses a key it does not know. A key that is misspelled is
@@ -179,6 +183,7 @@ struct File {
     state_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     setup_dir: Option<PathBuf>,
+    worktree_actions: Option<bool>,
     #[serde(default)]
     watch: WatchFile,
     #[serde(default)]
@@ -755,6 +760,7 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
         notify,
         config_sync,
         git_vetting,
+        worktree_actions: file.worktree_actions.unwrap_or(false),
     })
 }
 
@@ -828,6 +834,18 @@ mod tests {
             Some(Duration::from_secs(604_800))
         );
         assert_eq!(settings.spool_max_events, 10_000);
+        assert!(!settings.worktree_actions);
+    }
+
+    #[test]
+    fn worktree_actions_are_off_unless_turned_on() {
+        assert!(parse("worktree_actions = true\n").unwrap().worktree_actions);
+        assert!(
+            !parse("worktree_actions = false\n")
+                .unwrap()
+                .worktree_actions
+        );
+        assert!(parse("worktree_actions = \"yes\"\n").is_err());
     }
 
     #[test]

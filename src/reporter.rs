@@ -6,7 +6,8 @@
 //!
 //! - **Counts unsaved work**, once per nucleus, on a schedule (ten minutes
 //!   unless the config says otherwise), and writes the counts to
-//!   `unsaved.json`. A heartbeat reads that file and runs nothing.
+//!   `unsaved.json`, with what each session folder holds beside them. A
+//!   heartbeat reads that file and runs nothing.
 //! - **Reports what a session left behind.** When a session in a nucleus
 //!   stops or ends, the daemon's loop leaves a marker. Ten seconds later, and
 //!   at most once a minute for one session, the reporter looks at that
@@ -24,6 +25,7 @@ use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
 use crate::workspace::{RepoInfo, Workspace};
+use crate::worktrees::{self, Worktree};
 use crate::{driver, git, github, paths};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -71,6 +73,10 @@ pub struct Nucleus {
     /// it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<RefusedRepo>,
+    /// Every session folder in the nucleus, for a Watch that takes them.
+    /// Nothing for a driver's worktrees, which are in no session folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<Worktree>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +140,16 @@ impl Counts {
 
 pub fn counts_file(state_dir: &Path) -> PathBuf {
     state_dir.join("unsaved.json")
+}
+
+fn recount_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("recount")
+}
+
+/// Ask for the next count now, not at its time: what a folder holds has
+/// changed, and the next heartbeat should say so.
+pub fn ask_recount(state_dir: &Path) {
+    let _ = paths::write_private(&recount_file(state_dir), b"");
 }
 
 /// The last count, or nothing when there has been none or the report is off.
@@ -391,14 +407,22 @@ impl Reporter {
                     last_snapshot_ms: None,
                     driver: true,
                     refused,
+                    worktrees: None,
                 }
             });
         let nuclei = housekeeping::one_per_nucleus(settings)
             .into_iter()
             .map(|environment| {
                 let (unsaved, refused) = self.count_nucleus(settings, environment);
+                let sharing = housekeeping::sharing_nucleus(settings, environment);
+                let worktrees = environment.root.is_dir().then(|| {
+                    let workspace = self
+                        .workspace(settings, environment)
+                        .leaving_alone(driver::protected_roots(settings));
+                    worktrees::report(&workspace, &Store::new(&settings.state_dir), &sharing)
+                });
                 Nucleus {
-                    environments: housekeeping::sharing_nucleus(settings, environment),
+                    environments: sharing,
                     unsaved,
                     // Housekeeping runs a nucleus's jobs under the first of
                     // the environments that share it, which is this one.
@@ -408,6 +432,7 @@ impl Reporter {
                         .map(|seconds| seconds.saturating_mul(1_000)),
                     driver: false,
                     refused,
+                    worktrees,
                 }
             })
             .chain(owned)
@@ -444,7 +469,9 @@ impl Reporter {
                     .iter()
                     .all(|environment| counts.nucleus(&environment.name).is_some())
         });
-        if fresh {
+        // A finished worktree action asks for a count at once.
+        let asked = fs::remove_file(recount_file(&settings.state_dir)).is_ok();
+        if fresh && !asked {
             return;
         }
         let counts = self.count(settings, now);
@@ -632,6 +659,7 @@ mod tests {
                     last_snapshot_ms: None,
                     driver: false,
                     refused: Vec::new(),
+                    worktrees: None,
                 },
                 Nucleus {
                     environments: vec!["ops".into()],

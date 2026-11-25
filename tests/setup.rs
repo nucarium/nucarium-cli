@@ -97,11 +97,11 @@ fn the_setup_stays_on_the_box_until_watch_says_it_takes_it() {
     }
     let state = daemon.state(true);
     assert_eq!(state.heartbeat.last_error, None);
-    assert_eq!(state.heartbeat.withheld, ["setup"]);
+    assert_eq!(state.heartbeat.withheld, ["setup", "worktrees"]);
 
     // On the box it is shown all the same, and so is its being held back.
     let shown = gate::status_shown(&rig);
-    assert_eq!(shown["watch"]["withheld"], json!(["setup"]));
+    assert_eq!(shown["watch"]["withheld"], json!(["setup", "worktrees"]));
     let setup = &shown["environments"][0]["setup"];
     assert_eq!(setup["network"], "full");
     assert_eq!(setup["repos"], json!(["your-org/web", "your-org/api"]));

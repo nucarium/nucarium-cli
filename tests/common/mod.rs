@@ -716,7 +716,8 @@ pub mod contract {
     }
 
     /// The fields of a heartbeat's environment that are ahead of 0.5.0.
-    pub const AHEAD: [&str; 7] = [
+    /// `worktrees` stands for two: `worktrees` and `worktree_action_results`.
+    pub const AHEAD: [&str; 8] = [
         "driver",
         "driver_ref",
         "config_commit",
@@ -724,6 +725,7 @@ pub mod contract {
         "config_state",
         "setup",
         "usage",
+        "worktrees",
     ];
 
     const NETWORKS: [&str; 3] = ["none", "limited", "full"];
@@ -917,6 +919,9 @@ pub mod contract {
                 "unsaved",
             ];
             optional.extend(AHEAD.iter().filter(|field| ahead.contains(field)));
+            if ahead.contains(&"worktrees") {
+                optional.extend(["worktree_action_results", "worktree_actions_allowed"]);
+            }
             closed(
                 environment,
                 "environment",
@@ -978,6 +983,18 @@ pub mod contract {
             if let Some(usage) = environment.get("usage") {
                 usage_object(usage, &top["client_ts"])?;
             }
+            if let Some(worktrees) = environment.get("worktrees") {
+                worktrees_list(worktrees)?;
+            }
+            if let Some(results) = environment.get("worktree_action_results") {
+                results_list(results)?;
+            }
+            field(
+                environment,
+                "environment",
+                "worktree_actions_allowed",
+                boolean,
+            )?;
             if let Some(unsaved) = environment.get("unsaved") {
                 let unsaved = object(unsaved, "unsaved")?;
                 closed(
@@ -1064,6 +1081,120 @@ pub mod contract {
             if finished < started {
                 return Err("setup.script finished before it started".to_string());
             }
+        }
+        Ok(())
+    }
+
+    /// `^[0-9A-Za-z._-]{1,128}$`, `^[0-9A-Za-z._/-]{1,140}$`
+    fn folder_name(value: &str) -> bool {
+        chars(value, 1, 128, word)
+    }
+
+    fn repo_name(value: &str) -> bool {
+        chars(value, 1, 140, |c| word(c) || c == '/')
+    }
+
+    /// `worktrees`: at most 200 folders of at most 20 repos, every object
+    /// closed.
+    fn worktrees_list(value: &Value) -> Check {
+        let folders = value
+            .as_array()
+            .filter(|list| list.len() <= 200)
+            .ok_or("worktrees is not a list of at most 200")?;
+        for folder in folders {
+            let folder = object(folder, "worktree")?;
+            closed(
+                folder,
+                "worktree",
+                &["folder", "in_use", "repos"],
+                &["last_change_at"],
+            )?;
+            field(folder, "worktree", "folder", string(folder_name))?;
+            field(folder, "worktree", "in_use", boolean)?;
+            field(folder, "worktree", "last_change_at", string(date_time))?;
+            let repos = folder["repos"]
+                .as_array()
+                .filter(|list| list.len() <= 20)
+                .ok_or("worktree.repos is not a list of at most 20")?;
+            for repo in repos {
+                let repo = object(repo, "worktree.repo")?;
+                closed(
+                    repo,
+                    "worktree.repo",
+                    &["repo", "branch", "uncommitted", "unpushed_commits"],
+                    &["merged_pull_request", "open_pull_request"],
+                )?;
+                field(repo, "worktree.repo", "repo", string(repo_name))?;
+                field(
+                    repo,
+                    "worktree.repo",
+                    "branch",
+                    string(|v| {
+                        v.chars().count() <= 255
+                            && !v.chars().any(|c| c.is_whitespace() || c.is_control())
+                    }),
+                )?;
+                field(repo, "worktree.repo", "uncommitted", boolean)?;
+                field(
+                    repo,
+                    "worktree.repo",
+                    "unpushed_commits",
+                    integer(0, 100_000),
+                )?;
+                for key in ["merged_pull_request", "open_pull_request"] {
+                    field(repo, "worktree.repo", key, |v| {
+                        v.as_str().and_then(pull_request).is_some()
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `worktree_action_results`: at most 50, every object closed.
+    fn results_list(value: &Value) -> Check {
+        let results = value
+            .as_array()
+            .filter(|list| list.len() <= 50)
+            .ok_or("worktree_action_results is not a list of at most 50")?;
+        for result in results {
+            let result = object(result, "worktree_action_result")?;
+            closed(
+                result,
+                "worktree_action_result",
+                &["id", "outcome", "detail", "finished_at"],
+                &[],
+            )?;
+            field(
+                result,
+                "worktree_action_result",
+                "id",
+                string(|v| {
+                    v.strip_prefix("wta_").is_some_and(|rest| {
+                        chars(rest, 16, 16, |c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit()
+                        })
+                    })
+                }),
+            )?;
+            field(
+                result,
+                "worktree_action_result",
+                "outcome",
+                string(|v| ["done", "refused", "failed"].contains(&v)),
+            )?;
+            field(
+                result,
+                "worktree_action_result",
+                "detail",
+                string(|v| chars(v, 1, 300, |c| !c.is_control())),
+            )?;
+            field(
+                result,
+                "worktree_action_result",
+                "finished_at",
+                string(date_time),
+            )?;
         }
         Ok(())
     }
@@ -1224,6 +1355,7 @@ pub mod contract {
     /// As [`violation`], for a Watch that also takes the `ahead` fields.
     pub fn violation_taking(request: &Request, ahead: &[&str]) -> Option<String> {
         let limit = match request.path.as_str() {
+            HEARTBEATS if ahead.contains(&"worktrees") => 1024 * 1024,
             HEARTBEATS => 32 * 1024,
             EVENTS => 256 * 1000,
             _ => return None,

@@ -11,6 +11,7 @@ use crate::envelope::{
 use crate::sessions::ACTIVITY_BEAT;
 use crate::setup::{Network, ScriptState};
 use crate::usage::{self, Window};
+use crate::worktrees::{self, Action, ActionResult, Worktree};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -411,7 +412,11 @@ impl UsageReport {
 /// none of these is sent until Watch has said it takes it: in `accepts`, in
 /// its answer to a heartbeat. Until then each stays on the box, where
 /// `nucleated status` shows it.
-pub const AHEAD: [&str; 7] = [
+///
+/// `worktrees` stands for three fields, `worktrees`,
+/// `worktree_action_results` and `worktree_actions_allowed`: a Watch that
+/// takes one takes all three.
+pub const AHEAD: [&str; 8] = [
     "driver",
     "driver_ref",
     "config_commit",
@@ -419,6 +424,7 @@ pub const AHEAD: [&str; 7] = [
     "config_state",
     "setup",
     "usage",
+    "worktrees",
 ];
 
 /// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
@@ -484,6 +490,15 @@ pub struct EnvironmentReport {
     /// How much of its plan the environment's login has used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageReport>,
+    /// Every session folder in the environment's nucleus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<Worktree>>,
+    /// How the worktree actions the box has finished ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_action_results: Option<Vec<ActionResult>>,
+    /// Whether the box runs worktree actions, or refuses each one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_actions_allowed: Option<bool>,
 }
 
 impl EnvironmentReport {
@@ -513,6 +528,9 @@ impl EnvironmentReport {
             config_state: None,
             setup: None,
             usage: None,
+            worktrees: None,
+            worktree_action_results: None,
+            worktree_actions_allowed: None,
         }
     }
 
@@ -550,6 +568,21 @@ impl EnvironmentReport {
     /// Watch has.
     pub fn with_usage(mut self, usage: Option<UsageReport>) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Say what the session folders of the environment's nucleus hold, as
+    /// the reporter last found, and how the actions the box has finished
+    /// since the last answered heartbeat ended.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: Option<Vec<Worktree>>,
+        results: Option<Vec<ActionResult>>,
+        allowed: bool,
+    ) -> Self {
+        self.worktrees = worktrees;
+        self.worktree_action_results = results.filter(|results| !results.is_empty());
+        self.worktree_actions_allowed = Some(allowed);
         self
     }
 
@@ -594,6 +627,11 @@ impl EnvironmentReport {
         if !taken.takes("usage") {
             report.usage = None;
         }
+        if !taken.takes("worktrees") {
+            report.worktrees = None;
+            report.worktree_action_results = None;
+            report.worktree_actions_allowed = None;
+        }
         report
     }
 
@@ -607,6 +645,9 @@ impl EnvironmentReport {
             self.config_state.is_some(),
             self.setup.is_some(),
             self.usage.is_some(),
+            self.worktrees.is_some()
+                || self.worktree_action_results.is_some()
+                || self.worktree_actions_allowed.is_some(),
         ]
         .into_iter()
         .zip(AHEAD)
@@ -687,6 +728,15 @@ pub struct HeartbeatAck {
     /// nothing takes none of them.
     #[serde(default, deserialize_with = "names")]
     pub accepts: Vec<String>,
+    /// What Watch asks the box to do with its session folders. An older
+    /// Watch says nothing, which is none.
+    #[serde(default, deserialize_with = "actions")]
+    pub worktree_actions: Vec<Action>,
+}
+
+/// Worktree actions, read without ever failing the answer they are part of.
+fn actions<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Action>, D::Error> {
+    Ok(worktrees::actions_from(&Value::deserialize(deserializer)?))
 }
 
 /// A list of names, read without ever failing the answer it is part of: what
@@ -1359,7 +1409,22 @@ mod tests {
                     resets_at_ms: None,
                 }],
                 now,
-            )));
+            )))
+            .with_worktrees(
+                Some(vec![Worktree {
+                    folder: "fix-login".into(),
+                    in_use: false,
+                    last_change_at: None,
+                    repos: Vec::new(),
+                }]),
+                Some(vec![ActionResult {
+                    id: "wta_abcdefghijklmnop".into(),
+                    outcome: worktrees::Outcome::Done,
+                    detail: "Cleaned up.".into(),
+                    finished_at: "2026-11-19T12:00:00.000Z".into(),
+                }]),
+                false,
+            );
         let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
         assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
             let mut all = AHEAD.to_vec();
@@ -1413,6 +1478,19 @@ mod tests {
             })
         );
         assert!(sent(&["setup"]).get("usage").is_none());
+        // A Watch that takes worktrees takes the results of their actions.
+        assert_eq!(
+            sent(&["worktrees"]),
+            json!({
+                "env_id": "t3", "server_alive": true, "server_restarts": 4,
+                "worktrees": [{ "folder": "fix-login", "in_use": false, "repos": [] }],
+                "worktree_action_results": [{
+                    "id": "wta_abcdefghijklmnop", "outcome": "done",
+                    "detail": "Cleaned up.", "finished_at": "2026-11-19T12:00:00.000Z",
+                }],
+                "worktree_actions_allowed": false,
+            })
+        );
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
     }
@@ -1434,6 +1512,25 @@ mod tests {
             assert_eq!(odd.heartbeat_interval_s, Some(300));
             assert_eq!(Taken::from_names(&odd.accepts), Taken::default());
         }
+        // An older Watch sends no actions, and an answer with actions Watch
+        // has since added fields to, or ones that are not actions, is read
+        // for those that are.
+        assert!(today.worktree_actions.is_empty());
+        let asked = ack(json!({
+            "heartbeat_interval_s": 60,
+            "something_new": { "a": 1 },
+            "worktree_actions": [
+                { "id": "wta_abcdefghijklmnop", "env_id": "client-a", "folder": "fix-login",
+                  "kind": "push", "discard": false, "requested_at": "2026-11-19T12:00:00Z",
+                  "added_later": true },
+                { "id": "nope", "kind": "push" },
+            ],
+        }));
+        assert_eq!(asked.heartbeat_interval_s, Some(60));
+        assert_eq!(asked.worktree_actions.len(), 1);
+        assert_eq!(asked.worktree_actions[0].folder, "fix-login");
+        let odd = ack(json!({ "heartbeat_interval_s": 60, "worktree_actions": "none" }));
+        assert!(odd.worktree_actions.is_empty());
     }
 
     #[test]

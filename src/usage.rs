@@ -389,7 +389,7 @@ pub fn parse(body: &str) -> Option<Vec<Limit>> {
 
 /// An RFC 3339 time, such as `2026-11-25T12:59:59.365551+00:00`, to the
 /// millisecond. Nothing for anything else, or a time before 1970.
-fn parse_time(text: &str) -> Option<SystemTime> {
+pub(crate) fn parse_time(text: &str) -> Option<SystemTime> {
     let bytes = text.as_bytes();
     let digits = |from: usize, len: usize| -> Option<i64> {
         let part = bytes.get(from..from + len)?;
