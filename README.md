@@ -85,6 +85,7 @@ nucleate available                  # repos that can be added
 nucleate create-session fix-login   # an empty session
 cd <root>/.worktrees/fix-login
 nucleate add demo                   # add a repo; the session is the folder you're in
+nucleate add octo/other             # ...or any GitHub repo the box can read, fetched first
 nucleate add demo some-branch       # ...or on a named branch, resuming it if it exists
 nucleate status                     # what's in the session and what's unsaved
 nucleate remove demo                # remove one repo (--force to discard unsaved work)

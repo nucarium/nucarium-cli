@@ -13,16 +13,16 @@ fn tools() -> Value {
     json!([
         {
             "name": "list_repos",
-            "description": "List repos available to add and those already in this session.",
+            "description": "List the repos already on this box and those in this session. Any other GitHub repo the box can read can be added by owner/name.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "add_repo",
-            "description": "Materialise an available bare repo as a git worktree in this session.",
+            "description": "Add a repo to this session as a git worktree. A GitHub repo not yet on this box is fetched first when named owner/name.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "repo": { "type": "string", "description": "Name like 'demo' or label like 'octo/demo'." },
+                    "repo": { "type": "string", "description": "Name like 'demo' for a repo already on this box, or owner/name like 'octo/demo' for any GitHub repo." },
                     "branch": { "type": "string", "description": "Optional; defaults to the session branch." }
                 },
                 "required": ["repo"]

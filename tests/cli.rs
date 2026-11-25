@@ -73,7 +73,7 @@ impl Fixture {
     fn isolate(&self, command: &mut Command) {
         command
             .env("HOME", &self.home)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", self.global_config())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
@@ -84,6 +84,40 @@ impl Fixture {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("NUCLEATE_CONFIG")
             .env_remove("NUCLEATE_GITHUB_TOKEN_FILE");
+    }
+
+    /// The test user's git settings: none, until a test gives them some.
+    fn global_config(&self) -> PathBuf {
+        let file = self.home.join(".gitconfig");
+        if file.is_file() {
+            file
+        } else {
+            PathBuf::from("/dev/null")
+        }
+    }
+
+    /// Have the test user's git fetch `https://github.com/octo/<name>` from
+    /// `upstream/<name>` on this machine, so nothing reaches GitHub.
+    fn github_on_disk(&self) {
+        let base = self.upstream.parent().unwrap();
+        fs::write(
+            self.home.join(".gitconfig"),
+            format!(
+                "[url \"{}/\"]\n\tinsteadOf = https://github.com/octo/\n",
+                base.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A repo on "GitHub" that the box has not fetched: `octo/<name>`.
+    fn on_github(&self, name: &str) {
+        let dir = self.upstream.parent().unwrap().join(format!("{name}.git"));
+        fs::create_dir_all(&dir).unwrap();
+        self.git(&dir, &["init", "-q", "-b", "main"]);
+        fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        self.git(&dir, &["add", "."]);
+        self.git(&dir, &["commit", "-q", "-m", "init"]);
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
@@ -214,6 +248,59 @@ fn unknown_repos_are_refused() {
     assert!(f
         .fails(&f.session("s1"), &["add", "nope"])
         .contains("not available"));
+}
+
+#[test]
+fn a_github_repo_not_on_the_box_is_fetched_and_added() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.on_github("other");
+    f.ok(&f.root, &["create-session", "s1"]);
+    let added = f.ok(&f.session("s1"), &["add", "octo/other"]);
+    assert_eq!(added["repo"], "other");
+    assert!(f.session("s1").join("other").join("README.md").is_file());
+    let labels: Vec<String> = f
+        .ok(&f.root, &["available"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["label"].as_str().unwrap().to_string())
+        .collect();
+    assert!(labels.contains(&"octo/other".to_string()), "{labels:?}");
+
+    // A second session finds it on the box.
+    f.ok(&f.root, &["create-session", "s2"]);
+    f.ok(&f.session("s2"), &["add", "OCTO/other"]);
+    assert!(f.session("s2").join("other").join("README.md").is_file());
+}
+
+#[test]
+fn a_repo_github_does_not_have_is_refused_and_leaves_nothing() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.ok(&f.root, &["create-session", "s1"]);
+    let said = f.fails(&f.session("s1"), &["add", "octo/missing"]);
+    assert!(said.contains("cannot fetch octo/missing"), "{said}");
+    assert!(!f.root.join(".repos").join("missing.git").exists());
+}
+
+#[test]
+fn another_owners_repo_under_a_name_already_here_is_refused() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.git(
+        &f.bare(),
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/octo/demo",
+        ],
+    );
+    f.ok(&f.root, &["create-session", "s1"]);
+    let said = f.fails(&f.session("s1"), &["add", "someone/demo"]);
+    assert!(said.contains("octo/demo is already here"), "{said}");
+    f.ok(&f.session("s1"), &["add", "octo/demo"]);
+    assert!(f.session("s1").join("demo").join("README.md").is_file());
 }
 
 #[test]
