@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod layout;
@@ -128,6 +129,35 @@ struct Asked {
 const ASK_AGAIN_AFTER_S: u64 = 3_600;
 /// An answer nobody has needed for this long is forgotten.
 const FORGET_AFTER_S: u64 = 30 * 86_400;
+
+/// Held while `merged.json` is read, changed and written back. The reporter
+/// and housekeeping each ask GitHub on a thread of their own and remember
+/// what they heard in the one file; without it, one's answers could be
+/// written over with a copy read before them.
+static MERGES: Mutex<()> = Mutex::new(());
+
+fn read_merges(file: &Path) -> BTreeMap<String, Asked> {
+    fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Add one answer to `merged.json`: read afresh, so that what another thread
+/// wrote since this one asked is kept, and written back whole. Answers no one
+/// has needed for a month are dropped.
+fn remember_merge(file: &Path, key: String, answer: Asked) {
+    let _held = MERGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now_s = answer.at_s;
+    let mut asked = read_merges(file);
+    asked.retain(|_, earlier| now_s.saturating_sub(earlier.at_s) < FORGET_AFTER_S);
+    asked.insert(key, answer);
+    if let Ok(text) = serde_json::to_string(&asked) {
+        let _ = paths::write_private(file, text.as_bytes());
+    }
+}
 
 fn count(text: &str) -> Result<u32> {
     text.trim()
@@ -960,27 +990,20 @@ impl Workspace {
         let now_s = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
-        let mut asked: BTreeMap<String, Asked> = fs::read_to_string(file)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
-        match asked.get(&key) {
+        match read_merges(file).get(&key) {
             Some(answer) if answer.merged => return true,
             Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => return false,
             _ => {}
         }
         let merged = ask();
-        asked.retain(|_, answer| now_s.saturating_sub(answer.at_s) < FORGET_AFTER_S);
-        asked.insert(
+        remember_merge(
+            file,
             key,
             Asked {
                 merged,
                 at_s: now_s,
             },
         );
-        if let Ok(text) = serde_json::to_string(&asked) {
-            let _ = paths::write_private(file, text.as_bytes());
-        }
         merged
     }
 
@@ -1196,7 +1219,34 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_branch, valid_name, Unsaved};
+    use super::{read_merges, remember_merge, valid_branch, valid_name, Asked, Unsaved};
+
+    #[test]
+    fn answers_remembered_at_once_by_several_threads_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("merged.json");
+        let at_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let file = &file;
+                scope.spawn(move || {
+                    for n in 0..25 {
+                        let answer = Asked {
+                            merged: n % 2 == 0,
+                            at_s,
+                        };
+                        remember_merge(file, format!("octo/web@{thread}-{n}"), answer);
+                    }
+                });
+            }
+        });
+        let kept = read_merges(&file);
+        assert_eq!(kept.len(), 8 * 25);
+        assert!(kept["octo/web@3-4"].merged && !kept["octo/web@3-5"].merged);
+    }
 
     #[test]
     fn unsaved_work_is_put_in_the_words_a_refusal_uses() {
