@@ -176,6 +176,8 @@ const INHERITED: [&str; 11] = [
 
 /// The most of a config file that is read. A real one is a few hundred bytes.
 const MAX_CONFIG: u64 = 1024 * 1024;
+/// The most a call given a time limit may print.
+const MAX_TIMED_OUTPUT: u64 = 1024 * 1024;
 const CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The most of a worktree's `.git` file or a `commondir` that is read.
 const MAX_POINTER: u64 = 4096;
@@ -779,6 +781,40 @@ impl Git {
         match self {
             Git::Plain => tree(dir, args),
             Git::Guarded(_) => checked(self.try_tree(dir, args)?, Some(("-C", dir)), args),
+        }
+    }
+
+    /// As [`Git::try_tree`], stopped once it has run for `timeout`: a call
+    /// that runs over comes back failed, with `timed out` for its error
+    /// output. For a call that waits on a network, such as a push.
+    pub fn try_tree_within(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        timeout: std::time::Duration,
+    ) -> Result<Output> {
+        let mut command = match self {
+            Git::Plain => {
+                let mut command = Command::new("git");
+                command
+                    .env(NO_PROMPT.0, NO_PROMPT.1)
+                    .args(with_prefix("-C", dir, args));
+                command
+            }
+            Git::Guarded(guarded) => guarded.prepare(dir, false, args, None)?,
+        };
+        match crate::bounded::run(&mut command, timeout, MAX_TIMED_OUTPUT) {
+            Ok(out) => Ok(Output {
+                ok: out.ok,
+                stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+                stderr: out.stderr,
+            }),
+            Err(crate::bounded::Failure::Late) => Ok(Output {
+                ok: false,
+                stdout: String::new(),
+                stderr: "timed out".to_string(),
+            }),
+            Err(failure) => bail!("running git: {failure:?}"),
         }
     }
 

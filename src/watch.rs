@@ -406,6 +406,11 @@ impl UsageReport {
     }
 }
 
+/// The size of a value as JSON, for keeping a heartbeat within its limit.
+fn json_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
 /// The fields of a heartbeat's environment that are ahead of the contract
 /// every Watch holds. Watch refuses a heartbeat that carries a field it does
 /// not name, and to its owner a refused heartbeat is a machine gone dark, so
@@ -708,6 +713,46 @@ impl Heartbeat {
                 .map(|report| report.only(taken))
                 .collect(),
             ..self.clone()
+        }
+    }
+
+    /// Keep the heartbeat to at most `limit` bytes by leaving session
+    /// folders out of it: saved ones before unsaved ones, and the longest
+    /// unchanged first. Nothing else is ever left out for its size.
+    pub fn fit_worktrees(&mut self, limit: usize) {
+        let mut total = json_len(self);
+        if total <= limit {
+            return;
+        }
+        let mut candidates: Vec<(bool, String, usize, usize, usize)> = Vec::new();
+        for (at, report) in self.environments.iter().enumerate() {
+            for (index, folder) in report.worktrees.iter().flatten().enumerate() {
+                candidates.push((
+                    !folder.is_saved(),
+                    folder.last_change_at.clone().unwrap_or_default(),
+                    at,
+                    index,
+                    json_len(folder) + 1,
+                ));
+            }
+        }
+        candidates.sort();
+        let mut dropped = BTreeSet::new();
+        for (_, _, at, index, bytes) in candidates {
+            if total <= limit {
+                break;
+            }
+            dropped.insert((at, index));
+            total = total.saturating_sub(bytes);
+        }
+        for (at, report) in self.environments.iter_mut().enumerate() {
+            if let Some(folders) = &mut report.worktrees {
+                let mut index = 0;
+                folders.retain(|_| {
+                    index += 1;
+                    !dropped.contains(&(at, index - 1))
+                });
+            }
         }
     }
 
@@ -1493,6 +1538,53 @@ mod tests {
         );
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
+    }
+
+    #[test]
+    fn a_heartbeat_too_big_for_watch_leaves_out_saved_and_old_folders_first() {
+        let now = at(1_795_089_600_000);
+        let folder = |name: &str, saved: bool, changed: &str| Worktree {
+            folder: name.to_string(),
+            in_use: false,
+            last_change_at: Some(changed.to_string()),
+            repos: vec![worktrees::WorktreeRepo {
+                repo: "octo/web".to_string(),
+                branch: "x".repeat(200),
+                uncommitted: !saved,
+                unpushed_commits: 0,
+                merged_pull_request: None,
+                open_pull_request: None,
+            }],
+        };
+        let folders = vec![
+            folder("unsaved-old", false, "2026-01-01T00:00:00.000Z"),
+            folder("saved-new", true, "2026-11-01T00:00:00.000Z"),
+            folder("saved-old", true, "2026-02-01T00:00:00.000Z"),
+            folder("unsaved-new", false, "2026-11-02T00:00:00.000Z"),
+        ];
+        let report = EnvironmentReport::new("client-a", true, None, None, now).with_worktrees(
+            Some(folders),
+            None,
+            true,
+        );
+        let mut beat = Heartbeat::new(MachineHealth::default(), vec![report], now);
+        let whole = json_len(&beat);
+        let names = |beat: &Heartbeat| -> Vec<String> {
+            beat.environments[0]
+                .worktrees
+                .iter()
+                .flatten()
+                .map(|folder| folder.folder.clone())
+                .collect()
+        };
+        beat.fit_worktrees(whole);
+        assert_eq!(names(&beat).len(), 4);
+        // Room for three folders, then for two.
+        beat.fit_worktrees(whole - 100);
+        assert_eq!(names(&beat), ["unsaved-old", "saved-new", "unsaved-new"]);
+        beat.fit_worktrees(whole - 400);
+        assert_eq!(names(&beat), ["unsaved-old", "unsaved-new"]);
+        assert!(json_len(&beat) <= whole - 400);
     }
 
     #[test]

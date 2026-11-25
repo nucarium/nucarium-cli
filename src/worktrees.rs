@@ -10,17 +10,21 @@
 //!   push never holds up a heartbeat, and writes down each result for the
 //!   heartbeats that follow to carry, until one carrying it is answered.
 //!
-//! An action's id is remembered for a day once it has run, and it never runs
-//! twice. A result's detail is one plain sentence made here from fixed
-//! words, repo names, counts and ref names: never git's own text, a path, a
-//! host or a token.
+//! An action's id is written down before it runs and remembered for a day,
+//! and it never runs twice. A result's detail is one plain sentence made
+//! here from fixed words, repo names, counts and ref names: never git's own
+//! text, a path, a host or a token.
+//!
+//! A folder's repos are the ones its manifest lists and the worktrees its
+//! subagents made under `.subworktrees/`: each is reported, pushed, backed
+//! up and removed like the others.
 
 use crate::envelope::{rfc3339, unix_ms, valid_env_key};
 use crate::housekeeping;
 use crate::reporter;
 use crate::sessions::Store;
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::{Manifest, RepoInfo, Workspace};
+use crate::workspace::{RepoInfo, Unsaved, Workspace};
 use crate::{driver, git, paths, usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,10 +48,12 @@ const MAX_FILES: usize = 100_000;
 /// How long the id of an action that has run is remembered.
 const REMEMBER: Duration = Duration::from_secs(24 * 3_600);
 /// An action not started this long after it was asked for, or after it
-/// reached the box, is dropped unrun: Watch has given up on it by then.
-const EXPIRES: Duration = Duration::from_secs(15 * 60);
+/// reached the box, is dropped unrun: Watch delivers none older.
+const EXPIRES: Duration = Duration::from_secs(10 * 60);
 /// How far the box's clock and Watch's may be apart.
 const SKEW: Duration = Duration::from_secs(60);
+/// The longest a push may take before it is stopped and counted failed.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---- the report -----------------------------------------------------------
 
@@ -63,6 +69,15 @@ pub struct Worktree {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_change_at: Option<String>,
     pub repos: Vec<WorktreeRepo>,
+}
+
+impl Worktree {
+    /// Nothing in it is uncommitted or on no remote.
+    pub fn is_saved(&self) -> bool {
+        self.repos
+            .iter()
+            .all(|repo| !repo.uncommitted && repo.unpushed_commits == 0)
+    }
 }
 
 /// One repo of a session folder.
@@ -83,9 +98,10 @@ pub struct WorktreeRepo {
     pub open_pull_request: Option<String>,
 }
 
-/// `^[0-9A-Za-z._-]{1,128}$`
+/// `^[0-9A-Za-z._-]{1,128}$`, and neither `.` nor `..`.
 pub fn valid_folder(value: &str) -> bool {
     (1..=128).contains(&value.len())
+        && !matches!(value, "." | "..")
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
@@ -99,18 +115,31 @@ fn valid_repo(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
 }
 
-/// The name a repo goes by in the report and in a result's detail.
-fn repo_name(key: &str, info: &RepoInfo) -> String {
-    if valid_repo(&info.label) {
-        info.label.clone()
-    } else {
-        key.to_string()
-    }
+/// A branch as Watch takes one: at most 255 UTF-16 units, with no space or
+/// control character in it.
+fn reportable_branch(value: &str) -> bool {
+    value.encode_utf16().count() <= MAX_BRANCH
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// The repos of a folder that are there, by their names in its manifest.
-fn present(manifest: &Manifest) -> impl Iterator<Item = (&String, &RepoInfo)> {
-    manifest.repos.iter().filter(|(_, info)| info.path.is_dir())
+/// The name a repo goes by in the report and in a result's detail: its
+/// label, else the name it has in the folder. Nothing when neither is a
+/// name Watch takes. A subagent's worktree has the label of the repo it is
+/// a worktree of, and so is told as that repo.
+fn repo_name(key: &str, info: &RepoInfo) -> Option<String> {
+    [info.label.as_str(), key]
+        .into_iter()
+        .find(|name| valid_repo(name))
+        .map(str::to_string)
+}
+
+/// Every worktree of a folder that is there: its repos and its subagents'.
+fn worktrees_of(workspace: &Workspace, path: &Path) -> anyhow::Result<Vec<(String, RepoInfo)>> {
+    Ok(workspace
+        .session_worktrees(path)?
+        .into_iter()
+        .filter(|(_, info)| info.path.is_dir())
+        .collect())
 }
 
 /// The newest modification time, in Unix milliseconds, of any file that git
@@ -155,8 +184,26 @@ fn last_change(git: &git::Git, worktrees: &[&Path]) -> Option<u64> {
     newest
 }
 
-/// One folder, or nothing when one of its repos cannot be read: a folder
-/// shown as holding less than it does would invite cleaning it up.
+/// Fold a repo into a folder's list: one of the same name, a subagent's
+/// worktree of a repo already listed, adds what it holds to that entry.
+fn add_repo(repos: &mut Vec<WorktreeRepo>, repo: WorktreeRepo) {
+    match repos.iter_mut().find(|have| have.repo == repo.repo) {
+        Some(have) => {
+            have.uncommitted |= repo.uncommitted;
+            have.unpushed_commits = have
+                .unpushed_commits
+                .saturating_add(repo.unpushed_commits)
+                .min(MAX_UNPUSHED);
+            have.merged_pull_request = have.merged_pull_request.take().or(repo.merged_pull_request);
+            have.open_pull_request = have.open_pull_request.take().or(repo.open_pull_request);
+        }
+        None => repos.push(repo),
+    }
+}
+
+/// One folder, or nothing when one of its worktrees cannot be read, a repo
+/// has no name Watch takes, or it holds more repos than Watch takes: a
+/// folder shown as holding less than it does would invite cleaning it up.
 fn folder(
     workspace: &Workspace,
     store: &Store,
@@ -164,36 +211,44 @@ fn folder(
     name: &str,
     path: &Path,
 ) -> Option<Worktree> {
-    let manifest = Workspace::load_manifest(path).ok()?;
+    let worktrees = worktrees_of(workspace, path).ok()?;
     let sessions = housekeeping::agent_sessions(store, sharing, name);
     let in_use = housekeeping::in_use_because(&sessions, path).is_some();
     let git = workspace.git();
     let mut repos = Vec::new();
-    for (key, info) in present(&manifest).take(MAX_REPOS) {
+    for (key, info) in &worktrees {
         let unsaved = workspace.unsaved(&info.path).ok()?;
         let branch = git.tree(&info.path, &["branch", "--show-current"]).ok()?;
-        // Watch takes a branch of at most 255 characters with no space or
-        // control character in it. One that does not fit is sent blank.
-        let fits = branch.chars().count() <= MAX_BRANCH
-            && !branch.chars().any(|c| c.is_whitespace() || c.is_control());
-        let branch = if fits { branch } else { String::new() };
+        // One that does not fit is sent blank.
+        let branch = if reportable_branch(&branch) {
+            branch
+        } else {
+            String::new()
+        };
         let pulls = workspace.pull_requests(&info.path).unwrap_or_default();
-        repos.push(WorktreeRepo {
-            repo: repo_name(key, info),
-            branch,
-            uncommitted: unsaved.uncommitted,
-            unpushed_commits: u64::from(unsaved.unpushed).min(MAX_UNPUSHED),
-            merged_pull_request: pulls.merged,
-            open_pull_request: pulls.open,
-        });
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: repo_name(key, info)?,
+                branch,
+                uncommitted: unsaved.uncommitted,
+                unpushed_commits: u64::from(unsaved.unpushed).min(MAX_UNPUSHED),
+                merged_pull_request: pulls.merged,
+                open_pull_request: pulls.open,
+            },
+        );
     }
-    let worktrees: Vec<&Path> = present(&manifest)
+    if repos.len() > MAX_REPOS {
+        return None;
+    }
+    let paths: Vec<&Path> = worktrees
+        .iter()
         .map(|(_, info)| info.path.as_path())
         .collect();
     Some(Worktree {
         folder: name.to_string(),
         in_use,
-        last_change_at: last_change(git, &worktrees)
+        last_change_at: last_change(git, &paths)
             .map(|ms| rfc3339(UNIX_EPOCH + Duration::from_millis(ms))),
         repos,
     })
@@ -303,41 +358,52 @@ fn results_dir(state_dir: &Path, env: &str) -> PathBuf {
     base(state_dir).join("results").join(env)
 }
 
-fn done_file(state_dir: &Path) -> PathBuf {
-    base(state_dir).join("done.json")
+fn result_file(state_dir: &Path, env: &str, id: &str) -> PathBuf {
+    results_dir(state_dir, env).join(format!("{id}.json"))
 }
 
-/// The ids of the actions that have run, with when each finished.
-fn read_done(state_dir: &Path) -> BTreeMap<String, u64> {
-    fs::read_to_string(done_file(state_dir))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+fn started_file(state_dir: &Path) -> PathBuf {
+    base(state_dir).join("started.json")
 }
 
-fn remember_done(state_dir: &Path, id: &str, now: SystemTime) -> anyhow::Result<()> {
+/// The ids of the actions that have been started, each with when, written
+/// down before it ran. A file that is there and cannot be read is an error,
+/// never "none": read as none, it would let an action run a second time.
+fn read_started(state_dir: &Path) -> anyhow::Result<BTreeMap<String, u64>> {
+    match fs::read_to_string(started_file(state_dir)) {
+        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Write down that an action is starting, before anything of it runs.
+fn remember_started(state_dir: &Path, id: &str, now: SystemTime) -> anyhow::Result<()> {
     let now_ms = unix_ms(now);
-    let mut done = read_done(state_dir);
+    let mut started = read_started(state_dir)?;
     let remember = REMEMBER.as_millis() as u64;
-    done.retain(|_, at| now_ms.saturating_sub(*at) < remember);
-    done.insert(id.to_string(), now_ms);
+    started.retain(|_, at| now_ms.saturating_sub(*at) < remember);
+    started.insert(id.to_string(), now_ms);
     paths::write_private(
-        &done_file(state_dir),
-        serde_json::to_string(&done)?.as_bytes(),
+        &started_file(state_dir),
+        serde_json::to_string(&started)?.as_bytes(),
     )
 }
 
-/// Write down the actions Watch has just sent, each once: one that has run,
-/// or is already waiting, is passed over, and so is one for an environment
-/// this box does not have. Only the daemon's loop calls this, and it runs
-/// nothing.
+/// Write down the actions Watch has just sent, each once: one that has been
+/// started, or is already waiting, is passed over, and so is one for an
+/// environment this box does not have. Only the daemon's loop calls this,
+/// and it runs nothing.
 pub fn take(settings: &Settings, actions: &[Action], now: SystemTime) {
     if actions.is_empty() {
         return;
     }
-    let done = read_done(&settings.state_dir);
+    let Ok(started) = read_started(&settings.state_dir) else {
+        eprintln!("nucleated: the record of worktree actions cannot be read; taking none");
+        return;
+    };
     for action in actions.iter().filter(|action| action.valid()) {
-        if done.contains_key(&action.id) || settings.environment(&action.env_id).is_none() {
+        if started.contains_key(&action.id) || settings.environment(&action.env_id).is_none() {
             continue;
         }
         let file = queue_dir(&settings.state_dir).join(format!("{}.json", action.id));
@@ -380,8 +446,18 @@ pub fn forget(state_dir: &Path, env: &str, results: &[ActionResult]) {
         return;
     }
     for result in results.iter().filter(|result| valid_id(&result.id)) {
-        let _ = fs::remove_file(results_dir(state_dir, env).join(format!("{}.json", result.id)));
+        let _ = fs::remove_file(result_file(state_dir, env, &result.id));
     }
+}
+
+/// Write an action's result down, unless one is there already: a result is
+/// never written over.
+fn write_result(state_dir: &Path, env: &str, result: &ActionResult) -> anyhow::Result<()> {
+    let file = result_file(state_dir, env, &result.id);
+    if file.exists() {
+        return Ok(());
+    }
+    paths::write_private(&file, serde_json::to_string(result)?.as_bytes())
 }
 
 // ---- running an action ----------------------------------------------------
@@ -435,7 +511,9 @@ fn commits(count: u32) -> String {
 /// is passed on: it may name the remote's address, and through it a token.
 fn push_failure(stderr: &str, repo: &str) -> String {
     let said = stderr.to_lowercase();
-    let why = if ["non-fast-forward", "[rejected]", "fetch first"]
+    let why = if said == "timed out" {
+        "it took too long"
+    } else if ["non-fast-forward", "[rejected]", "fetch first"]
         .iter()
         .any(|word| said.contains(word))
     {
@@ -472,19 +550,28 @@ fn push_failure(stderr: &str, repo: &str) -> String {
     format!("{repo} was not pushed: {why}.")
 }
 
-fn push(workspace: &Workspace, manifest: &Manifest) -> Ended {
+/// True for a branch name that can go into a refspec as it is: git takes it
+/// as a branch, and it cannot be read as an option or a forced update.
+fn pushable_branch(git: &git::Git, worktree: &Path, branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with(['-', '+'])
+        && git
+            .try_tree(worktree, &["check-ref-format", "--branch", branch])
+            .is_ok_and(|out| out.ok && out.stdout == branch)
+}
+
+fn push(workspace: &Workspace, worktrees: &[(String, RepoInfo)]) -> Ended {
     let git = workspace.git();
-    let mut pushed = Vec::new();
-    let mut total = 0u32;
-    let mut uncommitted = Vec::new();
+    let mut pushed: Vec<(String, u32)> = Vec::new();
+    let mut uncommitted: Vec<String> = Vec::new();
     let mut failures = Vec::new();
-    for (key, info) in present(manifest) {
-        let name = repo_name(key, info);
+    for (key, info) in worktrees {
+        let name = repo_name(key, info).unwrap_or_else(|| "a repo".to_string());
         let Ok(unsaved) = workspace.unsaved(&info.path) else {
             failures.push(format!("{name} could not be read."));
             continue;
         };
-        if unsaved.uncommitted {
+        if unsaved.uncommitted && !uncommitted.contains(&name) {
             uncommitted.push(name.clone());
         }
         if unsaved.unpushed == 0 {
@@ -497,28 +584,44 @@ fn push(workspace: &Workspace, manifest: &Manifest) -> Ended {
         if branch.is_empty() {
             continue;
         }
-        match git.try_tree(&info.path, &["push", "-q", "-u", "origin", &branch]) {
-            Ok(out) if out.ok => {
-                total = total.saturating_add(unsaved.unpushed);
-                pushed.push(format!("{} in {name}", commits(unsaved.unpushed)));
-            }
+        if !pushable_branch(git, &info.path, &branch) {
+            failures.push(format!(
+                "{name} was not pushed: its branch has a name that cannot be pushed safely."
+            ));
+            continue;
+        }
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let args = ["push", "-q", "-u", "origin", "--", refspec.as_str()];
+        match git.try_tree_within(&info.path, &args, PUSH_TIMEOUT) {
+            Ok(out) if out.ok => match pushed.iter_mut().find(|(have, _)| *have == name) {
+                Some((_, count)) => *count = count.saturating_add(unsaved.unpushed),
+                None => pushed.push((name, unsaved.unpushed)),
+            },
             Ok(out) => failures.push(push_failure(&out.stderr, &name)),
             Err(_) => failures.push(format!("{name} was not pushed: git cannot be run there.")),
         }
     }
     if !failures.is_empty() {
-        let text = failures.join(" ");
         let count = failures.len();
         return ended(
             Outcome::Failed,
-            fit(text, || format!("{count} repos were not pushed.")),
+            fit(failures.join(" "), || {
+                format!("{count} repos were not pushed.")
+            }),
         );
     }
     if pushed.is_empty() {
         return ended(Outcome::Refused, "There is nothing to push.");
     }
-    let mut text = format!("Pushed {}.", listed(&pushed));
+    let total = pushed
+        .iter()
+        .fold(0u32, |sum, (_, count)| sum.saturating_add(*count));
     let repos = pushed.len();
+    let parts: Vec<String> = pushed
+        .iter()
+        .map(|(name, count)| format!("{} in {name}", commits(*count)))
+        .collect();
+    let mut text = format!("Pushed {}.", listed(&parts));
     match uncommitted.as_slice() {
         [] => {}
         [one] => text.push_str(&format!(" {one} has changes that are not committed.")),
@@ -536,7 +639,7 @@ fn push(workspace: &Workspace, manifest: &Manifest) -> Ended {
 }
 
 /// What a repo holds that is not on GitHub, in the words Watch uses.
-fn unsaved_words(unsaved: &crate::workspace::Unsaved, name: &str) -> Vec<String> {
+fn unsaved_words(unsaved: &Unsaved, name: &str) -> Vec<String> {
     let mut words = Vec::new();
     if unsaved.unpushed > 0 {
         words.push(format!(
@@ -550,69 +653,130 @@ fn unsaved_words(unsaved: &crate::workspace::Unsaved, name: &str) -> Vec<String>
     words
 }
 
-/// Push a backup of one repo's unsaved work to `refs/wip/<branch>`: its
+/// A worktree as it stood at one moment: its `HEAD`, and the tree of all it
+/// holds, uncommitted and untracked files included.
+#[derive(PartialEq, Eq)]
+struct Standing {
+    head: String,
+    tree: String,
+}
+
+fn standing(git: &git::Git, info: &RepoInfo, keys: &Path) -> anyhow::Result<Standing> {
+    Ok(Standing {
+        head: git.tree(&info.path, &["rev-parse", "HEAD"])?,
+        tree: housekeeping::working_tree(git, &info.path, keys, "backup")?,
+    })
+}
+
+/// True when a tree holds a nested repository that `HEAD` does not: another
+/// repository inside the worktree, which a commit can only point at, not
+/// hold.
+fn new_gitlinks(git: &git::Git, worktree: &Path, tree: &str) -> anyhow::Result<bool> {
+    let links = |object: &str| -> anyhow::Result<Vec<String>> {
+        let (ok, listed, error) = git.tree_raw(worktree, &["ls-tree", "-r", "-z", object], &[])?;
+        if !ok {
+            anyhow::bail!("git ls-tree failed: {error}");
+        }
+        Ok(listed
+            .split(|byte| *byte == 0)
+            .map(|entry| String::from_utf8_lossy(entry).to_string())
+            .filter(|entry| entry.starts_with("160000 "))
+            .collect())
+    };
+    let before = links("HEAD")?;
+    Ok(links(tree)?.iter().any(|link| !before.contains(link)))
+}
+
+/// The ref a backup went to, or why it could not be made.
+enum Backup {
+    Pushed(String),
+    Failed(String),
+}
+
+/// Push a backup of one worktree's unsaved work to a ref of this action's
+/// own, `refs/wip/<branch>-<action id>`, that nothing else writes: its
 /// commits and, as a commit of their own made on no branch, its uncommitted
-/// changes. The ref it went to, or nothing when the push failed.
+/// changes. Never over anything already there.
 fn back_up(
     git: &git::Git,
+    name: &str,
     info: &RepoInfo,
-    uncommitted: bool,
-    keys: &Path,
-    now: SystemTime,
-) -> anyhow::Result<Option<String>> {
+    seen: &Standing,
+    action: &Action,
+) -> anyhow::Result<Backup> {
     let current = git.tree(&info.path, &["branch", "--show-current"])?;
     let branch = if current.is_empty() {
         info.branch.clone()
     } else {
         current
     };
-    let head = git.tree(&info.path, &["rev-parse", "HEAD"])?;
-    let commit = if uncommitted {
-        let tree = housekeeping::working_tree(git, &info.path, keys, &branch)?;
-        if tree == git.tree(&info.path, &["rev-parse", "HEAD^{tree}"])? {
-            head
-        } else {
-            housekeeping::wip_commit(git, &info.path, &tree, &branch, now)?
-        }
+    if !pushable_branch(git, &info.path, &branch) {
+        return Ok(Backup::Failed(format!(
+            "The backup of {name} could not be made, as its branch has a name that cannot be \
+             used, so nothing was removed."
+        )));
+    }
+    if new_gitlinks(git, &info.path, &seen.tree)? {
+        return Ok(Backup::Failed(format!(
+            "{name} holds another git repository that cannot be backed up, so nothing was \
+             removed."
+        )));
+    }
+    let head_tree = git.tree(&info.path, &["rev-parse", "HEAD^{tree}"])?;
+    let commit = if seen.tree == head_tree {
+        seen.head.clone()
     } else {
-        head
+        housekeeping::wip_commit(git, &info.path, &seen.tree, &branch, SystemTime::now())?
     };
-    let reference = housekeeping::wip_ref(&branch);
-    Ok(housekeeping::push_wip(git, &info.path, &commit, &reference)?.then_some(reference))
+    let reference = format!("{}-{}", housekeeping::wip_ref(&branch), action.id);
+    let refspec = format!("{commit}:{reference}");
+    let pushed = git.try_tree_within(
+        &info.path,
+        &["push", "-q", "origin", "--", refspec.as_str()],
+        PUSH_TIMEOUT,
+    )?;
+    Ok(match pushed.ok {
+        true => Backup::Pushed(reference),
+        false => Backup::Failed(format!(
+            "The backup of {name} could not be pushed, so nothing was removed."
+        )),
+    })
 }
 
 fn clean_up(
     workspace: &Workspace,
-    manifest: &Manifest,
     path: &Path,
-    discard: bool,
+    action: &Action,
+    in_use: &dyn Fn() -> bool,
     keys: &Path,
-    now: SystemTime,
 ) -> Ended {
-    let mut unsaved = Vec::new();
-    for (key, info) in present(manifest) {
-        let name = repo_name(key, info);
+    let git = workspace.git();
+    let unreadable = || {
+        ended(
+            Outcome::Failed,
+            "A repo in it could not be read, so nothing was removed.",
+        )
+    };
+    let Ok(worktrees) = worktrees_of(workspace, path) else {
+        return unreadable();
+    };
+    let mut holding = Vec::new();
+    for (key, info) in &worktrees {
+        let name = repo_name(key, info).unwrap_or_else(|| "a repo".to_string());
         match workspace.unsaved(&info.path) {
-            Ok(found) => unsaved.push((name, info, found)),
-            Err(_) => {
-                return ended(
-                    Outcome::Failed,
-                    format!("{name} could not be read, so nothing was removed."),
-                )
-            }
+            Ok(found) if found.is_saved() => {}
+            Ok(found) => holding.push((name, info, found)),
+            Err(_) => return unreadable(),
         }
     }
-    let holding: Vec<_> = unsaved
-        .iter()
-        .filter(|(_, _, found)| !found.is_saved())
-        .collect();
     if holding.is_empty() {
+        // Removed only if, looked at again, it still holds nothing unsaved.
         return match workspace.remove_session(path) {
             Ok(_) => ended(Outcome::Done, "Cleaned up."),
             Err(_) => ended(Outcome::Failed, "It could not be removed."),
         };
     }
-    if !discard {
+    if !action.discard {
         let words: Vec<String> = holding
             .iter()
             .flat_map(|(name, _, found)| unsaved_words(found, name))
@@ -625,17 +789,32 @@ fn clean_up(
             }),
         );
     }
+    // How each worktree stands before anything is pushed: what is backed up,
+    // and what it is compared with just before anything is removed.
+    let mut before = Vec::new();
+    for (_, info) in &worktrees {
+        match standing(git, info, keys) {
+            Ok(seen) => before.push(seen),
+            Err(_) => return unreadable(),
+        }
+    }
     // Every backup is pushed before anything is removed, and one that fails
     // removes nothing.
-    let git = workspace.git();
     let mut backed_up = Vec::new();
-    for (name, info, found) in &holding {
-        match back_up(git, info, found.uncommitted, keys, now) {
-            Ok(Some(reference)) => backed_up.push(format!("{reference} in {name}")),
-            _ => {
+    for (name, info, _) in &holding {
+        let Some(at) = worktrees
+            .iter()
+            .position(|(_, have)| have.path == info.path)
+        else {
+            return unreadable();
+        };
+        match back_up(git, name, info, &before[at], action) {
+            Ok(Backup::Pushed(reference)) => backed_up.push(format!("{reference} in {name}")),
+            Ok(Backup::Failed(detail)) => return ended(Outcome::Failed, fit(detail, String::new)),
+            Err(_) => {
                 return ended(
                     Outcome::Failed,
-                    format!("The backup of {name} could not be pushed, so nothing was removed."),
+                    format!("The backup of {name} could not be made, so nothing was removed."),
                 )
             }
         }
@@ -644,6 +823,28 @@ fn clean_up(
     let backed = fit(format!("Backed up to {}.", listed(&backed_up)), || {
         format!("Backed up {repos} repos to GitHub.")
     });
+    // Looked at once more just before the removal. A session that came
+    // back to it, a repo added or gone, or a commit or a change made since
+    // the backup, and nothing is removed.
+    let changed = in_use()
+        || worktrees_of(workspace, path).map_or(true, |now| {
+            now.len() != worktrees.len()
+                || now.iter().zip(&worktrees).zip(&before).any(
+                    |(((_, now_info), (_, then_info)), seen)| {
+                        now_info.path != then_info.path
+                            || standing(git, now_info, keys).map_or(true, |now| &now != seen)
+                    },
+                )
+        });
+    if changed {
+        return ended(
+            Outcome::Failed,
+            fit(
+                format!("{backed} It changed while it was backed up, so nothing was removed."),
+                || "It changed while it was backed up, so nothing was removed.".to_string(),
+            ),
+        );
+    }
     match workspace.remove_session_with(path, true) {
         Ok(_) => ended(Outcome::Done, backed),
         Err(_) => ended(
@@ -656,7 +857,7 @@ fn clean_up(
 }
 
 /// Run one action in one environment.
-fn run(settings: &Settings, environment: &Environment, action: &Action, now: SystemTime) -> Ended {
+fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended {
     // The box's owner turns actions on; until then each is refused unrun.
     if !settings.worktree_actions {
         return ended(Outcome::Refused, "Actions are off on this box.");
@@ -668,40 +869,44 @@ fn run(settings: &Settings, environment: &Environment, action: &Action, now: Sys
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(housekeeping::merges_file(&settings.state_dir));
     let path = environment.root.join(".worktrees").join(&action.folder);
-    let gone = || match action.kind {
-        Kind::Push => ended(Outcome::Refused, "There is nothing to push."),
-        Kind::CleanUp => ended(Outcome::Done, "It was already cleaned up."),
-    };
     if !path.exists() {
-        return gone();
+        return match action.kind {
+            Kind::Push => ended(Outcome::Refused, "There is nothing to push."),
+            Kind::CleanUp => ended(Outcome::Done, "It was already cleaned up."),
+        };
     }
-    let Ok(manifest) = Workspace::load_manifest(&path) else {
+    if Workspace::load_manifest(&path).is_err() {
         return ended(Outcome::Refused, "It is not a session folder.");
+    }
+    let Ok(worktrees) = worktrees_of(&workspace, &path) else {
+        return ended(Outcome::Failed, "A repo in it could not be read.");
     };
     let left_alone = workspace.leaves_alone(&path)
-        || manifest
-            .repos
-            .values()
-            .any(|info| workspace.leaves_alone(&info.path));
+        || worktrees
+            .iter()
+            .any(|(_, info)| workspace.leaves_alone(&info.path));
     if left_alone {
         return ended(Outcome::Refused, "The box leaves this folder alone.");
     }
     match action.kind {
-        Kind::Push => push(&workspace, &manifest),
+        Kind::Push => push(&workspace, &worktrees),
         Kind::CleanUp => {
             let store = Store::new(&settings.state_dir);
             let sharing = housekeeping::sharing_nucleus(settings, environment);
-            let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
-            if housekeeping::in_use_because(&sessions, &path).is_some() {
+            let in_use = || {
+                let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
+                housekeeping::in_use_because(&sessions, &path).is_some()
+            };
+            if in_use() {
                 return ended(Outcome::Refused, "A session is still using it.");
             }
             let keys = base(&settings.state_dir).join("index");
-            clean_up(&workspace, &manifest, &path, action.discard, &keys, now)
+            clean_up(&workspace, &path, action, &in_use, &keys)
         }
     }
 }
 
-/// True for an action asked for longer ago than Watch waits for it, by this
+/// True for an action asked for longer ago than Watch delivers one, by this
 /// box's clock, less a little for the two clocks being apart. One whose time
 /// cannot be read is judged by when it reached the box alone.
 fn too_old(requested_at: &str, now: SystemTime) -> bool {
@@ -711,8 +916,9 @@ fn too_old(requested_at: &str, now: SystemTime) -> bool {
 }
 
 /// Run every action that is waiting, each once, and write down its result.
-/// Returns how many ran.
-pub fn run_queued(settings: &Settings, now: SystemTime) -> usize {
+/// Returns how many ran. Nothing runs while the record of what was started
+/// cannot be read.
+pub fn run_queued(settings: &Settings) -> usize {
     let state_dir = &settings.state_dir;
     let Ok(entries) = fs::read_dir(queue_dir(state_dir)) else {
         return 0;
@@ -737,33 +943,47 @@ pub fn run_queued(settings: &Settings, now: SystemTime) -> usize {
             let _ = fs::remove_file(&file);
             continue;
         };
-        let late = unix_ms(now).saturating_sub(received_ms) > EXPIRES.as_millis() as u64
-            || too_old(&action.requested_at, now);
-        let environment = settings.environment(&action.env_id);
-        if late || environment.is_none() || read_done(state_dir).contains_key(&action.id) {
-            let _ = fs::remove_file(&file);
+        // Each action is judged by the time it starts, not the batch's.
+        let now = SystemTime::now();
+        let Ok(started) = read_started(state_dir) else {
+            eprintln!("nucleated: the record of worktree actions cannot be read; running none");
+            return ran;
+        };
+        if started.contains_key(&action.id) {
+            // Started before and never finished: the box stopped while it
+            // ran. It is not run again, and Watch hears so.
+            let stopped = ActionResult {
+                id: action.id.clone(),
+                outcome: Outcome::Failed,
+                detail: "The box stopped while it ran, and it was not run again.".to_string(),
+                finished_at: rfc3339(now),
+            };
+            if write_result(state_dir, &action.env_id, &stopped).is_ok() {
+                let _ = fs::remove_file(&file);
+            }
             continue;
         }
-        let Some(environment) = environment else {
+        let late = unix_ms(now).saturating_sub(received_ms) > EXPIRES.as_millis() as u64
+            || too_old(&action.requested_at, now);
+        let Some(environment) = settings.environment(&action.env_id).filter(|_| !late) else {
+            let _ = fs::remove_file(&file);
             continue;
         };
-        let end = run(settings, environment, &action, now);
-        let finished = SystemTime::now().max(now);
+        if remember_started(state_dir, &action.id, now).is_err() {
+            eprintln!(
+                "nucleated: worktree action {} not started: its start could not be written down",
+                action.id
+            );
+            continue;
+        }
+        let end = run(settings, environment, &action);
         let result = ActionResult {
             id: action.id.clone(),
             outcome: end.outcome,
             detail: end.detail,
-            finished_at: rfc3339(finished),
+            finished_at: rfc3339(SystemTime::now().max(now)),
         };
-        let written = serde_json::to_string(&result)
-            .map_err(anyhow::Error::from)
-            .and_then(|text| {
-                paths::write_private(
-                    &results_dir(state_dir, &action.env_id).join(format!("{}.json", action.id)),
-                    text.as_bytes(),
-                )
-            });
-        if written.is_ok() && remember_done(state_dir, &action.id, finished).is_ok() {
+        if write_result(state_dir, &action.env_id, &result).is_ok() {
             let _ = fs::remove_file(&file);
         }
         eprintln!(
@@ -782,7 +1002,7 @@ pub fn run_queued(settings: &Settings, now: SystemTime) -> usize {
 pub fn run_schedule(config: &Path, stop: &AtomicBool) {
     loop {
         if let Ok(settings) = settings::load_from(config) {
-            run_queued(&settings, SystemTime::now());
+            run_queued(&settings);
         }
         if housekeeping::wait(stop, Duration::from_secs(1)) {
             return;
@@ -858,11 +1078,44 @@ mod tests {
         assert!(!valid_folder(""));
         assert!(!valid_folder("a/b"));
         assert!(!valid_folder(&"a".repeat(129)));
+        assert!(!valid_folder("."));
+        assert!(!valid_folder(".."));
+        assert!(valid_folder("..."));
         assert!(valid_id("wta_abcdefghijklmn27"));
         assert!(valid_id("wta_0123456789abcdef"));
         assert!(!valid_id("wta_abcdefghijklmn2_"));
         assert!(!valid_id("wta_short"));
         assert!(valid_repo("octo/api"));
         assert!(!valid_repo("octo api"));
+    }
+
+    #[test]
+    fn a_branch_is_measured_as_watch_measures_it() {
+        assert!(reportable_branch("workspace/fix-login"));
+        assert!(reportable_branch(""));
+        // A character outside the basic plane is two UTF-16 units.
+        assert!(!reportable_branch(&"\u{1F600}".repeat(200)));
+        assert!(reportable_branch(&"\u{1F600}".repeat(127)));
+        assert!(!reportable_branch("has space"));
+        assert!(!reportable_branch("tab\there"));
+    }
+
+    #[test]
+    fn a_subagents_worktree_of_a_repo_is_folded_into_it() {
+        let repo = |name: &str, uncommitted, unpushed| WorktreeRepo {
+            repo: name.to_string(),
+            branch: "b".to_string(),
+            uncommitted,
+            unpushed_commits: unpushed,
+            merged_pull_request: None,
+            open_pull_request: None,
+        };
+        let mut repos = Vec::new();
+        add_repo(&mut repos, repo("octo/web", false, 1));
+        add_repo(&mut repos, repo("octo/api", false, 0));
+        add_repo(&mut repos, repo("octo/web", true, MAX_UNPUSHED));
+        assert_eq!(repos.len(), 2);
+        assert!(repos[0].uncommitted);
+        assert_eq!(repos[0].unpushed_commits, MAX_UNPUSHED);
     }
 }

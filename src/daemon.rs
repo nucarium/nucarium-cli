@@ -34,6 +34,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The most a heartbeat may be, well under the most Watch takes from a box
+/// that reports worktrees. Session folders are left out to keep it so.
+const MAX_HEARTBEAT: usize = 768 * 1024;
+
 /// The numbers the loop runs on. Tests shorten them; the daemon uses the defaults.
 #[derive(Debug, Clone)]
 pub struct Timings {
@@ -567,6 +571,7 @@ impl Daemon {
         if let (true, Some(client), Some(token)) = (self.hosted(), &self.client, &self.token) {
             self.heartbeat.last_attempt_at = Some(stamp.clone());
             let mut body = known.only(&self.taken_now(now));
+            body.fit_worktrees(MAX_HEARTBEAT);
             let mut answer = client.heartbeat(token, &body);
             if matches!(answer, Err(ApiError::Refused { .. })) && !body.ahead().is_empty() {
                 // Watch said it takes these and then refused them. Say at
