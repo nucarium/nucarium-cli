@@ -11,6 +11,7 @@
 
 use crate::envelope::{valid_env_key, valid_session_id, EventType};
 use crate::paths;
+use crate::process::Identity;
 use crate::spool::Record;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -69,6 +70,15 @@ pub struct Session {
     /// The nucleus session folder this agent session works in.
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The agent process its hooks last ran from. The daemon ends the
+    /// session when that process has gone. Never sent.
+    #[serde(default)]
+    pub process: Option<Identity>,
+    /// Whether the daemon has found that process running. Only a process
+    /// once found can be found gone: one the daemon never sees may be a
+    /// wrapper that exited at once, or one it cannot see at all.
+    #[serde(default)]
+    pub process_seen: bool,
     pub started_ms: u64,
     pub last_event_ms: u64,
     #[serde(default)]
@@ -192,6 +202,8 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
             branch: None,
             bridge_session_id: None,
             workspace: None,
+            process: None,
+            process_seen: false,
             started_ms: record.at_ms,
             last_event_ms: record.at_ms,
             ended_ms: None,
@@ -237,6 +249,11 @@ pub fn apply(previous: Option<Session>, record: &Record) -> Option<Applied> {
     }
     if record.workspace.is_some() {
         session.workspace = record.workspace.clone();
+    }
+    // Another process is another thing to find, and it has not been found.
+    if let Some(process) = record.process.filter(|p| session.process != Some(*p)) {
+        session.process = Some(process);
+        session.process_seen = false;
     }
     session.last_event_ms = record.at_ms;
     session.last_event_id = event.event_id.clone();
@@ -325,6 +342,7 @@ mod tests {
             event: Envelope::new(kind, draft, now).unwrap(),
             at_ms,
             workspace: None,
+            process: None,
         }
     }
 
@@ -538,6 +556,7 @@ mod tests {
             event: Envelope::new(Outcome, draft, now).unwrap(),
             at_ms,
             workspace: None,
+            process: None,
         }
     }
 
@@ -628,6 +647,45 @@ mod tests {
         let late = apply(Some(again.clone()), &outcome(15_000, |_| {})).unwrap();
         assert!(!late.changed);
         assert_eq!(late.session, again);
+    }
+
+    #[test]
+    fn a_session_keeps_the_last_agent_process_its_hooks_ran_from() {
+        let from = |kind: EventType, at_ms: u64, pid: Option<u32>| Record {
+            process: pid.map(|pid| Identity { pid, start: 1_000 }),
+            ..record(kind, at_ms)
+        };
+        let mut first = apply(None, &from(SessionStart, 1_000, Some(40)))
+            .unwrap()
+            .session;
+        assert_eq!(first.process.map(|p| p.pid), Some(40));
+        assert!(!first.process_seen);
+        // The daemon has found it running.
+        first.process_seen = true;
+        // An event from the same process, or from no known one, leaves the
+        // last one known, and found.
+        let same = apply(Some(first), &from(Activity, 1_500, Some(40)))
+            .unwrap()
+            .session;
+        let quiet = apply(Some(same), &from(UserPromptSubmit, 2_000, None))
+            .unwrap()
+            .session;
+        assert_eq!(quiet.process.map(|p| p.pid), Some(40));
+        assert!(quiet.process_seen);
+        // Another process has not been found yet.
+        let resumed = apply(Some(quiet), &from(Stop, 3_000, Some(41)))
+            .unwrap()
+            .session;
+        assert_eq!(resumed.process.map(|p| p.pid), Some(41));
+        assert!(!resumed.process_seen);
+        // A new start after an end is a new session, with only its own.
+        let ended = apply(Some(resumed), &from(SessionEnd, 4_000, None))
+            .unwrap()
+            .session;
+        let again = apply(Some(ended), &from(SessionStart, 5_000, None))
+            .unwrap()
+            .session;
+        assert_eq!(again.process, None);
     }
 
     #[test]

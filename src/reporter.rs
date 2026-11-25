@@ -565,6 +565,7 @@ impl Reporter {
                     event,
                     at_ms: now_ms,
                     workspace: None,
+                    process: None,
                 });
             }
         }

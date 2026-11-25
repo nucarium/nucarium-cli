@@ -7,13 +7,14 @@
 
 use crate::envelope::{valid_event_id, Envelope};
 use crate::paths;
+use crate::process::Identity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// What a spool file holds: the envelope, and two facts that stay on the box.
+/// What a spool file holds: the envelope, and facts that stay on the box.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub event: Envelope,
@@ -23,6 +24,10 @@ pub struct Record {
     /// Housekeeping uses it to know which folders are finished. Never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The agent process whose hook wrote this, so the daemon can end the
+    /// session if that process goes without saying so. Never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Identity>,
 }
 
 #[derive(Debug, Clone)]
