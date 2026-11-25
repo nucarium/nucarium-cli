@@ -88,8 +88,8 @@ pub struct Unsaved {
     /// Changes that are not committed, untracked files included.
     pub uncommitted: bool,
     /// Commits on no remote: those ahead of the branch's upstream or, for a
-    /// branch with none, those no remote branch holds, unless a merged pull
-    /// request's head is this very commit.
+    /// branch with none of its own, those no remote branch holds, unless
+    /// this very commit is one of a merged pull request's.
     pub unpushed: u32,
     /// Whether `unpushed` was counted against an upstream.
     pub tracked: bool,
@@ -806,10 +806,21 @@ impl Workspace {
                 ],
             )?;
         } else {
+            // A new branch tracks nothing: the default branch it starts
+            // from is not where its work goes, and counting against it would
+            // count merged work as unpushed for ever.
             let start = format!("origin/{default}");
             self.git.bare(
                 &item.bare,
-                &["worktree", "add", "-b", &branch, &child_arg, &start],
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    &branch,
+                    &child_arg,
+                    &start,
+                ],
             )?;
         }
         self.copy_includes(&item.repo, &child)?;
@@ -872,16 +883,12 @@ impl Workspace {
             .git
             .tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
         let uncommitted = !status.is_empty();
-        let upstream = self.git.try_tree(
+        let common = self.git.tree(
             child,
-            &[
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{upstream}",
-            ],
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
-        if upstream.ok && !upstream.stdout.is_empty() {
+        let common = Path::new(&common);
+        if self.has_own_upstream(child, common)? {
             let ahead = self
                 .git
                 .tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?;
@@ -897,12 +904,8 @@ impl Workspace {
             .tree(child, &["branch", "-r", "--contains", "HEAD"])?
             .is_empty()
         {
-            let common = self.git.tree(
-                child,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            )?;
             let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
-            if !self.merged(Path::new(&common), &head) {
+            if !self.merged(common, &head) {
                 let alone = self.git.tree(
                     child,
                     &["rev-list", "--count", "HEAD", "--not", "--remotes"],
@@ -916,6 +919,23 @@ impl Workspace {
             unpushed,
             tracked: false,
         })
+    }
+
+    /// True when a worktree's branch tracks a branch of its own on a remote,
+    /// one that still exists: the commits ahead of it are then the ones not
+    /// pushed. The remote's default branch is not such a branch. A session's
+    /// work is merged into it, often squashed, so counting against it would
+    /// count finished work as unpushed for ever.
+    fn has_own_upstream(&self, child: &Path, common: &Path) -> Result<bool> {
+        let upstream = self
+            .git
+            .try_tree(child, &["rev-parse", "--symbolic-full-name", "@{upstream}"])?;
+        // No upstream, or one whose remote branch is gone, fails here.
+        if !upstream.ok || !upstream.stdout.starts_with("refs/remotes/") {
+            return Ok(false);
+        }
+        let default = format!("refs/remotes/origin/{}", self.default_branch(common));
+        Ok(upstream.stdout != default)
     }
 
     /// Reasons a worktree must not be deleted: anything that exists nowhere else.
