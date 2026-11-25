@@ -138,7 +138,22 @@ pub fn run_job(
     let workspace =
         workspace(settings, environment).leaving_alone(driver::protected_roots(settings));
     let mut report = match job {
-        Job::Refresh => json!({ "repos": workspace.refresh()? }),
+        Job::Refresh => {
+            // A nucleus made before owner folders moves to them first.
+            // One that fails says so, and the repos are fetched as they are.
+            let moved = match dry_run {
+                true => Vec::new(),
+                false => match workspace.move_to_owner_folders() {
+                    Ok(moved) => moved.lines(),
+                    Err(error) => vec![format!("moving repos to owner folders: {error:#}")],
+                },
+            };
+            let mut report = json!({ "repos": workspace.refresh()? });
+            if !moved.is_empty() {
+                report["moved"] = json!(moved);
+            }
+            report
+        }
         Job::Cleanup => {
             let store = Store::new(&settings.state_dir);
             let sharing = sharing_nucleus(settings, environment);

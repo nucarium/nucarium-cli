@@ -94,7 +94,7 @@ fn a_second_nucleus_does_not_take_over_the_config() {
 #[test]
 fn clone_makes_a_repo_available_for_sessions() {
     let rig = Rig::new();
-    let bare = rig.root.join(".repos/web.git");
+    let bare = rig.bare();
     assert!(bare.is_dir());
     // Remote-tracking refs, so a fetch never rewrites a session's branch.
     assert_eq!(
@@ -156,10 +156,13 @@ fn clone_prints_the_entry_available_would() {
     assert_eq!(printed["label"], "backend");
     assert_eq!(
         printed["bare"],
-        rig.root.join(".repos/backend.git").to_str().unwrap()
+        rig.root.join(".repos/_/backend.git").to_str().unwrap()
     );
+    assert_eq!(printed["already_present"], false);
+    let mut entry = printed.clone();
+    entry.as_object_mut().unwrap().remove("already_present");
     let listed = stdout_json(&run(rig.nucleate().arg("available"), ""));
-    assert!(listed.as_array().unwrap().contains(&printed));
+    assert!(listed.as_array().unwrap().contains(&entry));
     // The remote's own default branch is the one sessions start from.
     let session = run(rig.nucleate().args(["create-session", "s1", "backend"]), "");
     assert!(session.status.success(), "{}", stderr(&session));
@@ -177,20 +180,33 @@ fn clone_names_the_repo_from_the_url() {
     assert!(named("https://example.invalid/your-org/api.git").contains("api.git"));
     assert!(named("git@example.invalid:your-org/console").contains("console.git"));
     // A failed clone leaves nothing behind.
-    assert!(!rig.root.join(".repos/api.git").exists());
-    assert!(!rig.root.join(".repos/console.git").exists());
+    assert!(!rig.root.join(".repos/_/api.git").exists());
+    assert!(!rig.root.join(".repos/_/console.git").exists());
 }
 
 #[test]
-fn clone_refuses_a_repo_that_is_already_there_or_cannot_be_named() {
+fn clone_finds_a_repo_already_there_and_refuses_one_it_cannot_name() {
     let rig = Rig::new();
+    // The same repo again: found, and nothing changes.
     let again = run(
         rig.nucleate()
             .args(["clone", rig.upstream.to_str().unwrap()]),
         "",
     );
-    assert_eq!(again.status.code(), Some(1));
-    assert!(stderr(&again).contains("already available"));
+    assert!(again.status.success(), "{}", stderr(&again));
+    let printed = stdout_json(&again);
+    assert_eq!(printed["already_present"], true);
+    assert_eq!(printed["bare"], rig.bare().to_str().unwrap());
+    // Another repo of the same name with no owner to tell them apart.
+    let elsewhere = rig.home.dir.join("elsewhere/web");
+    fs::create_dir_all(&elsewhere).unwrap();
+    git(&elsewhere, &["init", "-q", "-b", "main"]);
+    let other = run(
+        rig.nucleate().args(["clone", elsewhere.to_str().unwrap()]),
+        "",
+    );
+    assert_eq!(other.status.code(), Some(1));
+    assert!(stderr(&other).contains("already available"));
     let unnamed = run(
         rig.nucleate().args(["clone", "https://example.invalid/"]),
         "",

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 fn bare(rig: &Rig) -> PathBuf {
-    rig.root.join(".repos/web.git")
+    rig.bare()
 }
 
 fn nucleate(rig: &Rig, args: &[&str], stdin: &str) -> Output {

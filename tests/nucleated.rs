@@ -625,12 +625,62 @@ fn refresh_fetches_every_repo() {
     assert_eq!(report["environment"], "client-a");
     assert_eq!(report["repos"], json!([{ "repo": "web", "ok": true }]));
     assert_eq!(
-        git(
-            &rig.root.join(".repos/web.git"),
-            &["rev-parse", "refs/remotes/origin/main"]
-        ),
+        git(&rig.bare(), &["rev-parse", "refs/remotes/origin/main"]),
         git(&rig.upstream, &["rev-parse", "HEAD"])
     );
+}
+
+#[test]
+fn refresh_moves_a_nucleus_made_before_owner_folders() {
+    let rig = Rig::new();
+    let worktree = rig.session("fix-login");
+    let flat = rig.flatten();
+    let report = housekeeping(&rig, &["refresh"]);
+    assert_eq!(report["repos"], json!([{ "repo": "web", "ok": true }]));
+    assert!(!flat.exists());
+    let moved = rig.root.join(".repos/_/web.git");
+    assert!(report["moved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line.as_str().unwrap().contains(moved.to_str().unwrap())));
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    // A dry run moves nothing.
+    rig.flatten();
+    let out = run(
+        rig.nucleated()
+            .args(["housekeeping", "run", "refresh", "--dry-run"]),
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(flat.is_dir());
+}
+
+#[test]
+fn the_daemon_moves_a_nucleus_made_before_owner_folders_when_it_starts() {
+    let rig = Rig::new();
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    let worktree = rig.session("fix-login");
+    let flat = rig.flatten();
+    let child = rig
+        .nucleated()
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let moved = rig.root.join(".repos/_/web.git");
+    wait_for("the move", || moved.is_dir() && !flat.exists());
+    wait_for("the first heartbeat", || {
+        !mock.to("/v1/heartbeats:ingest").is_empty()
+    });
+    signal(child.id(), "-TERM");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&format!("client-a: moved {}", flat.display())));
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
 }
 
 #[test]
@@ -646,7 +696,7 @@ fn refresh_signs_in_to_github_with_the_environments_token_file() {
         &rig.upstream.join(".git"),
         "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX2NsaWVudF9hX3Rva2Vu",
     );
-    let bare = rig.root.join(".repos/web.git");
+    let bare = rig.bare();
     git(
         &bare,
         &[
@@ -839,7 +889,7 @@ fn cleanup_removes_a_finished_session_that_holds_nothing_unsaved() {
     assert!(!rig.root.join(".worktrees/finished").exists());
     assert!(dirty.join("unsaved.txt").is_file());
     // The bare repo no longer lists the worktree that was removed.
-    let listed = git(&rig.root.join(".repos/web.git"), &["worktree", "list"]);
+    let listed = git(&rig.bare(), &["worktree", "list"]);
     assert!(!listed.contains("finished"), "{listed}");
 }
 

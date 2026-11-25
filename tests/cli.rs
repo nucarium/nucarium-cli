@@ -38,7 +38,7 @@ impl Fixture {
         fs::write(fixture.upstream.join(".gitignore"), ".env\n").unwrap();
         fixture.git(&fixture.upstream, &["add", "."]);
         fixture.git(&fixture.upstream, &["commit", "-q", "-m", "init"]);
-        let bare = fixture.bare();
+        let bare = fixture.root.join(".repos").join("_").join("demo.git");
         fixture.git(
             &fixture.root,
             &[
@@ -62,8 +62,15 @@ impl Fixture {
         fixture
     }
 
+    /// The demo repo's bare clone, in whichever owner folder it is.
     fn bare(&self) -> PathBuf {
-        self.root.join(".repos").join("demo.git")
+        let repos = self.root.join(".repos");
+        fs::read_dir(&repos)
+            .unwrap()
+            .flatten()
+            .map(|owner| owner.path().join("demo.git"))
+            .find(|bare| bare.is_dir())
+            .unwrap_or_else(|| repos.join("_").join("demo.git"))
     }
 
     fn session(&self, name: &str) -> PathBuf {
@@ -96,32 +103,50 @@ impl Fixture {
         }
     }
 
-    /// Have the test user's git fetch `https://github.com/octo/<name>` from
-    /// `upstream/<name>` on this machine, so nothing reaches GitHub, and make
-    /// the demo repo octo's.
-    fn github_on_disk(&self) {
+    /// Where "GitHub" keeps `owner`'s repos on this machine.
+    fn github_owner(&self, owner: &str) -> PathBuf {
         let base = self.upstream.parent().unwrap();
-        fs::write(
-            self.home.join(".gitconfig"),
-            format!(
-                "[url \"{}/\"]\n\tinsteadOf = https://github.com/octo/\n",
-                base.display()
-            ),
-        )
-        .unwrap();
+        match owner {
+            "octo" => base.to_path_buf(),
+            other => base.parent().unwrap().join(other),
+        }
+    }
+
+    /// Have the test user's git fetch `https://github.com/<owner>/<name>`,
+    /// for owners `octo` and `other`, from folders on this machine, so
+    /// nothing reaches GitHub, and make the demo repo octo's: it moves to
+    /// octo's folder, where cloning it from GitHub would have put it.
+    fn github_on_disk(&self) {
+        let mut config = String::new();
+        for owner in ["octo", "other"] {
+            config.push_str(&format!(
+                "[url \"{}/\"]\n\tinsteadOf = https://github.com/{owner}/\n",
+                self.github_owner(owner).display()
+            ));
+        }
+        fs::write(self.home.join(".gitconfig"), config).unwrap();
+        let bare = self.bare();
         self.git(
-            &self.bare(),
+            &bare,
             &[
                 "config",
                 "remote.origin.url",
                 "https://github.com/octo/demo",
             ],
         );
+        let octo = self.root.join(".repos").join("octo");
+        fs::create_dir_all(&octo).unwrap();
+        fs::rename(&bare, octo.join("demo.git")).unwrap();
     }
 
     /// A repo on "GitHub" that the box has not fetched: `octo/<name>`.
     fn on_github(&self, name: &str) {
-        let dir = self.upstream.parent().unwrap().join(format!("{name}.git"));
+        self.on_github_as("octo", name);
+    }
+
+    /// A repo on "GitHub" that the box has not fetched: `<owner>/<name>`.
+    fn on_github_as(&self, owner: &str, name: &str) {
+        let dir = self.github_owner(owner).join(format!("{name}.git"));
         fs::create_dir_all(&dir).unwrap();
         self.git(&dir, &["init", "-q", "-b", "main"]);
         fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
@@ -189,6 +214,76 @@ impl Fixture {
             .write_all(input.as_bytes())
             .unwrap();
         child.wait_with_output().unwrap()
+    }
+
+    /// A repo on this machine named `name`, with one commit, made available
+    /// with `nucleate clone`.
+    fn local_repo(&self, name: &str) -> PathBuf {
+        let dir = self
+            .upstream
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("local")
+            .join(name);
+        fs::create_dir_all(&dir).unwrap();
+        self.git(&dir, &["init", "-q", "-b", "main"]);
+        fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        self.git(&dir, &["add", "."]);
+        self.git(&dir, &["commit", "-q", "-m", "init"]);
+        self.ok(&self.root, &["clone", dir.to_str().unwrap()]);
+        dir
+    }
+
+    /// Put the nucleus back as a nucleate before owner folders left it: every
+    /// bare repo at `.repos/<name>.git`, its worktrees pointing there, and
+    /// every session's manifest naming it there.
+    fn flatten(&self) {
+        let repos = self.root.join(".repos");
+        let mut moved = Vec::new();
+        for owner in fs::read_dir(&repos).unwrap().flatten() {
+            if !owner.path().is_dir() || owner.file_name().to_string_lossy().ends_with(".git") {
+                continue;
+            }
+            for repo in fs::read_dir(owner.path()).unwrap().flatten() {
+                let flat = repos.join(repo.file_name());
+                fs::rename(repo.path(), &flat).unwrap();
+                self.git(&flat, &["--git-dir", ".", "worktree", "repair"]);
+                moved.push((repo.path(), flat));
+            }
+            fs::remove_dir(owner.path()).unwrap();
+        }
+        for session in fs::read_dir(self.root.join(".worktrees"))
+            .unwrap()
+            .flatten()
+        {
+            let file = session.path().join(".workspace.json");
+            let Ok(mut text) = fs::read_to_string(&file) else {
+                continue;
+            };
+            for (nested, flat) in &moved {
+                text = text.replace(nested.to_str().unwrap(), flat.to_str().unwrap());
+            }
+            fs::write(&file, text).unwrap();
+        }
+    }
+
+    /// The bare repo a worktree belongs to, as git finds it.
+    fn common_dir(&self, worktree: &Path) -> PathBuf {
+        PathBuf::from(self.git(
+            worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ))
+        .canonicalize()
+        .unwrap()
+    }
+
+    /// The `bare` a session's manifest names for one of its repos.
+    fn manifest_bare(&self, session: &str, repo: &str) -> PathBuf {
+        let file = self.session(session).join(".workspace.json");
+        let manifest: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+        PathBuf::from(manifest["repos"][repo]["bare"].as_str().unwrap())
     }
 
     /// A session named `name` with the demo repo added.
@@ -290,36 +385,90 @@ fn a_repo_github_does_not_have_is_refused_and_leaves_nothing() {
     f.ok(&f.root, &["create-session", "s1"]);
     let said = f.fails(&f.session("s1"), &["add", "octo/missing"]);
     assert!(said.contains("cannot fetch octo/missing"), "{said}");
-    assert!(!f.root.join(".repos").join("missing.git").exists());
+    assert!(!f.root.join(".repos/octo/missing.git").exists());
+    // From an owner the box has nothing from, not even the owner's folder.
+    let said = f.fails(&f.session("s1"), &["add", "nobody/missing"]);
+    assert!(said.contains("cannot fetch nobody/missing"), "{said}");
+    assert!(!f.root.join(".repos/nobody").exists());
 }
 
 #[test]
-fn a_repo_from_an_owner_the_box_has_nothing_from_is_refused() {
+fn a_github_repo_is_cloned_into_its_owners_folder_once() {
     let f = Fixture::new();
     f.github_on_disk();
+    f.on_github("other");
+    let cloned = f.ok(&f.root, &["clone", "https://github.com/octo/other.git"]);
+    let bare = f.root.join(".repos/octo/other.git");
+    assert_eq!(cloned["bare"], bare.to_str().unwrap());
+    assert_eq!(cloned["label"], "octo/other");
+    assert_eq!(cloned["repo"], "other");
+    assert_eq!(cloned["already_present"], false);
+    // Again, spelled differently: the same repo, found and left as it is.
+    let again = f.ok(&f.root, &["clone", "https://github.com/OCTO/other"]);
+    assert_eq!(again["already_present"], true);
+    assert_eq!(again["bare"], bare.to_str().unwrap());
+    let owners: Vec<String> = fs::read_dir(f.root.join(".repos"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.eq_ignore_ascii_case("octo"))
+        .collect();
+    assert_eq!(owners, ["octo"]);
+}
+
+#[test]
+fn a_repo_with_no_github_owner_is_cloned_into_the_folder_for_none() {
+    let f = Fixture::new();
+    f.local_repo("tool");
+    assert!(f.root.join(".repos/_/tool.git").is_dir());
+    let labels: Vec<Value> = f.ok(&f.root, &["available"]).as_array().unwrap().clone();
+    assert!(labels
+        .iter()
+        .any(|a| a["label"] == "tool" && a["repo"] == "tool"));
+}
+
+#[test]
+fn a_repo_from_any_owner_is_fetched_into_its_own_folder() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.on_github_as("other", "demo");
     f.ok(&f.root, &["create-session", "s1"]);
-    let said = f.fails(&f.session("s1"), &["add", "someone/other"]);
-    assert!(said.contains("no repos from someone"), "{said}");
-    assert!(!f.root.join(".repos").join("other.git").exists());
-}
+    let added = f.ok(&f.session("s1"), &["add", "other/demo"]);
+    assert_eq!(added["label"], "other/demo");
+    assert!(f.root.join(".repos/other/demo.git").is_dir());
+    assert!(f.root.join(".repos/octo/demo.git").is_dir());
 
-#[test]
-fn another_owners_repo_under_a_name_already_here_is_refused() {
-    let f = Fixture::new();
-    f.github_on_disk();
-    f.git(
-        &f.bare(),
-        &[
-            "config",
-            "remote.origin.url",
-            "https://github.com/octo/demo",
-        ],
+    // Two owners have a demo: the name alone no longer says which.
+    f.ok(&f.root, &["create-session", "s2"]);
+    let said = f.fails(&f.session("s2"), &["add", "demo"]);
+    assert!(
+        said.contains("octo/demo") && said.contains("other/demo"),
+        "{said}"
     );
-    f.ok(&f.root, &["create-session", "s1"]);
-    let said = f.fails(&f.session("s1"), &["add", "someone/demo"]);
-    assert!(said.contains("octo/demo is already here"), "{said}");
-    f.ok(&f.session("s1"), &["add", "octo/demo"]);
-    assert!(f.session("s1").join("demo").join("README.md").is_file());
+    let added = f.ok(&f.session("s2"), &["add", "octo/demo"]);
+    assert_eq!(added["label"], "octo/demo");
+
+    // One session holds one demo: the other cannot be added beside it.
+    let said = f.fails(&f.session("s1"), &["add", "octo/demo"]);
+    assert!(
+        said.contains("other/demo") && said.contains("octo/demo"),
+        "{said}"
+    );
+    let again = f.ok(&f.session("s1"), &["add", "OTHER/demo"]);
+    assert_eq!(again["already_present"], true);
+}
+
+#[test]
+fn a_repo_is_removed_from_a_session_by_the_name_the_session_has_it_under() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.on_github_as("other", "demo");
+    f.ok(&f.root, &["clone", "https://github.com/other/demo.git"]);
+    f.ok(&f.root, &["create-session", "s1", "octo/demo"]);
+    let said = f.fails(&f.session("s1"), &["remove", "other/demo"]);
+    assert!(said.contains("not in session"), "{said}");
+    f.ok(&f.session("s1"), &["remove", "demo"]);
+    assert!(!f.session("s1").join("demo").exists());
 }
 
 #[test]
@@ -543,4 +692,154 @@ fn the_mcp_server_lists_its_tools_and_adds_a_repo() {
     assert!(session.join("demo").join("README.md").is_file());
     assert_eq!(replies[3]["result"]["isError"], true);
     assert_eq!(replies[4]["error"]["code"], -32601);
+}
+
+// ---- moving a nucleus made before owner folders ---------------------------
+
+#[test]
+fn a_flat_nucleus_with_a_live_session_moves_to_owner_folders() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.local_repo("tool");
+    f.ok(&f.root, &["create-session", "s1", "demo", "tool"]);
+    let demo = f.session("s1").join("demo");
+    let tool = f.session("s1").join("tool");
+    fs::write(demo.join("work.txt"), "work\n").unwrap();
+    f.git(&demo, &["add", "."]);
+    f.git(&demo, &["commit", "-q", "-m", "work"]);
+    let payload = format!(r#"{{"name":"helper","cwd":"{}"}}"#, demo.display());
+    let out = f.with_stdin(&f.root, &["hook-create"], &payload);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let helper = f.session("s1").join(".subworktrees").join("helper-demo");
+
+    f.flatten();
+    let repos = f.root.join(".repos");
+    assert_eq!(f.common_dir(&demo), repos.join("demo.git"));
+    assert_eq!(f.manifest_bare("s1", "demo"), repos.join("demo.git"));
+
+    // Run from inside another repo's worktree, which must not be touched.
+    let out = f.run(&tool, &["refresh"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("moved"));
+
+    assert!(!repos.join("demo.git").exists());
+    assert!(!repos.join("tool.git").exists());
+    let octo = repos.join("octo/demo.git");
+    let none = repos.join("_/tool.git");
+    assert_eq!(f.common_dir(&demo), octo);
+    assert_eq!(f.common_dir(&helper), octo);
+    assert_eq!(f.common_dir(&tool), none);
+    assert_eq!(f.manifest_bare("s1", "demo"), octo);
+    assert_eq!(f.manifest_bare("s1", "tool"), none);
+
+    // The session works as before.
+    fs::write(demo.join("more.txt"), "more\n").unwrap();
+    f.git(&demo, &["add", "."]);
+    f.git(&demo, &["commit", "-q", "-m", "more"]);
+    let status = f.ok(&f.session("s1"), &["status"]);
+    assert_eq!(status["repos"]["demo"]["dirty"], false);
+    assert_eq!(status["repos"]["tool"]["dirty"], false);
+    let labels: Vec<Value> = status["available"].as_array().unwrap().clone();
+    assert!(labels.iter().any(|a| a["label"] == "octo/demo"));
+    f.ok(&f.session("s1"), &["remove", "tool"]);
+    assert!(!tool.exists());
+
+    // A second run finds nothing to do.
+    let out = f.run(&f.root, &["refresh"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    assert_eq!(f.common_dir(&demo), octo);
+}
+
+#[test]
+fn a_move_that_stopped_part_way_is_finished() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    let demo = f.session_with_demo("s1").join("demo");
+    f.flatten();
+    let repos = f.root.join(".repos");
+    let octo = repos.join("octo/demo.git");
+    fs::create_dir_all(octo.parent().unwrap()).unwrap();
+
+    // Stopped after the move and its repair, before the manifests: reading
+    // the manifest finds the repo where it is now.
+    fs::rename(repos.join("demo.git"), &octo).unwrap();
+    f.git(&octo, &["--git-dir", ".", "worktree", "repair"]);
+    let status = f.ok(&f.session("s1"), &["status"]);
+    assert_eq!(status["repos"]["demo"]["bare"], octo.to_str().unwrap());
+
+    // Stopped straight after the move: the worktree still points at the
+    // old place, and the next run repairs it and the manifest.
+    f.flatten();
+    fs::create_dir_all(octo.parent().unwrap()).unwrap();
+    fs::rename(repos.join("demo.git"), &octo).unwrap();
+    let out = f.run(&f.root, &["refresh"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(f.common_dir(&demo), octo);
+    assert_eq!(f.manifest_bare("s1", "demo"), octo);
+    f.ok(&f.session("s1"), &["status"]);
+}
+
+#[test]
+fn a_flat_repo_whose_new_place_is_taken_stays_and_the_rest_move() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.local_repo("tool");
+    f.flatten();
+    let repos = f.root.join(".repos");
+    f.git(
+        &f.root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            f.upstream.to_str().unwrap(),
+            repos.join("octo/demo.git").to_str().unwrap(),
+        ],
+    );
+    let out = f.run(&f.root, &["refresh"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains(&format!("left {}", repos.join("demo.git").display())),
+        "{said}"
+    );
+    assert!(
+        said.contains(repos.join("octo/demo.git").to_str().unwrap()),
+        "{said}"
+    );
+    assert!(repos.join("demo.git").is_dir());
+    assert!(repos.join("_/tool.git").is_dir());
+    assert!(!repos.join("tool.git").exists());
+}
+
+#[test]
+fn a_refused_flat_repo_stays_where_it_is_and_is_still_listed() {
+    let f = Fixture::new();
+    f.local_repo("tool");
+    f.flatten();
+    let repos = f.root.join(".repos");
+    f.git(&repos.join("demo.git"), &["config", "pull.rebase", "true"]);
+    let out = f.run(&f.root, &["refresh"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(said.contains("refused"), "{said}");
+    assert!(repos.join("demo.git").is_dir());
+    assert!(repos.join("_/tool.git").is_dir());
+    let listed = f.ok(&f.root, &["available"]);
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["repo"] == "demo" && a["label"] == "demo"));
 }

@@ -50,7 +50,8 @@ Everything lives under one workspace root:
 
 ```text
 <root>/
-  .repos/<repo>.git        bare clones; a repo is available when its clone exists
+  .repos/<owner>/<repo>.git  bare clones of GitHub repos, under their owner
+  .repos/_/<repo>.git        bare clones from any other remote
   .worktrees/<session>/    one folder per session
     .workspace.json        the session's manifest
     AGENTS.md              a note for the agent, listing the session's repos
@@ -71,10 +72,47 @@ It prints `{ "root", "config", "created" }`; running it again changes nothing
 and prints `"created": false`.
 
 `nucleate clone <url> [--name NAME]` makes the bare clone at
-`.repos/<name>.git` (the name comes from the URL unless given), fetches into
-remote-tracking refs so that fetching never rewrites a branch a session has
-checked out, and records the remote's default branch. It prints one entry in
-the shape `nucleate available` uses: `{ "repo", "label", "bare" }`.
+`.repos/<owner>/<name>.git` (the name comes from the URL unless given), fetches
+into remote-tracking refs so that fetching never rewrites a branch a session
+has checked out, and records the remote's default branch. It prints one entry
+in the shape `nucleate available` uses, `{ "repo", "label", "bare" }`, with
+`"already_present"`: cloning a repo that is already there, however its owner
+and name are capitalised, finds it and changes nothing.
+
+A repo is available when its clone exists. Its label is `owner/name`, and two
+owners' repos of the same name live side by side. `<owner>` is the repo's
+owner on GitHub. A repo from anywhere else, another host or a path on this
+machine, goes in `_`, and its label is its name alone: GitHub never gives an
+owner that name, and another host's path says nothing reliable about who owns
+a repo. A remote whose owner or name is not a plain name (letters, digits,
+`.`, `_` and `-`) counts as one from anywhere else.
+
+`nucleate add` takes a label (`octo/web`) or a name alone (`web`). A name alone
+works while one owner has a repo of that name; when two do, it is refused and
+the message names both labels. A session's folder for a repo is its name, so a
+session holds one repo of each name: adding a second owner's `web` to a session
+that has one is refused, naming both. `nucleate remove` names a repo as the
+session has it, by its folder or its label.
+
+### Nuclei made before owner folders
+
+A nucleus made by an earlier `nucleate` keeps its clones at
+`.repos/<name>.git`. They are still read, and they move to their owner folders
+the first time `nucleate init`, `nucleate clone`, `nucleate refresh`,
+`nucleated`'s refresh or `nucleated` itself starts. Each move renames the bare
+clone, runs `git worktree repair` inside it so that every worktree registered
+in it points at it again (a session's, a session's `.subworktrees/`, and one a
+driver or a person added), and rewrites the `bare` path in each session's
+manifest. A session at work keeps working: a git command started in it at the
+very moment of the move can fail once. What moved goes to standard error, or
+to `nucleated`'s log. One run at a time moves anything, and running it again
+does nothing.
+
+A repo is left where it is, and the reason said, when the vetting refuses it
+(moving it would mean running git in it), or when the place it would move to
+is taken; such a repo is still listed and used as before. A run that stopped
+part way is finished by the next one, and a manifest that still names the old
+place is read as naming the new one.
 
 ## Commands
 
@@ -85,7 +123,7 @@ nucleate available                  # repos that can be added
 nucleate create-session fix-login   # an empty session
 cd <root>/.worktrees/fix-login
 nucleate add demo                   # add a repo; the session is the folder you're in
-nucleate add octo/other             # ...or another repo of an owner the box has, fetched first
+nucleate add octo/other             # ...or any owner's GitHub repo by owner/name, fetched first
 nucleate add demo some-branch       # ...or on a named branch, resuming it if it exists
 nucleate status                     # what's in the session and what's unsaved
 nucleate remove demo                # remove one repo (--force to discard unsaved work)
@@ -1295,7 +1333,7 @@ the daemon refusing anything (`nucleate` refuses such a repo either way):
    after `git refused:`. `journalctl --user -u nucleated | grep refused` shows
    the same, once per repo.
 4. For each, read its config yourself (`git config --file
-   <nucleus>/.repos/<repo>.git/config --no-includes --list`), and remove what
+   <nucleus>/.repos/<owner>/<repo>.git/config --no-includes --list`), and remove what
    should not be there, or decide the repo is not one for this box.
 5. When `nucleated status` names none, set `vetting = "enforce"` (or remove
    the line) and restart the daemon.

@@ -25,7 +25,7 @@ fn marker_program(rig: &Rig) -> (PathBuf, PathBuf) {
 }
 
 fn bare(rig: &Rig) -> PathBuf {
-    rig.root.join(".repos/web.git")
+    rig.bare()
 }
 
 /// Set a file's modification time well into the past, so it no longer looks
