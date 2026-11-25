@@ -166,6 +166,59 @@ fn a_subagent_worktree_counts_before_and_after_the_move_to_owner_folders() {
     assert!(!listed.contains("helper"), "{listed}");
 }
 
+#[test]
+fn a_link_planted_among_subagent_worktrees_is_removed_and_what_it_points_at_is_not() {
+    let rig = Rig::new();
+    rig.session("parent");
+    let outside = rig.home.dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    git(&outside, &["init", "-q", "-b", "main"]);
+    fs::write(outside.join("precious.txt"), "precious\n").unwrap();
+    let subs = session_dir(&rig, "parent").join(".subworktrees");
+    fs::create_dir_all(&subs).unwrap();
+    std::os::unix::fs::symlink(&outside, subs.join("planted")).unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!session_dir(&rig, "parent").exists());
+    assert!(outside.join("precious.txt").is_file());
+    assert!(outside.join(".git").is_dir());
+}
+
+#[test]
+fn a_worktree_of_another_repo_planted_in_a_session_keeps_it_and_is_not_touched() {
+    let rig = Rig::new();
+    rig.session("parent");
+    let other = rig.home.dir.join("other");
+    fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    fs::write(other.join("a.txt"), "a\n").unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-q", "-m", "a"]);
+    let subs = session_dir(&rig, "parent").join(".subworktrees");
+    fs::create_dir_all(&subs).unwrap();
+    let planted = subs.join("planted");
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            planted.to_str().unwrap(),
+        ],
+    );
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    assert!(
+        stderr(&out).contains("not a worktree of this nucleus's repos"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(planted.join("a.txt").is_file());
+    assert!(git(&other, &["worktree", "list"]).contains("planted"));
+}
+
 // ---- housekeeping ----------------------------------------------------------
 
 /// Whether a process is inside a session is read from /proc, so what cleanup
@@ -303,6 +356,24 @@ mod housekeeping {
         let report = cleanup(&rig, &github);
         assert_eq!(verdict(&report, "parent")["action"], "kept", "{report}");
         assert!(sibling.join("only-here.txt").is_file());
+    }
+
+    #[test]
+    fn cleanup_removes_a_folder_that_holds_nothing_at_once_and_keeps_one_that_holds_a_file() {
+        let rig = Rig::new();
+        for name in ["empty", "with-notes"] {
+            let out = run(rig.nucleate().args(["create-session", name]), "");
+            assert!(out.status.success(), "{}", stderr(&out));
+        }
+        fs::write(session_dir(&rig, "with-notes").join("notes.txt"), "mine\n").unwrap();
+        let github = Mock::start(|_: &Request| Reply::json(200, json!([])));
+        let report = cleanup(&rig, &github);
+        assert_eq!(verdict(&report, "empty")["action"], "removed", "{report}");
+        assert_eq!(
+            verdict(&report, "with-notes"),
+            json!({ "session": "with-notes", "action": "kept", "reason": "it changed too recently" })
+        );
+        assert!(session_dir(&rig, "with-notes").join("notes.txt").is_file());
     }
 }
 

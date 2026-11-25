@@ -261,7 +261,7 @@ fn keep_reason(
     for (repo, info) in &worktrees {
         unsaved.push((repo, workspace.unsafe_reasons(&info.path)?));
     }
-    if !merged_and_done(workspace, &worktrees, &unsaved)? {
+    if !merged_and_done(workspace, path, &worktrees, &unsaved)? {
         let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
         for session in &agent_sessions {
             last_change = last_change.max(session.last_event_ms);
@@ -291,16 +291,17 @@ fn keep_reason(
 /// True when a folder's work is finished with, so that it need not wait out
 /// the age limit: every worktree in it is saved, each either holds nothing
 /// beyond the remote's default branch or has its `HEAD` in a merged pull
-/// request, and at least one was merged. A folder with no worktree at all
-/// holds nothing either. Work that was only pushed is not finished: a
+/// request, and at least one was merged. A folder with no worktree that
+/// holds nothing but what nucleate wrote in it is finished with too. Work that was only pushed is not finished: a
 /// branch on GitHub may still be worked on, and waits as before.
 fn merged_and_done(
     workspace: &Workspace,
+    path: &Path,
     worktrees: &[(String, RepoInfo)],
     unsaved: &[(&String, Vec<String>)],
 ) -> Result<bool> {
     if worktrees.is_empty() {
-        return Ok(true);
+        return Ok(Workspace::holds_only_its_own_files(path));
     }
     if unsaved.iter().any(|(_, reasons)| !reasons.is_empty()) {
         return Ok(false);

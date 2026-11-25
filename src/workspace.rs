@@ -692,6 +692,41 @@ impl Workspace {
     }
 
     fn write_agents(session: &Path, manifest: &Manifest) -> Result<()> {
+        fs::write(session.join("AGENTS.md"), Self::agents_text(manifest))?;
+        Ok(())
+    }
+
+    /// True when a session folder holds nothing but what nucleate wrote in
+    /// it: its manifest, the `AGENTS.md` made from it, and an empty
+    /// `.subworktrees`.
+    pub fn holds_only_its_own_files(session: &Path) -> bool {
+        let Ok(manifest) = Self::load_manifest(session) else {
+            return false;
+        };
+        let Ok(entries) = fs::read_dir(session) else {
+            return false;
+        };
+        entries.flatten().all(|entry| {
+            let name = entry.file_name();
+            let kind = entry.file_type().ok();
+            match name.to_str() {
+                Some(MANIFEST) => kind.is_some_and(|kind| kind.is_file()),
+                Some("AGENTS.md") => {
+                    kind.is_some_and(|kind| kind.is_file())
+                        && fs::read_to_string(entry.path())
+                            .is_ok_and(|text| text == Self::agents_text(&manifest))
+                }
+                Some(SUBWORKTREES) => {
+                    kind.is_some_and(|kind| kind.is_dir())
+                        && fs::read_dir(entry.path())
+                            .is_ok_and(|mut inside| inside.next().is_none())
+                }
+                _ => false,
+            }
+        })
+    }
+
+    fn agents_text(manifest: &Manifest) -> String {
         let mut text = format!(
             "# Workspace session\n\nEach subdirectory is an independent git worktree on branch \
              `{}`. Work only inside them; never edit the bare repos under `../../.repos/`. Use \
@@ -704,8 +739,7 @@ impl Workspace {
                 info.label, info.branch
             ));
         }
-        fs::write(session.join("AGENTS.md"), text)?;
-        Ok(())
+        text
     }
 
     fn inside_sessions(&self, path: &Path) -> bool {
@@ -1059,42 +1093,73 @@ impl Workspace {
     pub fn session_worktrees(&self, session: &Path) -> Result<Vec<(String, RepoInfo)>> {
         let manifest = Self::load_manifest(session)?;
         let mut found: Vec<(String, RepoInfo)> = manifest.repos.into_iter().collect();
-        let Ok(entries) = fs::read_dir(session.join(SUBWORKTREES)) else {
+        let subs_dir = session.join(SUBWORKTREES);
+        // A link in its place leads somewhere else, and holds none of them.
+        if fs::symlink_metadata(&subs_dir).map_or(true, |meta| !meta.is_dir()) {
+            return Ok(found);
+        }
+        let Ok(entries) = fs::read_dir(&subs_dir) else {
             return Ok(found);
         };
         let mut subs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        if subs.is_empty() {
+            return Ok(found);
+        }
         subs.sort();
+        // `.subworktrees` is writable from a session, so what is in it may
+        // have been planted there. A worktree is taken for one of this
+        // session's only when it is a folder right here, git's pointer in it
+        // leads to one of this nucleus's bare repos, and that repo has it
+        // registered under this very path. Nothing is run in it before then.
+        let subs_dir = subs_dir.canonicalize()?;
+        let repos: Vec<(PathBuf, Available)> = self
+            .available()?
+            .into_iter()
+            .filter_map(|item| Some((item.bare.canonicalize().ok()?, item)))
+            .collect();
         for path in subs {
             let name = format!(
                 "{SUBWORKTREES}/{}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             );
-            if fs::symlink_metadata(path.join(".git")).is_err() {
+            let meta = fs::symlink_metadata(&path)?;
+            // A link is not a worktree, and removing the session removes the
+            // link and never what it points at.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let pointer = path.join(".git");
+            if !meta.is_dir() {
+                bail!("{name} is not a git worktree");
+            }
+            if fs::symlink_metadata(&pointer).is_err() {
                 let empty = fs::read_dir(&path).is_ok_and(|mut inside| inside.next().is_none());
                 if empty {
                     continue;
                 }
                 bail!("{name} is not a git worktree");
             }
-            let common = self.git.tree(
-                &path,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            )?;
+            let real = path.canonicalize()?;
+            if real.parent() != Some(subs_dir.as_path()) {
+                bail!("{name} is not inside the session");
+            }
+            let (bare, item) = self
+                .pointed_at(&pointer, &repos)
+                .ok_or_else(|| anyhow!("{name} is not a worktree of this nucleus's repos"))?;
+            let registered = self.worktrees(bare)?.iter().any(|worktree| {
+                worktree
+                    .canonicalize()
+                    .is_ok_and(|worktree| worktree == real)
+            });
+            if !registered {
+                bail!("{name} is not a worktree its repo has registered");
+            }
             let branch = self.git.tree(&path, &["branch", "--show-current"])?;
-            let bare = PathBuf::from(common);
-            let label = github::slug(&self.remote_url(&bare))
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-                .unwrap_or_else(|| {
-                    bare.file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                });
             found.push((
                 name,
                 RepoInfo {
-                    label,
-                    bare,
+                    label: item.label.clone(),
+                    bare: item.bare.clone(),
                     path,
                     branch,
                     base: String::new(),
@@ -1102,6 +1167,31 @@ impl Workspace {
             ));
         }
         Ok(found)
+    }
+
+    /// The repo of this nucleus whose linked worktree a `.git` file names,
+    /// read without running git: `gitdir: <bare>/worktrees/<id>`. Nothing
+    /// for a folder, a file that says anything else, or another repo.
+    fn pointed_at<'a>(
+        &self,
+        pointer: &Path,
+        repos: &'a [(PathBuf, Available)],
+    ) -> Option<(&'a PathBuf, &'a Available)> {
+        if !fs::symlink_metadata(pointer).ok()?.is_file() {
+            return None;
+        }
+        let text = git::read_small(pointer, 4096).ok()?;
+        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        let target = PathBuf::from(target).canonicalize().ok()?;
+        let worktrees = target.parent()?;
+        if worktrees.file_name()? != "worktrees" {
+            return None;
+        }
+        let bare = worktrees.parent()?;
+        repos
+            .iter()
+            .find(|(real, _)| real == bare)
+            .map(|(real, item)| (real, item))
     }
 
     /// Remove a whole session, or nothing at all if any worktree in it, its
