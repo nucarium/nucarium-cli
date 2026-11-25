@@ -32,6 +32,8 @@ mod layout;
 pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
+/// Where the worktrees a session's subagents make go, inside the session.
+const SUBWORKTREES: &str = ".subworktrees";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -836,21 +838,10 @@ impl Workspace {
                 ],
             )?;
         } else {
-            // A new branch tracks nothing: the default branch it starts
-            // from is not where its work goes, and counting against it would
-            // count merged work as unpushed for ever.
             let start = format!("origin/{default}");
             self.git.bare(
                 &item.bare,
-                &[
-                    "worktree",
-                    "add",
-                    "--no-track",
-                    "-b",
-                    &branch,
-                    &child_arg,
-                    &start,
-                ],
+                &["worktree", "add", "-b", &branch, &child_arg, &start],
             )?;
         }
         self.copy_includes(&item.repo, &child)?;
@@ -1060,11 +1051,65 @@ impl Workspace {
         Ok(json!({ "removed": name, "session": session }))
     }
 
-    /// Remove a whole session, or nothing at all if any repo in it holds unsaved work.
-    pub fn remove_session(&self, session: &Path) -> Result<Value> {
+    /// Every worktree in a session folder: the repos its manifest lists, and
+    /// those its subagents made under `.subworktrees/`, which no manifest
+    /// lists. Each comes with a name to say it by. A folder there that is
+    /// not a worktree, and is not empty, is an error: what it holds is
+    /// nowhere else, and nothing here can say whether it is saved.
+    pub fn session_worktrees(&self, session: &Path) -> Result<Vec<(String, RepoInfo)>> {
         let manifest = Self::load_manifest(session)?;
+        let mut found: Vec<(String, RepoInfo)> = manifest.repos.into_iter().collect();
+        let Ok(entries) = fs::read_dir(session.join(SUBWORKTREES)) else {
+            return Ok(found);
+        };
+        let mut subs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        subs.sort();
+        for path in subs {
+            let name = format!(
+                "{SUBWORKTREES}/{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            if fs::symlink_metadata(path.join(".git")).is_err() {
+                let empty = fs::read_dir(&path).is_ok_and(|mut inside| inside.next().is_none());
+                if empty {
+                    continue;
+                }
+                bail!("{name} is not a git worktree");
+            }
+            let common = self.git.tree(
+                &path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            let branch = self.git.tree(&path, &["branch", "--show-current"])?;
+            let bare = PathBuf::from(common);
+            let label = github::slug(&self.remote_url(&bare))
+                .map(|(owner, repo)| format!("{owner}/{repo}"))
+                .unwrap_or_else(|| {
+                    bare.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
+            found.push((
+                name,
+                RepoInfo {
+                    label,
+                    bare,
+                    path,
+                    branch,
+                    base: String::new(),
+                },
+            ));
+        }
+        Ok(found)
+    }
+
+    /// Remove a whole session, or nothing at all if any worktree in it, its
+    /// subagents' included, holds unsaved work.
+    pub fn remove_session(&self, session: &Path) -> Result<Value> {
+        let worktrees = self.session_worktrees(session)?;
         let mut problems = Vec::new();
-        for (name, info) in &manifest.repos {
+        for (name, info) in &worktrees {
             // All of the session or none of it: one worktree that is not
             // ours to remove keeps the whole session.
             if let Some(why) = self.left_alone_because(&info.path) {
@@ -1082,16 +1127,49 @@ impl Workspace {
                 problems.join(" | ")
             );
         }
-        for (name, info) in &manifest.repos {
+        // A subagent's worktree first: it may be in a repo the session's own
+        // worktree of it is not.
+        for (name, info) in worktrees.iter().rev() {
             self.remove_one(name, info, false)?;
         }
-        for info in manifest.repos.values() {
+        for (_, info) in &worktrees {
             if self.holds_only_its_own(&info.bare) {
                 let _ = self.git.try_bare(&info.bare, &["worktree", "prune"]);
             }
         }
         fs::remove_dir_all(session)?;
         Ok(json!({ "removed_session": session }))
+    }
+
+    /// True when a worktree's `HEAD` is on the remote's default branch: it
+    /// holds no commit of its own.
+    pub fn on_default_branch(&self, child: &Path) -> Result<bool> {
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let default = format!(
+            "refs/remotes/origin/{}",
+            self.default_branch(Path::new(&common))
+        );
+        Ok(self
+            .git
+            .try_tree(child, &["merge-base", "--is-ancestor", "HEAD", &default])?
+            .ok)
+    }
+
+    /// True when a worktree's `HEAD` holds commits of its own, and they are
+    /// one of a merged pull request's.
+    pub fn head_merged(&self, child: &Path) -> Result<bool> {
+        if self.on_default_branch(child)? {
+            return Ok(false);
+        }
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
+        Ok(self.merged(Path::new(&common), &head))
     }
 
     pub fn status(&self, session: &Path) -> Result<Value> {
@@ -1167,7 +1245,7 @@ impl Workspace {
             // names a branch that does not exist, and in any other a branch
             // the session is not on.
             let start = self.git.tree(&top, &["rev-parse", "HEAD"])?;
-            let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
+            let target = root.join(SUBWORKTREES).join(format!("{name}-{leaf}"));
             fs::create_dir_all(target.parent().unwrap_or(&root))?;
             let branch = format!("{}/{name}", self.config.branch_prefix);
             let target_arg = target.to_string_lossy().to_string();

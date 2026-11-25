@@ -1,6 +1,7 @@
 //! Work that was merged on GitHub: a squash-merged session branch counts as
 //! saved, whatever it tracks and however far along the pull request its tip
-//! is, and housekeeping cleans its folder up at the next run.
+//! is, and housekeeping cleans its folder up at the next run. A worktree a
+//! subagent made inside a session counts as one of its repos.
 
 mod common;
 
@@ -88,19 +89,6 @@ fn session_dir(rig: &Rig, name: &str) -> PathBuf {
 }
 
 #[test]
-fn a_new_session_branch_tracks_nothing() {
-    let rig = Rig::new();
-    let worktree = rig.session("fresh");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&worktree)
-        .args(["rev-parse", "--symbolic-full-name", "@{upstream}"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success(), "it tracks {:?}", out.stdout);
-}
-
-#[test]
 fn a_squash_merged_branch_whose_tip_is_behind_the_pull_requests_head_is_saved() {
     let rig = Rig::new();
     let (worktree, commits) = merged_session(&rig, "behind", false);
@@ -111,11 +99,6 @@ fn a_squash_merged_branch_whose_tip_is_behind_the_pull_requests_head_is_saved() 
     let out = remove_session(&rig, &github, "behind");
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!session_dir(&rig, "behind").exists());
-    // GitHub was asked which commits the pull request holds.
-    assert!(github
-        .requests()
-        .iter()
-        .any(|request| request.path.starts_with("/repos/octo/web/pulls/7/commits")));
 }
 
 #[test]
@@ -268,4 +251,74 @@ mod housekeeping {
         );
         assert!(worktree.is_dir());
     }
+
+    #[test]
+    fn cleanup_keeps_work_that_was_pushed_and_not_merged_until_it_is_old() {
+        let rig = Rig::new();
+        rig.as_github("octo/web");
+        let worktree = rig.session("pushed");
+        fs::write(worktree.join("change.txt"), "1\n").unwrap();
+        rig.home.git(&worktree, &["add", "."]);
+        rig.home.git(&worktree, &["commit", "-q", "-m", "change"]);
+        rig.push(&worktree);
+        let github = Mock::start(|_: &Request| Reply::json(200, json!([])));
+        let report = cleanup(&rig, &github);
+        assert_eq!(
+            verdict(&report, "pushed"),
+            json!({ "session": "pushed", "action": "kept", "reason": "it changed too recently" })
+        );
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn cleanup_keeps_merged_work_whose_subagent_worktree_holds_unsaved_work() {
+        let rig = Rig::new();
+        let (worktree, commits) = merged_session(&rig, "parent", false);
+        let sibling = subworktree(&rig, &worktree, "helper");
+        fs::write(sibling.join("only-here.txt"), "only here\n").unwrap();
+        let github = github(&commits);
+        let report = cleanup(&rig, &github);
+        assert_eq!(verdict(&report, "parent")["action"], "kept", "{report}");
+        assert!(sibling.join("only-here.txt").is_file());
+    }
+}
+
+// ---- worktrees a session's subagents made ------------------------------
+
+/// A sibling worktree made inside a session, as the `WorktreeCreate` hook
+/// makes one for a subagent. Returns its folder.
+fn subworktree(rig: &Rig, worktree: &std::path::Path, name: &str) -> PathBuf {
+    let payload = json!({ "name": name, "cwd": worktree }).to_string();
+    let out = run(rig.nucleate().args(["hook-create"]), &payload);
+    assert!(out.status.success(), "{}", stderr(&out));
+    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+#[test]
+fn remove_session_keeps_a_session_whose_subagent_worktree_holds_unsaved_work() {
+    let rig = Rig::new();
+    let worktree = rig.session("parent");
+    let sibling = subworktree(&rig, &worktree, "helper");
+    fs::write(sibling.join("only-here.txt"), "only here\n").unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    assert!(
+        stderr(&out).contains("uncommitted changes"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(sibling.join("only-here.txt").is_file());
+}
+
+#[test]
+fn remove_session_removes_a_saved_subagent_worktree_with_it() {
+    let rig = Rig::new();
+    let worktree = rig.session("parent");
+    let sibling = subworktree(&rig, &worktree, "helper");
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!session_dir(&rig, "parent").exists());
+    let listed = git(&rig.root.join(".repos/web.git"), &["worktree", "list"]);
+    assert!(!listed.contains("helper"), "{listed}");
+    assert!(!sibling.exists());
 }

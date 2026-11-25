@@ -162,12 +162,13 @@ would drop that worktree's record too if its folder were away at the time.
 
 `nucleated` counts by this same rule, so what Watch shows as unsaved is what
 `nucleate` would refuse to delete: the worktrees with uncommitted changes, and
-the commits that are on no remote. A new session branch tracks nothing until
-it is pushed with `git push -u`. An upstream that is the remote's default
-branch, as older sessions' branches have, or one whose remote branch was
-deleted after a merge, counts as none: a branch that was squash-merged and
-deleted is then recognised from GitHub, even when its tip is an earlier commit
-of the pull request than the last.
+the commits that are on no remote. A new session branch tracks the
+repository's default branch until it is pushed with `git push -u`. An upstream
+that is the remote's default branch, or one whose remote branch was deleted
+after a merge, counts as none: a branch that was squash-merged and deleted is
+then recognised from GitHub, even when its tip is an earlier commit of the
+pull request than the last. A worktree a subagent made inside a session, under
+its `.subworktrees/`, counts as one of the session's repos.
 
 ## Configuration
 
@@ -469,8 +470,7 @@ config_dir = "/home/agent/.claude-client-a"
 refresh = "hourly"
 cleanup = "weekly"
 snapshot = "hourly"
-# A session younger than this is cleaned up only when its work is all on
-# GitHub, pushed or merged.
+# A session younger than this is cleaned up only when its work was merged.
 cleanup_min_age = "7d"
 
 [report]
@@ -1043,7 +1043,7 @@ Never sent from what the box finds out itself: commit subjects and messages,
 file names, diffs, pull request titles, descriptions, branches and authors.
 The daemon never asks git for a commit's subject or a file's contents. `git
 status` names the files that changed, and that answer is read for whether it is
-empty and then dropped. From GitHub's list of pull requests it reads four
+empty and then dropped. From GitHub's list of pull requests it reads five
 fields: the number, the address, the state, whether it was merged and the
 head commit. For a merged pull request whose head is a later commit, it reads
 the ids of that pull request's commits, and nothing else about them.
@@ -1243,7 +1243,7 @@ it tells you the machine has gone dark.
 | Job | Default | What it does |
 |---|---|---|
 | `refresh` | hourly | `nucleate refresh` for each environment: fetch every bare repo and drop branches deleted upstream. |
-| `cleanup` | weekly | Removes a whole session, never one repo out of it, and only when all of these hold: its agent session has ended; no process has a working directory inside it; its last commit and its last agent event are older than `cleanup_min_age`, unless it committed work and all of that work is on GitHub, pushed or merged; and every repo in it passes `nucleate`'s unsaved-work rule. Also prunes stale worktree records. |
+| `cleanup` | weekly | Removes a whole session, never one repo out of it, and only when all of these hold: its agent session has ended; no process has a working directory inside it; its last commit and its last agent event are older than `cleanup_min_age`, unless every worktree in it, its subagents' included, holds nothing beyond the default branch or has its `HEAD` in a merged pull request, and one was merged; and every repo in it, and every worktree its subagents made, passes `nucleate`'s unsaved-work rule. Also prunes stale worktree records. |
 | `snapshot` | hourly | For each worktree with uncommitted work: commits its state, without touching the index or the branch, and pushes that commit to `refs/wip/<branch>` on the remote, with slashes in the branch name replaced by hyphens. Ignored files are not captured. A worktree with a file changed in the last two minutes is skipped, and so is one whose state was already pushed. |
 
 Whether a process is inside a session is read from `/proc`, so `cleanup`

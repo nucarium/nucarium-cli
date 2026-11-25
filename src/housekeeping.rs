@@ -2,7 +2,7 @@
 //!
 //! - `refresh`: fetch every bare repo and drop branches deleted upstream;
 //! - `cleanup`: remove sessions that are finished and hold nothing unsaved,
-//!   at once when their work is on GitHub, pushed or merged;
+//!   at once when their work was merged;
 //! - `snapshot`: push uncommitted work to a hidden ref, so a dead disk costs
 //!   at most an hour.
 //!
@@ -17,7 +17,7 @@ use crate::git;
 use crate::paths;
 use crate::sessions::{Status, Store};
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::{Manifest, Workspace};
+use crate::workspace::{RepoInfo, Workspace};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -241,34 +241,35 @@ fn keep_reason(
             ))
         }
     }
-    let manifest = Workspace::load_manifest(path)?;
+    // Every worktree in it, its subagents' included.
+    let worktrees: Vec<_> = workspace
+        .session_worktrees(path)?
+        .into_iter()
+        .filter(|(_, info)| info.path.exists())
+        .collect();
     // A repo the daemon will not run git in cannot be told saved.
-    for (repo, info) in &manifest.repos {
-        if !info.path.exists() || !workspace.git().enforcing() {
-            continue;
+    for (repo, info) in &worktrees {
+        if !workspace.git().enforcing() {
+            break;
         }
         if let Some(refused) = workspace.git().vet_tree(&info.path) {
             return Ok(Some(format!("{repo}: {refused}")));
         }
     }
-    // What each repo holds that exists nowhere else, asked once.
+    // What each holds that exists nowhere else, asked once.
     let mut unsaved = Vec::new();
-    for (repo, info) in manifest.repos.iter().filter(|(_, info)| info.path.exists()) {
+    for (repo, info) in &worktrees {
         unsaved.push((repo, workspace.unsafe_reasons(&info.path)?));
     }
-    // Work that is all on GitHub, pushed or merged, is finished with: such a
-    // folder goes at once, however recently it changed. One where nothing
-    // was ever committed is not finished work, and waits as before.
-    let saved = unsaved.iter().all(|(_, reasons)| reasons.is_empty());
-    if !(saved && committed_to(workspace, &manifest)) {
+    if !merged_and_done(workspace, &worktrees, &unsaved)? {
         let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
         for session in &agent_sessions {
             last_change = last_change.max(session.last_event_ms);
         }
-        for repo in manifest.repos.values().filter(|repo| repo.path.exists()) {
+        for (_, info) in &worktrees {
             let committed = workspace
                 .git()
-                .tree(&repo.path, &["log", "-1", "--format=%ct"])
+                .tree(&info.path, &["log", "-1", "--format=%ct"])
                 .ok()
                 .and_then(|seconds| seconds.parse::<u64>().ok())
                 .unwrap_or(u64::MAX / 1000);
@@ -287,19 +288,32 @@ fn keep_reason(
     Ok(None)
 }
 
-/// True when a session committed anything: some repo's HEAD is no longer
-/// the commit its worktree started from.
-fn committed_to(workspace: &Workspace, manifest: &Manifest) -> bool {
-    manifest
-        .repos
-        .values()
-        .filter(|info| info.path.exists())
-        .any(|info| {
-            workspace
-                .git()
-                .tree(&info.path, &["rev-parse", "HEAD"])
-                .is_ok_and(|head| head != info.base)
-        })
+/// True when a folder's work is finished with, so that it need not wait out
+/// the age limit: every worktree in it is saved, each either holds nothing
+/// beyond the remote's default branch or has its `HEAD` in a merged pull
+/// request, and at least one was merged. A folder with no worktree at all
+/// holds nothing either. Work that was only pushed is not finished: a
+/// branch on GitHub may still be worked on, and waits as before.
+fn merged_and_done(
+    workspace: &Workspace,
+    worktrees: &[(String, RepoInfo)],
+    unsaved: &[(&String, Vec<String>)],
+) -> Result<bool> {
+    if worktrees.is_empty() {
+        return Ok(true);
+    }
+    if unsaved.iter().any(|(_, reasons)| !reasons.is_empty()) {
+        return Ok(false);
+    }
+    let mut merged = false;
+    for (_, info) in worktrees {
+        if workspace.head_merged(&info.path)? {
+            merged = true;
+        } else if !workspace.on_default_branch(&info.path)? {
+            return Ok(false);
+        }
+    }
+    Ok(merged)
 }
 
 fn cleanup(
