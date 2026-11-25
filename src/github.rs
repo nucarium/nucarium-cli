@@ -1,6 +1,8 @@
 //! The two questions nucleate asks GitHub about a commit: was it merged, and
-//! which open pull requests is it the head of? Both are one documented call,
-//! "list pull requests associated with a commit", and four of its fields.
+//! which open pull requests is it the head of? Both start from one documented
+//! call, "list pull requests associated with a commit", and five of its
+//! fields. A merged pull request whose head is some later commit is then
+//! checked against "list commits on a pull request", for the commit ids alone.
 
 use crate::envelope::pull_request_repo;
 use crate::watch::normalize_api_url;
@@ -75,6 +77,8 @@ fn token(token_file: Option<&Path>) -> Option<String> {
 #[derive(Deserialize)]
 struct Pull {
     #[serde(default)]
+    number: Option<u64>,
+    #[serde(default)]
     html_url: Option<String>,
     #[serde(default)]
     state: Option<String>,
@@ -97,21 +101,20 @@ impl Pull {
     }
 }
 
-/// The pull requests GitHub associates with a commit, or nothing when there
-/// was no answer.
-fn pulls(
-    api: &str,
-    owner: &str,
-    repo: &str,
-    sha: &str,
-    token_file: Option<&Path>,
-) -> Option<Vec<Pull>> {
-    // A commit id goes into the address, so it has to be one.
-    if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let url = format!("{api}/repos/{owner}/{repo}/commits/{sha}/pulls");
-    let mut request = ureq::get(&url)
+/// One commit of a pull request, read for its id and nothing else.
+#[derive(Deserialize)]
+struct Commit {
+    #[serde(default)]
+    sha: Option<String>,
+}
+
+fn hex(sha: &str) -> bool {
+    !sha.is_empty() && sha.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// One answer from the GitHub API, or nothing when there was none.
+fn get<T: serde::de::DeserializeOwned>(url: &str, token_file: Option<&Path>) -> Option<T> {
+    let mut request = ureq::get(url)
         .config()
         .timeout_global(Some(Duration::from_secs(15)))
         .build()
@@ -124,7 +127,66 @@ fn pulls(
     request.call().ok()?.body_mut().read_json().ok()
 }
 
-/// True when a merged pull request's head is exactly this commit.
+/// The pull requests GitHub associates with a commit, or nothing when there
+/// was no answer. For a commit that is not on the default branch, as the
+/// commits of a squash-merged branch never are, that is every pull request
+/// whose commits include it, merged or open.
+fn pulls(
+    api: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+    token_file: Option<&Path>,
+) -> Option<Vec<Pull>> {
+    // A commit id goes into the address, so it has to be one.
+    if !hex(sha) {
+        return None;
+    }
+    get(
+        &format!("{api}/repos/{owner}/{repo}/commits/{sha}/pulls"),
+        token_file,
+    )
+}
+
+/// GitHub lists at most this many commits of one pull request.
+const PULL_COMMITS_MAX: usize = 250;
+const PER_PAGE: usize = 100;
+
+/// Whether `sha` is one of the commits of pull request `number`. Any failure
+/// to get an answer, and a commit beyond the most GitHub lists, is "no".
+fn among_commits(
+    api: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    sha: &str,
+    token_file: Option<&Path>,
+) -> bool {
+    for page in 1..=PULL_COMMITS_MAX.div_ceil(PER_PAGE) {
+        let url = format!(
+            "{api}/repos/{owner}/{repo}/pulls/{number}/commits?per_page={PER_PAGE}&page={page}"
+        );
+        let Some(commits) = get::<Vec<Commit>>(&url, token_file) else {
+            return false;
+        };
+        if commits.iter().any(|commit| {
+            commit
+                .sha
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(sha))
+        }) {
+            return true;
+        }
+        if commits.len() < PER_PAGE {
+            return false;
+        }
+    }
+    false
+}
+
+/// True when this commit is one of the commits of a merged pull request:
+/// its head, or one before it. A commit made after the last one a pull
+/// request held is in none, however that pull request ended.
 ///
 /// A squash merge rewrites the commits and the branch is then deleted, so
 /// asking GitHub is the only way to recognise finished work. Any failure to
@@ -136,7 +198,13 @@ pub fn merged(api: &str, remote_url: &str, sha: &str, token_file: Option<&Path>)
     pulls(api, &owner, &repo, sha, token_file).is_some_and(|pulls| {
         pulls
             .iter()
-            .any(|pull| pull.merged_at.is_some() && pull.head_is(sha))
+            .filter(|pull| pull.merged_at.is_some())
+            .any(|pull| {
+                pull.head_is(sha)
+                    || pull.number.is_some_and(|number| {
+                        among_commits(api, &owner, &repo, number, sha, token_file)
+                    })
+            })
     })
 }
 
@@ -230,8 +298,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_request_is_read_for_four_fields_and_nothing_else() {
+    fn a_pull_request_is_read_for_five_fields_and_nothing_else() {
         let listed = r#"[{
+            "number": 7,
             "html_url": "https://github.com/octo/demo/pull/7",
             "state": "open",
             "merged_at": null,
@@ -246,6 +315,7 @@ mod tests {
         }, {}]"#;
         let pulls: Vec<Pull> = serde_json::from_str(listed).unwrap();
         assert!(pulls[0].head_is("abc123") && pulls[0].merged_at.is_none());
+        assert_eq!(pulls[0].number, Some(7));
         assert_eq!(pulls[0].state.as_deref(), Some("open"));
         assert!(pulls[1].head_is("def456") && pulls[1].merged_at.is_some());
         assert!(!pulls[2].head_is("abc123"));

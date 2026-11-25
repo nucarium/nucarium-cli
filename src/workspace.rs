@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod layout;
@@ -31,6 +32,8 @@ mod layout;
 pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
+/// Where the worktrees a session's subagents make go, inside the session.
+const SUBWORKTREES: &str = ".subworktrees";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -88,8 +91,8 @@ pub struct Unsaved {
     /// Changes that are not committed, untracked files included.
     pub uncommitted: bool,
     /// Commits on no remote: those ahead of the branch's upstream or, for a
-    /// branch with none, those no remote branch holds, unless a merged pull
-    /// request's head is this very commit.
+    /// branch with none of its own, those no remote branch holds, unless
+    /// this very commit is one of a merged pull request's.
     pub unpushed: u32,
     /// Whether `unpushed` was counted against an upstream.
     pub tracked: bool,
@@ -128,6 +131,35 @@ struct Asked {
 const ASK_AGAIN_AFTER_S: u64 = 3_600;
 /// An answer nobody has needed for this long is forgotten.
 const FORGET_AFTER_S: u64 = 30 * 86_400;
+
+/// Held while `merged.json` is read, changed and written back. The reporter
+/// and housekeeping each ask GitHub on a thread of their own and remember
+/// what they heard in the one file; without it, one's answers could be
+/// written over with a copy read before them.
+static MERGES: Mutex<()> = Mutex::new(());
+
+fn read_merges(file: &Path) -> BTreeMap<String, Asked> {
+    fs::read_to_string(file)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Add one answer to `merged.json`: read afresh, so that what another thread
+/// wrote since this one asked is kept, and written back whole. Answers no one
+/// has needed for a month are dropped.
+fn remember_merge(file: &Path, key: String, answer: Asked) {
+    let _held = MERGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now_s = answer.at_s;
+    let mut asked = read_merges(file);
+    asked.retain(|_, earlier| now_s.saturating_sub(earlier.at_s) < FORGET_AFTER_S);
+    asked.insert(key, answer);
+    if let Ok(text) = serde_json::to_string(&asked) {
+        let _ = paths::write_private(file, text.as_bytes());
+    }
+}
 
 fn count(text: &str) -> Result<u32> {
     text.trim()
@@ -660,6 +692,11 @@ impl Workspace {
     }
 
     fn write_agents(session: &Path, manifest: &Manifest) -> Result<()> {
+        fs::write(session.join("AGENTS.md"), Self::agents_text(manifest))?;
+        Ok(())
+    }
+
+    fn agents_text(manifest: &Manifest) -> String {
         let mut text = format!(
             "# Workspace session\n\nEach subdirectory is an independent git worktree on branch \
              `{}`. Work only inside them; never edit the bare repos under `../../.repos/`. Use \
@@ -672,8 +709,7 @@ impl Workspace {
                 info.label, info.branch
             ));
         }
-        fs::write(session.join("AGENTS.md"), text)?;
-        Ok(())
+        text
     }
 
     fn inside_sessions(&self, path: &Path) -> bool {
@@ -872,16 +908,12 @@ impl Workspace {
             .git
             .tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
         let uncommitted = !status.is_empty();
-        let upstream = self.git.try_tree(
+        let common = self.git.tree(
             child,
-            &[
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{upstream}",
-            ],
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?;
-        if upstream.ok && !upstream.stdout.is_empty() {
+        let common = Path::new(&common);
+        if self.has_own_upstream(child, common)? {
             let ahead = self
                 .git
                 .tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?;
@@ -897,12 +929,8 @@ impl Workspace {
             .tree(child, &["branch", "-r", "--contains", "HEAD"])?
             .is_empty()
         {
-            let common = self.git.tree(
-                child,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            )?;
             let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
-            if !self.merged(Path::new(&common), &head) {
+            if !self.merged(common, &head) {
                 let alone = self.git.tree(
                     child,
                     &["rev-list", "--count", "HEAD", "--not", "--remotes"],
@@ -916,6 +944,23 @@ impl Workspace {
             unpushed,
             tracked: false,
         })
+    }
+
+    /// True when a worktree's branch tracks a branch of its own on a remote,
+    /// one that still exists: the commits ahead of it are then the ones not
+    /// pushed. The remote's default branch is not such a branch. A session's
+    /// work is merged into it, often squashed, so counting against it would
+    /// count finished work as unpushed for ever.
+    fn has_own_upstream(&self, child: &Path, common: &Path) -> Result<bool> {
+        let upstream = self
+            .git
+            .try_tree(child, &["rev-parse", "--symbolic-full-name", "@{upstream}"])?;
+        // No upstream, or one whose remote branch is gone, fails here.
+        if !upstream.ok || !upstream.stdout.starts_with("refs/remotes/") {
+            return Ok(false);
+        }
+        let default = format!("refs/remotes/origin/{}", self.default_branch(common));
+        Ok(upstream.stdout != default)
     }
 
     /// Reasons a worktree must not be deleted: anything that exists nowhere else.
@@ -940,27 +985,20 @@ impl Workspace {
         let now_s = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
-        let mut asked: BTreeMap<String, Asked> = fs::read_to_string(file)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
-        match asked.get(&key) {
+        match read_merges(file).get(&key) {
             Some(answer) if answer.merged => return true,
             Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => return false,
             _ => {}
         }
         let merged = ask();
-        asked.retain(|_, answer| now_s.saturating_sub(answer.at_s) < FORGET_AFTER_S);
-        asked.insert(
+        remember_merge(
+            file,
             key,
             Asked {
                 merged,
                 at_s: now_s,
             },
         );
-        if let Ok(text) = serde_json::to_string(&asked) {
-            let _ = paths::write_private(file, text.as_bytes());
-        }
         merged
     }
 
@@ -1001,10 +1039,12 @@ impl Workspace {
 
     pub fn remove_repo(&self, session: &Path, repo: &str, force: bool) -> Result<Value> {
         let mut manifest = Self::load_manifest(session)?;
+        // Only a worktree that is this session's own, as its manifest names.
+        let worktrees = self.session_worktrees(session)?;
         // Named as the session has it: by its folder there, or its label.
-        let (name, info) = manifest
-            .repos
+        let (name, info) = worktrees
             .iter()
+            .filter(|(name, _)| manifest.repos.contains_key(name))
             .find(|(name, info)| {
                 name.eq_ignore_ascii_case(repo) || info.label.eq_ignore_ascii_case(repo)
             })
@@ -1017,11 +1057,209 @@ impl Workspace {
         Ok(json!({ "removed": name, "session": session }))
     }
 
-    /// Remove a whole session, or nothing at all if any repo in it holds unsaved work.
-    pub fn remove_session(&self, session: &Path) -> Result<Value> {
+    /// Every worktree in a session folder: the repos its manifest lists, and
+    /// those its subagents made under `.subworktrees/`, which no manifest
+    /// lists. Each comes with a name to say it by.
+    ///
+    /// The session can write its manifest and `.subworktrees`, so neither is
+    /// taken at its word. A worktree is taken for one of this session's only
+    /// when it is a folder right here, not a link: a manifest's repo directly
+    /// in the session, a subagent's directly in `.subworktrees`. Git's
+    /// pointer in it must lead to one of this nucleus's bare repos (for a
+    /// manifest's repo, the one the manifest names), and that repo must have
+    /// it registered under this very path. Nothing is run in it before then.
+    /// Anything else is an error, and keeps the session: what it holds is
+    /// nowhere else, or it is not this session's to touch. A manifest's repo
+    /// whose folder is gone is listed as it is; a link among the subagents'
+    /// is not listed, and removing the session removes only the link.
+    pub fn session_worktrees(&self, session: &Path) -> Result<Vec<(String, RepoInfo)>> {
         let manifest = Self::load_manifest(session)?;
+        let session_real = session.canonicalize()?;
+        let repos: Vec<(PathBuf, Available)> = self
+            .available()?
+            .into_iter()
+            .filter_map(|item| Some((item.bare.canonicalize().ok()?, item)))
+            .collect();
+        let mut found: Vec<(String, RepoInfo)> = Vec::new();
+        for (name, info) in manifest.repos {
+            let here = info
+                .path
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .is_some_and(|parent| parent == session_real);
+            if !here || info.path.file_name().is_none() {
+                bail!("{name}: its worktree is not in the session");
+            }
+            match fs::symlink_metadata(&info.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    bail!("{name}: its worktree is not a folder")
+                }
+                Ok(_) => {
+                    let (bare, _) = self.registered_here(&name, &info.path, &repos)?;
+                    let named = info.bare.canonicalize().ok();
+                    if named.as_ref() != Some(bare) {
+                        bail!("{name}: its worktree is not of the repo the manifest names");
+                    }
+                }
+            }
+            found.push((name, info));
+        }
+        let subs_dir = session.join(SUBWORKTREES);
+        // A link in its place leads somewhere else, and holds none of them.
+        if fs::symlink_metadata(&subs_dir).map_or(true, |meta| !meta.is_dir()) {
+            return Ok(found);
+        }
+        let Ok(entries) = fs::read_dir(&subs_dir) else {
+            return Ok(found);
+        };
+        let mut subs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        subs.sort();
+        for path in subs {
+            let name = format!(
+                "{SUBWORKTREES}/{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if !meta.is_dir() {
+                bail!("{name} is not a git worktree");
+            }
+            if fs::symlink_metadata(path.join(".git")).is_err() {
+                let empty = fs::read_dir(&path).is_ok_and(|mut inside| inside.next().is_none());
+                if empty {
+                    continue;
+                }
+                bail!("{name} is not a git worktree");
+            }
+            let (_, item) = self.registered_here(&name, &path, &repos)?;
+            let branch = self.git.tree(&path, &["branch", "--show-current"])?;
+            found.push((
+                name,
+                RepoInfo {
+                    label: item.label.clone(),
+                    bare: item.bare.clone(),
+                    path,
+                    branch,
+                    base: String::new(),
+                },
+            ));
+        }
+        Ok(found)
+    }
+
+    /// The repo of this nucleus that `path`, a folder, is a worktree of: its
+    /// `.git` file points there, and the repo has it registered at exactly
+    /// this path. An error otherwise.
+    fn registered_here<'a>(
+        &self,
+        name: &str,
+        path: &Path,
+        repos: &'a [(PathBuf, Available)],
+    ) -> Result<(&'a PathBuf, &'a Available)> {
+        let real = path.canonicalize()?;
+        let Some((bare, item)) = self.pointed_at(&path.join(".git"), repos) else {
+            // Said as the vetting says it, where it would refuse the worktree.
+            if let Some(refused) = self
+                .git
+                .enforcing()
+                .then(|| self.git.vet_tree(path))
+                .flatten()
+            {
+                return Err(refused.into());
+            }
+            bail!("{name} is not a worktree of this nucleus's repos");
+        };
+        let registered = self.worktrees(bare)?.iter().any(|worktree| {
+            worktree
+                .canonicalize()
+                .is_ok_and(|worktree| worktree == real)
+        });
+        if !registered {
+            bail!("{name} is not a worktree its repo has registered");
+        }
+        Ok((bare, item))
+    }
+
+    /// The entries at a session folder's root that nucleate did not put
+    /// there: anything but its manifest, the `AGENTS.md` made from it
+    /// unchanged, `.subworktrees`, and the folders of the repos it lists.
+    /// What is in them is nowhere else, so a session that holds any is not
+    /// saved. `worktrees` is the session's, as [`Workspace::session_worktrees`]
+    /// gave them.
+    pub fn other_files(session: &Path, worktrees: &[(String, RepoInfo)]) -> Vec<String> {
+        let manifest = Self::load_manifest(session).ok();
+        let ours: Vec<&std::ffi::OsStr> = worktrees
+            .iter()
+            .filter(|(name, _)| !name.starts_with(SUBWORKTREES))
+            .filter_map(|(_, info)| info.path.file_name())
+            .collect();
+        let mut other: Vec<String> = fs::read_dir(session)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let kind = entry.file_type().ok();
+                let file = kind.is_some_and(|kind| kind.is_file());
+                let dir = kind.is_some_and(|kind| kind.is_dir());
+                let known = match name.to_str() {
+                    Some(MANIFEST) => file,
+                    Some("AGENTS.md") => {
+                        file && manifest.as_ref().is_some_and(|manifest| {
+                            fs::read_to_string(entry.path())
+                                .is_ok_and(|text| text == Self::agents_text(manifest))
+                        })
+                    }
+                    Some(SUBWORKTREES) => dir,
+                    _ => dir && ours.contains(&name.as_os_str()),
+                };
+                !known
+            })
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        other.sort();
+        other
+    }
+
+    /// The repo of this nucleus whose linked worktree a `.git` file names,
+    /// read without running git: `gitdir: <bare>/worktrees/<id>`. Nothing
+    /// for a folder, a file that says anything else, or another repo.
+    fn pointed_at<'a>(
+        &self,
+        pointer: &Path,
+        repos: &'a [(PathBuf, Available)],
+    ) -> Option<(&'a PathBuf, &'a Available)> {
+        if !fs::symlink_metadata(pointer).ok()?.is_file() {
+            return None;
+        }
+        let text = git::read_small(pointer, 4096).ok()?;
+        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        let target = PathBuf::from(target).canonicalize().ok()?;
+        let worktrees = target.parent()?;
+        if worktrees.file_name()? != "worktrees" {
+            return None;
+        }
+        let bare = worktrees.parent()?;
+        repos
+            .iter()
+            .find(|(real, _)| real == bare)
+            .map(|(real, item)| (real, item))
+    }
+
+    /// Remove a whole session, or nothing at all if any worktree in it, its
+    /// subagents' included, holds unsaved work.
+    pub fn remove_session(&self, session: &Path) -> Result<Value> {
+        let worktrees = self.session_worktrees(session)?;
         let mut problems = Vec::new();
-        for (name, info) in &manifest.repos {
+        let other = Self::other_files(session, &worktrees);
+        if !other.is_empty() {
+            problems.push(format!("it holds other files: {}", other.join(", ")));
+        }
+        for (name, info) in &worktrees {
             // All of the session or none of it: one worktree that is not
             // ours to remove keeps the whole session.
             if let Some(why) = self.left_alone_because(&info.path) {
@@ -1039,16 +1277,49 @@ impl Workspace {
                 problems.join(" | ")
             );
         }
-        for (name, info) in &manifest.repos {
+        // A subagent's worktree first: it may be in a repo the session's own
+        // worktree of it is not.
+        for (name, info) in worktrees.iter().rev() {
             self.remove_one(name, info, false)?;
         }
-        for info in manifest.repos.values() {
+        for (_, info) in &worktrees {
             if self.holds_only_its_own(&info.bare) {
                 let _ = self.git.try_bare(&info.bare, &["worktree", "prune"]);
             }
         }
         fs::remove_dir_all(session)?;
         Ok(json!({ "removed_session": session }))
+    }
+
+    /// True when a worktree's `HEAD` is on the remote's default branch: it
+    /// holds no commit of its own.
+    pub fn on_default_branch(&self, child: &Path) -> Result<bool> {
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let default = format!(
+            "refs/remotes/origin/{}",
+            self.default_branch(Path::new(&common))
+        );
+        Ok(self
+            .git
+            .try_tree(child, &["merge-base", "--is-ancestor", "HEAD", &default])?
+            .ok)
+    }
+
+    /// True when a worktree's `HEAD` holds commits of its own, and they are
+    /// one of a merged pull request's.
+    pub fn head_merged(&self, child: &Path) -> Result<bool> {
+        if self.on_default_branch(child)? {
+            return Ok(false);
+        }
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
+        Ok(self.merged(Path::new(&common), &head))
     }
 
     pub fn status(&self, session: &Path) -> Result<Value> {
@@ -1124,7 +1395,7 @@ impl Workspace {
             // names a branch that does not exist, and in any other a branch
             // the session is not on.
             let start = self.git.tree(&top, &["rev-parse", "HEAD"])?;
-            let target = root.join(".subworktrees").join(format!("{name}-{leaf}"));
+            let target = root.join(SUBWORKTREES).join(format!("{name}-{leaf}"));
             fs::create_dir_all(target.parent().unwrap_or(&root))?;
             let branch = format!("{}/{name}", self.config.branch_prefix);
             let target_arg = target.to_string_lossy().to_string();
@@ -1176,7 +1447,34 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_branch, valid_name, Unsaved};
+    use super::{read_merges, remember_merge, valid_branch, valid_name, Asked, Unsaved};
+
+    #[test]
+    fn answers_remembered_at_once_by_several_threads_are_all_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("merged.json");
+        let at_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let file = &file;
+                scope.spawn(move || {
+                    for n in 0..25 {
+                        let answer = Asked {
+                            merged: n % 2 == 0,
+                            at_s,
+                        };
+                        remember_merge(file, format!("octo/web@{thread}-{n}"), answer);
+                    }
+                });
+            }
+        });
+        let kept = read_merges(&file);
+        assert_eq!(kept.len(), 8 * 25);
+        assert!(kept["octo/web@3-4"].merged && !kept["octo/web@3-5"].merged);
+    }
 
     #[test]
     fn unsaved_work_is_put_in_the_words_a_refusal_uses() {

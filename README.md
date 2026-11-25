@@ -143,9 +143,10 @@ JSON on standard output; anything meant for a person goes to standard error.
 elsewhere:
 
 - uncommitted or untracked changes;
-- commits that are ahead of the branch's upstream;
-- with no upstream, a `HEAD` that is on no remote branch **and** is not the head
-  of a merged pull request.
+- commits that are ahead of the branch's upstream, when that is a branch of its
+  own on a remote that still exists;
+- otherwise, a `HEAD` that is on no remote branch **and** is not one of the
+  commits of a merged pull request, its head or one before it.
 
 The last check asks GitHub, because a squash merge rewrites the commits and the
 branch is usually deleted afterwards. If GitHub can't be reached, the answer is
@@ -162,8 +163,17 @@ would drop that worktree's record too if its folder were away at the time.
 `nucleated` counts by this same rule, so what Watch shows as unsaved is what
 `nucleate` would refuse to delete: the worktrees with uncommitted changes, and
 the commits that are on no remote. A new session branch tracks the
-repository's default branch until it is pushed with `git push -u`. Commits
-pushed without `-u` are still ahead of that upstream, so they still count.
+repository's default branch until it is pushed with `git push -u`. An upstream
+that is the remote's default branch, or one whose remote branch was deleted
+after a merge, counts as none: a branch that was squash-merged and deleted is
+then recognised from GitHub, even when its tip is an earlier commit of the
+pull request than the last. A worktree a subagent made inside a session, under
+its `.subworktrees/`, counts as one of the session's repos. Anything else at a
+session's root, a file or a folder nucleate did not put there, is unsaved
+too, and keeps the session. A worktree counts as the session's only when it
+is a folder directly in it (or in its `.subworktrees/`), not a link, and the
+nucleus's repo has it registered at that path: a manifest that names a folder
+anywhere else keeps the session rather than reach outside it.
 
 ## Configuration
 
@@ -465,7 +475,7 @@ config_dir = "/home/agent/.claude-client-a"
 refresh = "hourly"
 cleanup = "weekly"
 snapshot = "hourly"
-# A session younger than this is never cleaned up.
+# A session younger than this is cleaned up only when its work was merged.
 cleanup_min_age = "7d"
 
 [report]
@@ -538,7 +548,7 @@ and all mode 600:
 | `snapshots/` | The tree last pushed for each branch, so the same work is not pushed twice. |
 | `unsaved.json` | The last count of unsaved work, per nucleus: two numbers and two times, and the name of each repo the daemon would not run git in, with one word for why. The heartbeat reads the numbers and times, never the names. |
 | `outcomes/<environment>/<session_id>.json` | A note that a session stopped or ended and its repos are to be looked at. Removed when they have been. |
-| `merged.json` | GitHub's answers to "was this commit merged?", so the count asks about a commit once an hour at most and never again once it was merged. |
+| `merged.json` | GitHub's answers to "was this commit merged?", so the count and `cleanup` ask about a commit once an hour at most and never again once it was merged. |
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 | `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
@@ -1038,8 +1048,10 @@ Never sent from what the box finds out itself: commit subjects and messages,
 file names, diffs, pull request titles, descriptions, branches and authors.
 The daemon never asks git for a commit's subject or a file's contents. `git
 status` names the files that changed, and that answer is read for whether it is
-empty and then dropped. From GitHub's list of pull requests it reads four
-fields: the address, the state, whether it was merged and the head commit.
+empty and then dropped. From GitHub's list of pull requests it reads five
+fields: the number, the address, the state, whether it was merged and the
+head commit. For a merged pull request whose head is a later commit, it reads
+the ids of that pull request's commits, and nothing else about them.
 
 Never read from a driver, never written to disk, never sent: thread and
 session titles, messages, prompts, goals, terminal contents and previews, tool
@@ -1236,7 +1248,7 @@ it tells you the machine has gone dark.
 | Job | Default | What it does |
 |---|---|---|
 | `refresh` | hourly | `nucleate refresh` for each environment: fetch every bare repo and drop branches deleted upstream. |
-| `cleanup` | weekly | Removes a whole session, never one repo out of it, and only when all of these hold: its agent session has ended; no process has a working directory inside it; its last commit and its last agent event are older than `cleanup_min_age`; and every repo in it passes `nucleate`'s unsaved-work rule. Also prunes stale worktree records. |
+| `cleanup` | weekly | Removes a whole session, never one repo out of it, and only when all of these hold: its agent session has ended; no process has a working directory inside it; its last commit and its last agent event are older than `cleanup_min_age`, unless every worktree in it, its subagents' included, holds nothing beyond the default branch or has its `HEAD` in a merged pull request, and one was merged; and every repo in it, and every worktree its subagents made, passes `nucleate`'s unsaved-work rule. Also prunes stale worktree records. |
 | `snapshot` | hourly | For each worktree with uncommitted work: commits its state, without touching the index or the branch, and pushes that commit to `refs/wip/<branch>` on the remote, with slashes in the branch name replaced by hyphens. Ignored files are not captured. A worktree with a file changed in the last two minutes is skipped, and so is one whose state was already pushed. |
 
 Whether a process is inside a session is read from `/proc`, so `cleanup`

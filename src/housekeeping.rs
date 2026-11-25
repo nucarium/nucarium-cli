@@ -1,7 +1,8 @@
 //! Housekeeping: the jobs that keep a nucleus healthy while nobody watches.
 //!
 //! - `refresh`: fetch every bare repo and drop branches deleted upstream;
-//! - `cleanup`: remove sessions that are finished and hold nothing unsaved;
+//! - `cleanup`: remove sessions that are finished and hold nothing unsaved,
+//!   at once when their work was merged;
 //! - `snapshot`: push uncommitted work to a hidden ref, so a dead disk costs
 //!   at most an hour.
 //!
@@ -16,7 +17,7 @@ use crate::git;
 use crate::paths;
 use crate::sessions::{Status, Store};
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::Workspace;
+use crate::workspace::{RepoInfo, Workspace};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,6 +114,12 @@ pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Works
     )))
 }
 
+/// Where GitHub's answers about merged commits are remembered, for cleanup
+/// and the reporter alike.
+pub(crate) fn merges_file(state_dir: &Path) -> PathBuf {
+    state_dir.join("merged.json")
+}
+
 /// Run one job for one environment and report what it did.
 pub fn run_job(
     settings: &Settings,
@@ -135,8 +142,9 @@ pub fn run_job(
         bail!("{} is not a folder", environment.root.display());
     }
     // And no job reaches into a driver's folders from a nucleus beside them.
-    let workspace =
-        workspace(settings, environment).leaving_alone(driver::protected_roots(settings));
+    let workspace = workspace(settings, environment)
+        .leaving_alone(driver::protected_roots(settings))
+        .remembering_merges(merges_file(&settings.state_dir));
     let mut report = match job {
         Job::Refresh => {
             // A nucleus made before owner folders moves to them first.
@@ -233,42 +241,82 @@ fn keep_reason(
             ))
         }
     }
-    let manifest = Workspace::load_manifest(path)?;
+    // Every worktree in it, its subagents' included, and anything else at
+    // its root that nucleate did not put there.
+    let listed = workspace.session_worktrees(path)?;
+    let other = Workspace::other_files(path, &listed);
+    let worktrees: Vec<_> = listed
+        .into_iter()
+        .filter(|(_, info)| info.path.exists())
+        .collect();
     // A repo the daemon will not run git in cannot be told saved.
-    for (repo, info) in &manifest.repos {
-        if !info.path.exists() || !workspace.git().enforcing() {
-            continue;
+    for (repo, info) in &worktrees {
+        if !workspace.git().enforcing() {
+            break;
         }
         if let Some(refused) = workspace.git().vet_tree(&info.path) {
             return Ok(Some(format!("{repo}: {refused}")));
         }
     }
-    let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
-    for session in &agent_sessions {
-        last_change = last_change.max(session.last_event_ms);
-    }
-    for repo in manifest.repos.values().filter(|repo| repo.path.exists()) {
-        let committed = workspace
-            .git()
-            .tree(&repo.path, &["log", "-1", "--format=%ct"])
-            .ok()
-            .and_then(|seconds| seconds.parse::<u64>().ok())
-            .unwrap_or(u64::MAX / 1000);
-        last_change = last_change.max(committed.saturating_mul(1000));
-    }
-    let age_ms = unix_ms(SystemTime::now()).saturating_sub(last_change);
-    if age_ms < min_age.as_millis() as u64 {
-        return Ok(Some("it changed too recently".to_string()));
-    }
-    for (repo, info) in &manifest.repos {
-        if info.path.exists() {
-            let reasons = workspace.unsafe_reasons(&info.path)?;
-            if !reasons.is_empty() {
-                return Ok(Some(format!("{repo}: {}", reasons.join("; "))));
-            }
+    // What it holds that exists nowhere else, asked once.
+    let mut unsaved = Vec::new();
+    for (repo, info) in &worktrees {
+        let reasons = workspace.unsafe_reasons(&info.path)?;
+        if !reasons.is_empty() {
+            unsaved.push(format!("{repo}: {}", reasons.join("; ")));
         }
     }
-    Ok(None)
+    if !other.is_empty() {
+        unsaved.push(format!("it holds other files: {}", other.join(", ")));
+    }
+    if !(unsaved.is_empty() && merged_and_done(workspace, path, &worktrees)?) {
+        let mut last_change = modified_ms(path).max(modified_ms(&path.join(".workspace.json")));
+        for session in &agent_sessions {
+            last_change = last_change.max(session.last_event_ms);
+        }
+        for (_, info) in &worktrees {
+            let committed = workspace
+                .git()
+                .tree(&info.path, &["log", "-1", "--format=%ct"])
+                .ok()
+                .and_then(|seconds| seconds.parse::<u64>().ok())
+                .unwrap_or(u64::MAX / 1000);
+            last_change = last_change.max(committed.saturating_mul(1000));
+        }
+        let age_ms = unix_ms(SystemTime::now()).saturating_sub(last_change);
+        if age_ms < min_age.as_millis() as u64 {
+            return Ok(Some("it changed too recently".to_string()));
+        }
+    }
+    Ok(unsaved.into_iter().next())
+}
+
+/// True when a folder that holds nothing unsaved, nor any file nucleate did
+/// not put there, is finished with, so that it need not wait out the age
+/// limit: each worktree in it holds nothing beyond the remote's default
+/// branch or has its `HEAD` in a merged pull request, and at least one was
+/// merged. A folder with no worktree and an empty `.subworktrees` is
+/// finished with too. Work that was only pushed is not finished: a branch
+/// on GitHub may still be worked on, and waits as before.
+fn merged_and_done(
+    workspace: &Workspace,
+    path: &Path,
+    worktrees: &[(String, RepoInfo)],
+) -> Result<bool> {
+    if worktrees.is_empty() {
+        let subs = path.join(".subworktrees");
+        return Ok(fs::symlink_metadata(&subs).is_err()
+            || fs::read_dir(&subs).is_ok_and(|mut inside| inside.next().is_none()));
+    }
+    let mut merged = false;
+    for (_, info) in worktrees {
+        if workspace.head_merged(&info.path)? {
+            merged = true;
+        } else if !workspace.on_default_branch(&info.path)? {
+            return Ok(false);
+        }
+    }
+    Ok(merged)
 }
 
 fn cleanup(

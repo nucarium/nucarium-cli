@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The agent user's home folder, where an adapter looks for a third party's
 /// files when the config names no other place.
@@ -59,8 +60,14 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+/// Each write's own number, so that two threads writing the same file never
+/// share a temporary file.
+static WRITES: AtomicU64 = AtomicU64::new(0);
+
 /// Write a file only its owner can read, by writing a temporary file beside it
-/// and renaming, so a reader never sees half of it.
+/// and renaming, so a reader never sees half of it. The temporary file is
+/// this write's alone: two writers of one file, in two processes or two
+/// threads of one, each rename a whole file of their own.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
@@ -70,7 +77,11 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -107,5 +118,34 @@ pub fn mode(path: &Path) -> Option<u32> {
     {
         let _ = path;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_private;
+
+    #[test]
+    fn threads_writing_one_file_at_once_each_write_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shared.json");
+        let contents: Vec<String> = (0..16).map(|n| format!("{n}").repeat(4_096)).collect();
+        std::thread::scope(|scope| {
+            for text in &contents {
+                let file = &file;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        write_private(file, text.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let left = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains(&left), "a file made of two writes");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["shared.json"], "a temporary file was left behind");
     }
 }

@@ -275,7 +275,7 @@ impl Reporter {
 
     fn workspace(&self, settings: &Settings, environment: &Environment) -> Workspace {
         let workspace = housekeeping::workspace(settings, environment)
-            .remembering_merges(settings.state_dir.join("merged.json"));
+            .remembering_merges(housekeeping::merges_file(&settings.state_dir));
         match &self.github {
             Some(url) => workspace.asking_github_at(url),
             None => workspace,
