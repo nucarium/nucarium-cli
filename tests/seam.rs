@@ -98,7 +98,7 @@ fn beside_a_driver() -> (Rig, PathBuf, PathBuf) {
     let rig = Rig::new();
     let workspaces = rig.home.dir.join("orca").join("workspaces");
     std::fs::create_dir_all(&workspaces).unwrap();
-    let bare = rig.root.join(".repos/web.git");
+    let bare = rig.bare();
     let worktree = workspaces.join("task-1");
     git(
         &rig.home.dir,
@@ -224,7 +224,7 @@ fn housekeeping_never_removes_or_changes_anything_under_a_drivers_own_folders() 
 /// that a snapshot would not pass it by as still being written.
 fn beside_a_worktree_no_config_names() -> (Rig, PathBuf, PathBuf) {
     let rig = Rig::new();
-    let bare = rig.root.join(".repos/web.git");
+    let bare = rig.bare();
     let worktree = rig.home.dir.join("threads").join("thread-1");
     add_worktree(&rig, &bare, &worktree, "thread/one");
     let notes = worktree.join("notes.txt");

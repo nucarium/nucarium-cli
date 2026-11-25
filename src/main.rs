@@ -98,7 +98,12 @@ fn finish(output: login::Output) -> Result<u8> {
 fn run_without_workspace(cli: &Cli) -> Option<Result<u8>> {
     let mut ui = std::io::stderr();
     Some(match &cli.command {
-        Command::Init => config::init(cli.root.clone()).and_then(|out| print(&out).map(|()| 0)),
+        Command::Init => config::init(cli.root.clone()).and_then(|out| {
+            // A nucleus made before owner folders moves to them now.
+            let root = out["root"].as_str().map(PathBuf::from);
+            move_to_owner_folders(&Workspace::new(config::load(root)?));
+            print(&out).map(|()| 0)
+        }),
         Command::Login {
             api_url,
             name,
@@ -122,6 +127,20 @@ fn run_without_workspace(cli: &Cli) -> Option<Result<u8>> {
     })
 }
 
+/// Move a nucleus's repos into owner folders, saying on stderr what moved:
+/// stdout is each command's JSON. A move that fails says so and is tried
+/// again next time; the command itself goes on, on the repos as they are.
+fn move_to_owner_folders(workspace: &Workspace) {
+    match workspace.move_to_owner_folders() {
+        Ok(moved) => {
+            for line in moved.lines() {
+                eprintln!("nucleate: {line}");
+            }
+        }
+        Err(error) => eprintln!("nucleate: moving repos to owner folders: {error:#}"),
+    }
+}
+
 fn run(cli: Cli) -> Result<u8> {
     if let Some(result) = run_without_workspace(&cli) {
         return result;
@@ -137,11 +156,15 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Init | Command::Login { .. } | Command::Logout | Command::Whoami => {
             unreachable!("handled before the workspace is loaded")
         }
-        Command::Clone { url, name } => print(&serde_json::to_value(
-            workspace.clone(url, name.as_deref())?,
-        )?)?,
+        Command::Clone { url, name } => {
+            move_to_owner_folders(&workspace);
+            print(&serde_json::to_value(
+                workspace.clone(url, name.as_deref())?,
+            )?)?
+        }
         Command::Available => print(&serde_json::to_value(workspace.available()?)?)?,
         Command::Refresh => {
+            move_to_owner_folders(&workspace);
             let results = workspace.refresh()?;
             print(&results)?;
             let all_ok = results

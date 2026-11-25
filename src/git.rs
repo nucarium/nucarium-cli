@@ -395,7 +395,7 @@ fn short_name(path: &Path) -> String {
 
 /// A small file's text. Anything but a plain file is an error: opening a
 /// pipe a session planted in place of a pointer must not wait for a writer.
-fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
+pub(crate) fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -747,6 +747,25 @@ impl Git {
             Git::Plain => bare(dir, args),
             Git::Guarded(_) => checked(self.try_bare(dir, args)?, Some(("--git-dir", dir)), args),
         }
+    }
+
+    /// `git worktree repair` in a bare repo, so that the worktrees it has
+    /// registered point at it again after it moved. Run from inside the
+    /// bare repo itself: repair also repairs the folder it is run from, and
+    /// run from another repository's worktree it would point that one here.
+    pub fn repair_worktrees(&self, bare: &Path) -> Result<()> {
+        let args = ["worktree", "repair"];
+        let out = match self {
+            Git::Plain => {
+                let mut command = Command::new("git");
+                command.arg("--git-dir").arg(bare).args(args);
+                collect(command.current_dir(bare))?
+            }
+            Git::Guarded(guarded) => {
+                collect(guarded.prepare(bare, true, &args, None)?.current_dir(bare))?
+            }
+        };
+        checked(out, Some(("--git-dir", bare)), &args).map(drop)
     }
 
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {

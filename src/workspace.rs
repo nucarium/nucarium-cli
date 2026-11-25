@@ -3,12 +3,17 @@
 //! Layout under the workspace root:
 //!
 //! ```text
-//! .repos/<repo>.git          bare clones; a repo is available when its clone exists
+//! .repos/<owner>/<repo>.git  bare clones of GitHub repos, under their owner
+//! .repos/_/<repo>.git        bare clones from anywhere else
 //! .worktrees/<session>/      one folder per session
 //!     .workspace.json        the session's manifest
-//!     <repo>/                a linked git worktree of .repos/<repo>.git
+//!     <repo>/                a linked git worktree of one bare clone
 //! .seeds/<repo>/             untracked files copied into new worktrees
 //! ```
+//!
+//! A repo is available when its clone exists. A nucleus made before owner
+//! folders has `.repos/<repo>.git`; those are still read, and moved into
+//! their owner folders by [`Workspace::move_to_owner_folders`].
 
 use crate::config::Config;
 use crate::{git, github, paths};
@@ -20,6 +25,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod layout;
+
+pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
 
@@ -44,6 +53,14 @@ pub struct Available {
     pub repo: String,
     pub label: String,
     pub bare: PathBuf,
+}
+
+/// What `nucleate clone` made available, or found already there.
+#[derive(Debug, Clone, Serialize)]
+pub struct Cloned {
+    #[serde(flatten)]
+    pub repo: Available,
+    pub already_present: bool,
 }
 
 pub struct Workspace {
@@ -296,78 +313,64 @@ impl Workspace {
 
     pub fn available(&self) -> Result<Vec<Available>> {
         let mut found = Vec::new();
-        let Ok(entries) = fs::read_dir(&self.repos_dir) else {
-            return Ok(found);
-        };
-        for entry in entries.flatten() {
+        // In an owner folder, a repo is labelled by where it is.
+        for (owner, name, path) in layout::nested(&self.repos_dir) {
+            if self.listed(&path)? {
+                found.push(Available {
+                    label: layout::label(&owner, &name),
+                    repo: name,
+                    bare: path,
+                });
+            }
+        }
+        // Not moved to an owner folder yet: labelled by its remote, as before.
+        for entry in fs::read_dir(&self.repos_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             let path = entry.path();
             let file = entry.file_name().to_string_lossy().to_string();
             let Some(name) = file.strip_suffix(".git") else {
                 continue;
             };
-            // A repo the daemon refuses is still one of the nucleus's: it is
-            // listed, under its folder's name, and every call in it refused.
-            if self.git.enforcing() && self.git.vet_bare(&path).is_some() {
-                found.push(Available {
-                    repo: name.to_string(),
-                    label: name.to_string(),
-                    bare: path,
-                });
+            if !self.listed(&path)? {
                 continue;
             }
-            let is_bare = self
-                .git
-                .try_bare(&path, &["rev-parse", "--is-bare-repository"])?;
-            if !is_bare.ok || is_bare.stdout != "true" {
-                continue;
+            let refused = self.git.enforcing() && self.git.vet_bare(&path).is_some();
+            let label = match refused {
+                true => None,
+                false => github::slug(&self.remote_url(&path)),
             }
-            let label = github::slug(&self.remote_url(&path))
-                .map(|(owner, repo)| format!("{owner}/{repo}"))
-                .unwrap_or_else(|| name.to_string());
+            .map(|(owner, repo)| format!("{owner}/{repo}"))
+            .unwrap_or_else(|| name.to_string());
             found.push(Available {
                 repo: name.to_string(),
                 label,
                 bare: path,
             });
         }
-        found.sort_by(|a, b| a.repo.cmp(&b.repo));
+        found.sort_by(|a, b| (&a.repo, &a.label).cmp(&(&b.repo, &b.label)));
         Ok(found)
     }
 
-    /// Find a repo by its short name (`demo`) or its label (`octo/demo`).
-    fn lookup(&self, value: &str) -> Result<Available> {
-        let available = self.available()?;
-        if let Some(hit) = available
-            .iter()
-            .find(|a| a.label == value || a.repo == value)
-        {
-            return Ok(hit.clone());
+    /// Whether a folder in `.repos` is listed as a repo: a bare repo is, and
+    /// so is one the daemon refuses, which is still one of the nucleus's,
+    /// with every call in it refused.
+    fn listed(&self, path: &Path) -> Result<bool> {
+        if self.git.enforcing() && self.git.vet_bare(path).is_some() {
+            return Ok(true);
         }
-        let short = value.rsplit('/').next().unwrap_or(value);
-        if !valid_name(short) {
-            bail!("invalid repo name: {value:?}");
-        }
-        available
-            .into_iter()
-            .find(|a| a.repo == short)
-            .ok_or_else(|| {
-                anyhow!(
-                    "repo not available in {}: {value}",
-                    self.repos_dir.display()
-                )
-            })
+        let is_bare = self
+            .git
+            .try_bare(path, &["rev-parse", "--is-bare-repository"])?;
+        Ok(is_bare.ok && is_bare.stdout == "true")
     }
 
-    /// Find a repo to add. One named `owner/name` that this nucleus does not
-    /// have yet is fetched from GitHub first, with the box's GitHub sign-in,
-    /// when the box already has repositories from that owner.
-    fn find_or_fetch(&self, value: &str) -> Result<Available> {
-        let Some((owner, name)) = value.split_once('/') else {
-            return self.lookup(value);
-        };
-        if !valid_name(owner) || !valid_name(name) {
-            return self.lookup(value);
-        }
+    /// Find a repo by its label (`octo/demo`, or `demo` for one with no
+    /// owner), or by its name alone (`demo`) when only one owner has a repo
+    /// of that name. Case does not matter.
+    fn lookup(&self, value: &str) -> Result<Available> {
         let available = self.available()?;
         if let Some(hit) = available
             .iter()
@@ -375,38 +378,59 @@ impl Workspace {
         {
             return Ok(hit.clone());
         }
-        if let Some(hit) = available.iter().find(|a| a.repo.eq_ignore_ascii_case(name)) {
-            // A folder of the same name with no owner is taken to be it, as
-            // before; another owner's repository is not.
-            if hit.label == hit.repo {
-                return Ok(hit.clone());
-            }
-            bail!(
-                "cannot add {value}: {} is already here under the name {}",
-                hit.label,
-                hit.repo
-            );
+        let short = value.rsplit('/').next().unwrap_or(value);
+        if !valid_name(short) {
+            bail!("invalid repo name: {value:?}");
         }
-        // Only from an owner the box already has repositories from: a session
-        // cannot bring in another owner's code under a name the box's own
-        // repositories may later need.
-        let owned_here = available.iter().any(|a| {
-            a.label
-                .split_once('/')
-                .is_some_and(|(have, _)| have.eq_ignore_ascii_case(owner))
-        });
-        if !owned_here {
-            bail!(
-                "cannot add {value}: this box has no repos from {owner}; \
-                 add the repo to the box's list of repos instead"
-            );
+        let not_here = || {
+            anyhow!(
+                "repo not available in {}: {value}",
+                self.repos_dir.display()
+            )
+        };
+        if value.contains('/') {
+            return Err(not_here());
+        }
+        let mut named: Vec<Available> = available
+            .into_iter()
+            .filter(|a| a.repo.eq_ignore_ascii_case(value))
+            .collect();
+        match named.len() {
+            0 => Err(not_here()),
+            1 => Ok(named.remove(0)),
+            _ => {
+                let labels: Vec<&str> = named.iter().map(|a| a.label.as_str()).collect();
+                bail!(
+                    "{value} is more than one repo here: {}; name the one you mean",
+                    labels.join(", ")
+                )
+            }
+        }
+    }
+
+    /// Find a repo to add. One named `owner/name` that this nucleus does not
+    /// have yet is fetched from GitHub first, with the box's GitHub sign-in,
+    /// into its owner's folder.
+    fn find_or_fetch(&self, value: &str) -> Result<Available> {
+        let Some((owner, name)) = value.split_once('/') else {
+            return self.lookup(value);
+        };
+        if !layout::valid_owner(owner) || !valid_name(name) {
+            return self.lookup(value);
+        }
+        if let Some(hit) = self
+            .available()?
+            .into_iter()
+            .find(|a| a.label.eq_ignore_ascii_case(value))
+        {
+            return Ok(hit);
         }
         let url = format!(
             "{}/{owner}/{name}.git",
             github::git_origin(&self.config.github_api)
         );
-        match self.clone(&url, None) {
-            Ok(fetched) => Ok(fetched),
+        match self.clone_into(&url, None, Some(owner)) {
+            Ok(fetched) => Ok(fetched.repo),
             // Another session fetched the same repo at the same moment.
             Err(error) => self
                 .available()?
@@ -416,10 +440,17 @@ impl Workspace {
         }
     }
 
-    /// `nucleate clone`: make a repo available. The bare repo fetches into
-    /// remote-tracking refs, so a fetch never rewrites a branch a session has
-    /// checked out, and records the remote's default branch.
-    pub fn clone(&self, url: &str, name: Option<&str>) -> Result<Available> {
+    /// `nucleate clone`: make a repo available, in its owner's folder. The
+    /// bare repo fetches into remote-tracking refs, so a fetch never rewrites
+    /// a branch a session has checked out, and records the remote's default
+    /// branch. A repo already here is found, not cloned again.
+    pub fn clone(&self, url: &str, name: Option<&str>) -> Result<Cloned> {
+        self.clone_into(url, name, None)
+    }
+
+    /// As [`Workspace::clone`], into `owner`'s folder when it is given, else
+    /// that of the URL's GitHub owner, else the folder for repos with none.
+    fn clone_into(&self, url: &str, name: Option<&str>, owner: Option<&str>) -> Result<Cloned> {
         let name = match name {
             Some(name) => name.to_string(),
             None => {
@@ -439,10 +470,7 @@ impl Workspace {
         if !valid_name(&name) {
             bail!("cannot name a repo {name:?} from {url:?}; pass --name");
         }
-        let bare = self.repos_dir.join(format!("{name}.git"));
-        if bare.exists() {
-            bail!("repo already available: {}", bare.display());
-        }
+        let owner = owner.map_or_else(|| layout::owner_of(url), str::to_string);
         // A path on this machine is fetched by its full name, so the clone
         // does not depend on the folder the command was run from.
         let local = Path::new(url);
@@ -450,8 +478,34 @@ impl Workspace {
             Ok(path) if !url.contains("://") => path.to_string_lossy().to_string(),
             _ => url.to_string(),
         };
-        fs::create_dir_all(&self.repos_dir)?;
-        self.git.init_bare(&bare)?;
+        let label = layout::label(&owner, &name);
+        if let Some(have) = self
+            .available()?
+            .into_iter()
+            .find(|a| a.label.eq_ignore_ascii_case(&label))
+        {
+            // A GitHub repo is the same repo by its owner and name. One with
+            // no owner has only its name, so it must come from the same place.
+            if owner != layout::NO_OWNER || self.remote_url(&have.bare) == source {
+                return Ok(Cloned {
+                    repo: have,
+                    already_present: true,
+                });
+            }
+            bail!("repo already available: {}", have.bare.display());
+        }
+        let owner_dir = layout::owner_dir(&self.repos_dir, &owner);
+        let bare = owner_dir.join(format!("{name}.git"));
+        if bare.exists() {
+            bail!("repo already available: {}", bare.display());
+        }
+        let new_owner = !owner_dir.exists();
+        fs::create_dir_all(&owner_dir)?;
+        let made = self.git.init_bare(&bare);
+        if made.is_err() && new_owner {
+            let _ = fs::remove_dir(&owner_dir);
+        }
+        made?;
         let fetched = self
             .git
             .bare(&bare, &["remote", "add", "origin", &source])
@@ -468,6 +522,8 @@ impl Workspace {
             .and_then(|_| self.git.bare(&bare, &["fetch", "-q", "origin"]));
         if let Err(error) = fetched {
             let _ = fs::remove_dir_all(&bare);
+            // Only if it is empty: another repo may be arriving in it.
+            let _ = fs::remove_dir(&owner_dir);
             return Err(error);
         }
         // An empty remote has no head to record; sessions then start from "main".
@@ -476,13 +532,16 @@ impl Workspace {
             .try_bare(&bare, &["remote", "set-head", "origin", "--auto"]);
         let head = format!("refs/heads/{}", self.default_branch(&bare));
         let _ = self.git.try_bare(&bare, &["symbolic-ref", "HEAD", &head]);
-        let label = github::slug(&self.remote_url(&bare))
-            .map(|(owner, repo)| format!("{owner}/{repo}"))
-            .unwrap_or_else(|| name.clone());
-        Ok(Available {
-            repo: name,
-            label,
-            bare,
+        let owner = owner_dir
+            .file_name()
+            .map_or(owner, |have| have.to_string_lossy().to_string());
+        Ok(Cloned {
+            repo: Available {
+                label: layout::label(&owner, &name),
+                repo: name,
+                bare,
+            },
+            already_present: false,
         })
     }
 
@@ -586,7 +645,11 @@ impl Workspace {
             );
         }
         let text = fs::read_to_string(&path)?;
-        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut manifest: Manifest =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // A repo moved to its owner folder since this was written.
+        layout::relocate_all(&mut manifest);
+        Ok(manifest)
     }
 
     fn save_manifest(session: &Path, manifest: &Manifest) -> Result<()> {
@@ -688,6 +751,16 @@ impl Workspace {
         let mut manifest = Self::load_manifest(session)?;
         let item = self.find_or_fetch(repo)?;
         if let Some(existing) = manifest.repos.get(&item.repo) {
+            let same = existing.label.eq_ignore_ascii_case(&item.label)
+                || Self::resolved(&existing.bare) == Self::resolved(&item.bare);
+            if !same {
+                bail!(
+                    "this session already has {} from {}; {} cannot be added beside it",
+                    item.repo,
+                    existing.label,
+                    item.label
+                );
+            }
             return Ok(json!({
                 "repo": item.repo, "path": existing.path, "branch": existing.branch,
                 "already_present": true,
@@ -928,12 +1001,15 @@ impl Workspace {
 
     pub fn remove_repo(&self, session: &Path, repo: &str, force: bool) -> Result<Value> {
         let mut manifest = Self::load_manifest(session)?;
-        let name = self.lookup(repo)?.repo;
-        let info = manifest
+        // Named as the session has it: by its folder there, or its label.
+        let (name, info) = manifest
             .repos
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| anyhow!("repo not in session: {name}"))?;
+            .iter()
+            .find(|(name, info)| {
+                name.eq_ignore_ascii_case(repo) || info.label.eq_ignore_ascii_case(repo)
+            })
+            .map(|(name, info)| (name.clone(), info.clone()))
+            .ok_or_else(|| anyhow!("repo not in session: {repo}"))?;
         self.remove_one(&name, &info, force)?;
         manifest.repos.remove(&name);
         Self::save_manifest(session, &manifest)?;

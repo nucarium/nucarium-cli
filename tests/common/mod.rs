@@ -560,8 +560,11 @@ impl Rig {
     /// GitHub: a test that uses this points nucleate at a stand-in. The
     /// rewrite is the test user's own, as a box's git settings are, and not
     /// the repo's: a repo's config holds nothing of the kind.
+    ///
+    /// The repo moves to its owner's folder, where `nucleate clone` of that
+    /// address would have put it.
     pub fn as_github(&self, slug: &str) {
-        let bare = self.root.join(".repos/web.git");
+        let bare = self.bare();
         let url = format!("https://github.com/{slug}.git");
         let rewrite = format!("url.{}.insteadOf", self.upstream.display());
         let global = self.home.gitconfig();
@@ -570,6 +573,48 @@ impl Rig {
             &["config", "--file", global.to_str().unwrap(), &rewrite, &url],
         );
         git(&bare, &["config", "remote.origin.url", &url]);
+        let owner = slug.split('/').next().unwrap();
+        let moved = self.root.join(".repos").join(owner).join("web.git");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&bare, &moved).unwrap();
+        let repaired = Command::new("git")
+            .current_dir(&moved)
+            .args(["--git-dir", ".", "worktree", "repair"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(repaired.status.success(), "{}", stderr(&repaired));
+    }
+
+    /// Put the `web` repo back where a nucleate before owner folders kept
+    /// it, `.repos/web.git`, with its worktrees and every session's manifest
+    /// pointing there.
+    pub fn flatten(&self) -> PathBuf {
+        let nested = self.bare();
+        let flat = self.root.join(".repos").join("web.git");
+        std::fs::rename(&nested, &flat).unwrap();
+        git(&flat, &["--git-dir", ".", "worktree", "repair"]);
+        let sessions = self.root.join(".worktrees");
+        for session in std::fs::read_dir(sessions).unwrap().flatten() {
+            let file = session.path().join(".workspace.json");
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let text = text.replace(nested.to_str().unwrap(), flat.to_str().unwrap());
+                std::fs::write(&file, text).unwrap();
+            }
+        }
+        flat
+    }
+
+    /// The `web` repo's bare clone, in whichever owner folder it is.
+    pub fn bare(&self) -> PathBuf {
+        let repos = self.root.join(".repos");
+        std::fs::read_dir(&repos)
+            .unwrap()
+            .flatten()
+            .map(|owner| owner.path().join("web.git"))
+            .find(|bare| bare.is_dir())
+            .unwrap_or_else(|| repos.join("_").join("web.git"))
     }
 
     /// Push a worktree's branch and make it the one it tracks, as an agent's

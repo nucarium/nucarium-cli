@@ -1098,6 +1098,26 @@ impl Daemon {
     }
 }
 
+/// Move each nucleus made before owner folders to them, before anything
+/// else reads its repos. One that cannot be moved now is tried again by the
+/// next refresh.
+fn move_to_owner_folders(settings: &Settings) {
+    for environment in &settings.environments {
+        if environment.driver_owns_worktrees() || !environment.root.join(".repos").is_dir() {
+            continue;
+        }
+        let workspace = housekeeping::workspace(settings, environment);
+        match workspace.move_to_owner_folders() {
+            Ok(moved) => {
+                for line in moved.lines() {
+                    log(&format!("{}: {line}", environment.name));
+                }
+            }
+            Err(error) => log(&format!("{}: moving repos: {error:#}", environment.name)),
+        }
+    }
+}
+
 /// `nucleated run`. Returns when `stop` is set.
 pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
     let settings = settings::load()?;
@@ -1107,6 +1127,7 @@ pub fn run(stop: Arc<AtomicBool>) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         settings.environments.len()
     ));
+    move_to_owner_folders(&settings);
     let keeper = {
         let stop = stop.clone();
         let path = settings.path.clone();
