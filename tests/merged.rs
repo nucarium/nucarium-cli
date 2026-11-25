@@ -40,10 +40,8 @@ fn merged_session(rig: &Rig, name: &str, track_default: bool) -> (PathBuf, Vec<S
     git(&rig.upstream, &["merge", "-q", "--squash", &branch]);
     git(&rig.upstream, &["commit", "-q", "-m", "fix login (#7)"]);
     git(&rig.upstream, &["branch", "-q", "-D", &branch]);
-    rig.home.git(
-        &rig.root.join(".repos/web.git"),
-        &["fetch", "-q", "--prune", "origin"],
-    );
+    rig.home
+        .git(&rig.bare(), &["fetch", "-q", "--prune", "origin"]);
     (worktree, commits)
 }
 
@@ -141,6 +139,31 @@ fn a_merged_pull_request_that_does_not_hold_the_commit_does_not_save_it() {
     let out = remove_session(&rig, &github, "elsewhere");
     assert!(!out.status.success());
     assert!(session_dir(&rig, "elsewhere").is_dir());
+}
+
+#[test]
+fn a_subagent_worktree_counts_before_and_after_the_move_to_owner_folders() {
+    let rig = Rig::new();
+    let worktree = rig.session("parent");
+    let sibling = subworktree(&rig, &worktree, "helper");
+    fs::write(sibling.join("only-here.txt"), "only here\n").unwrap();
+    // A nucleus still in the flat layout.
+    rig.flatten();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    // Moved to owner folders, as the next refresh does.
+    let moved = run(rig.nucleate().arg("refresh"), "");
+    assert!(moved.status.success(), "{}", stderr(&moved));
+    assert!(!rig.root.join(".repos/web.git").exists());
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(!out.status.success(), "the session was removed");
+    assert!(sibling.join("only-here.txt").is_file());
+    fs::remove_file(sibling.join("only-here.txt")).unwrap();
+    let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!session_dir(&rig, "parent").exists());
+    let listed = git(&rig.bare(), &["worktree", "list"]);
+    assert!(!listed.contains("helper"), "{listed}");
 }
 
 // ---- housekeeping ----------------------------------------------------------
@@ -318,7 +341,7 @@ fn remove_session_removes_a_saved_subagent_worktree_with_it() {
     let out = run(rig.nucleate().args(["remove-session", "parent"]), "");
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(!session_dir(&rig, "parent").exists());
-    let listed = git(&rig.root.join(".repos/web.git"), &["worktree", "list"]);
+    let listed = git(&rig.bare(), &["worktree", "list"]);
     assert!(!listed.contains("helper"), "{listed}");
     assert!(!sibling.exists());
 }
