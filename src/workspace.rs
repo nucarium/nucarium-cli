@@ -1316,17 +1316,47 @@ impl Workspace {
         self.remove_session_with(session, false)
     }
 
-    /// Remove a whole session. With `force`, unsaved work in it goes too;
-    /// without, any worktree that holds some keeps all of it. Either way, one
-    /// worktree that is not this nucleus's own keeps the whole session.
+    /// Remove a whole session. With `force`, unsaved work in its worktrees
+    /// goes too; without, any worktree that holds some keeps all of it.
+    /// Either way, a file at its root that nucleate did not put there, or one
+    /// worktree that is not this nucleus's own, keeps the whole session.
     pub fn remove_session_with(&self, session: &Path, force: bool) -> Result<Value> {
         let worktrees = self.session_worktrees(session)?;
+        self.remove_these(session, &worktrees, force)
+    }
+
+    /// As [`Workspace::remove_session_with`], for a session that must still
+    /// hold exactly the worktrees `expected` lists, the ones a caller has
+    /// looked at and backed up. If it holds any other, or lacks one, nothing
+    /// is removed.
+    pub fn remove_session_as_listed(
+        &self,
+        session: &Path,
+        expected: &[(String, RepoInfo)],
+        force: bool,
+    ) -> Result<Value> {
+        let worktrees = self.session_worktrees(session)?;
+        let paths = |list: &[(String, RepoInfo)]| -> Vec<PathBuf> {
+            list.iter().map(|(_, info)| info.path.clone()).collect()
+        };
+        if paths(&worktrees) != paths(expected) {
+            bail!("refusing to remove session: its worktrees changed");
+        }
+        self.remove_these(session, &worktrees, force)
+    }
+
+    fn remove_these(
+        &self,
+        session: &Path,
+        worktrees: &[(String, RepoInfo)],
+        force: bool,
+    ) -> Result<Value> {
         let mut problems = Vec::new();
-        let other = Self::other_files(session, &worktrees);
+        let other = Self::other_files(session, worktrees);
         if !other.is_empty() {
             problems.push(format!("it holds other files: {}", other.join(", ")));
         }
-        for (name, info) in &worktrees {
+        for (name, info) in worktrees {
             // All of the session or none of it: one worktree that is not
             // ours to remove keeps the whole session.
             if let Some(why) = self.left_alone_because(&info.path) {
@@ -1349,7 +1379,7 @@ impl Workspace {
         for (name, info) in worktrees.iter().rev() {
             self.remove_one(name, info, force)?;
         }
-        for (_, info) in &worktrees {
+        for (_, info) in worktrees {
             if self.holds_only_its_own(&info.bare) {
                 let _ = self.git.try_bare(&info.bare, &["worktree", "prune"]);
             }

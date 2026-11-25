@@ -692,6 +692,24 @@ pub mod contract {
 
     type Check = Result<(), String>;
 
+    /// What JavaScript's `\s` matches, as the API checks with it.
+    fn js_space(c: char) -> bool {
+        matches!(
+            c,
+            '\u{9}'..='\u{d}'
+                | ' '
+                | '\u{a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    }
+
     fn chars(value: &str, min: usize, max: usize, allowed: impl Fn(char) -> bool) -> bool {
         (min..=max).contains(&value.chars().count()) && value.chars().all(allowed)
     }
@@ -1130,8 +1148,8 @@ pub mod contract {
                     "worktree.repo",
                     "branch",
                     string(|v| {
-                        v.chars().count() <= 255
-                            && !v.chars().any(|c| c.is_whitespace() || c.is_control())
+                        v.encode_utf16().count() <= 255
+                            && !v.chars().any(|c| js_space(c) || c.is_control())
                     }),
                 )?;
                 field(repo, "worktree.repo", "uncommitted", boolean)?;
@@ -1187,7 +1205,10 @@ pub mod contract {
                 result,
                 "worktree_action_result",
                 "detail",
-                string(|v| chars(v, 1, 300, |c| !c.is_control())),
+                string(|v| {
+                    (1..=300).contains(&v.encode_utf16().count())
+                        && !v.chars().any(char::is_control)
+                }),
             )?;
             field(
                 result,

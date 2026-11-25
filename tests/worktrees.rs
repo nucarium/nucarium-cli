@@ -392,7 +392,7 @@ fn an_action_the_box_stopped_in_the_middle_of_is_not_run_again() {
 }
 
 #[test]
-fn nothing_runs_while_the_record_of_started_actions_cannot_be_read() {
+fn nothing_runs_while_the_record_of_started_actions_cannot_be_read_and_watch_hears_why() {
     let rig = rig();
     let worktree = rig.session("fix-login");
     commit(&worktree, "a.txt");
@@ -409,7 +409,13 @@ fn nothing_runs_while_the_record_of_started_actions_cannot_be_read() {
     assert_eq!(run_actions(&rig), 0);
     assert!(git(&rig.upstream, &["branch", "--list", "workspace/*"]).is_empty());
     beats.beat();
-    assert!(results(&mock).is_empty());
+    let carried = results(&mock);
+    assert_eq!(carried.len(), 1, "{carried:?}");
+    assert_eq!(carried[0]["outcome"], "refused");
+    assert_eq!(
+        carried[0]["detail"],
+        "The box cannot read its record of earlier actions."
+    );
 }
 
 #[test]
@@ -474,6 +480,76 @@ fn a_subagents_worktree_is_reported_as_part_of_its_repo() {
     assert_eq!(repos.as_array().unwrap().len(), 1, "{repos}");
     assert_eq!(repos[0]["repo"], "web");
     assert_eq!(repos[0]["uncommitted"], true);
+}
+
+#[test]
+fn a_branch_with_a_space_javascript_sees_is_sent_blank() {
+    let rig = rig();
+    let worktree = rig.session("fix-login");
+    git(&worktree, &["checkout", "-q", "-b", "agent/a\u{FEFF}b"]);
+    count(&rig);
+    let taking = common::gate::watch_taking(&["worktrees"]);
+    rig.sign_in(&taking.url);
+    let mut beats = Beats::new(&rig);
+    beats.beat();
+    beats.beat();
+    // `heartbeats` holds every one to the contract as the API does.
+    let said = heartbeats(&taking).pop().unwrap();
+    assert_eq!(
+        said["environments"][0]["worktrees"][0]["repos"][0]["branch"],
+        ""
+    );
+}
+
+#[test]
+fn a_file_at_a_folders_root_shows_the_folder_as_not_saved() {
+    let rig = rig();
+    rig.session("fix-login");
+    fs::write(
+        rig.root.join(".worktrees/fix-login/NOTES.md"),
+        "only here\n",
+    )
+    .unwrap();
+    count(&rig);
+    let taking = common::gate::watch_taking(&["worktrees"]);
+    rig.sign_in(&taking.url);
+    let mut beats = Beats::new(&rig);
+    beats.beat();
+    beats.beat();
+    let said = heartbeats(&taking).pop().unwrap();
+    let repos = &said["environments"][0]["worktrees"][0]["repos"];
+    assert_eq!(
+        repos[1],
+        json!({
+            "repo": "fix-login", "branch": "",
+            "uncommitted": true, "unpushed_commits": 0,
+        }),
+        "{repos}"
+    );
+}
+
+#[test]
+fn a_result_the_box_cannot_read_is_sent_as_lost_and_then_forgotten() {
+    let rig = rig();
+    let (mock, _) = watch(false);
+    rig.sign_in(&mock.url);
+    let results_dir = rig
+        .home
+        .state_dir()
+        .join("worktree-actions/results/client-a");
+    fs::create_dir_all(&results_dir).unwrap();
+    fs::write(results_dir.join(format!("{ID}.json")), "{ half a resu").unwrap();
+    fs::write(results_dir.join("stray.json"), "{}").unwrap();
+    let mut beats = Beats::new(&rig);
+    beats.beat();
+    beats.beat();
+    beats.beat();
+    let carried = results(&mock);
+    assert_eq!(carried.len(), 1, "{carried:?}");
+    assert_eq!(carried[0]["id"], ID);
+    assert_eq!(carried[0]["outcome"], "failed");
+    assert_eq!(carried[0]["detail"], "The box lost this action's result.");
+    assert_eq!(fs::read_dir(&results_dir).unwrap().count(), 0);
 }
 
 /// Whether a process works in a folder is read from /proc, so a folder can
@@ -629,5 +705,57 @@ mod clean_up {
         );
         assert!(nested.join("own.txt").is_file());
         assert!(git(&rig.upstream, &["for-each-ref", "refs/wip"]).is_empty());
+    }
+
+    #[test]
+    fn a_file_at_a_folders_root_is_never_cleaned_up() {
+        let rig = rig();
+        rig.session("fix-login");
+        let notes = folder(&rig, "fix-login").join("NOTES.md");
+        fs::write(&notes, "only here\n").unwrap();
+        let result = act(&rig, action("fix-login", "clean_up", false));
+        assert_eq!(result["outcome"], "refused");
+        assert_eq!(result["detail"], "It holds files outside its repos.");
+        let result = act(
+            &rig,
+            json!({
+                "id": "wta_0000000000000003", "env_id": "client-a", "folder": "fix-login",
+                "kind": "clean_up", "discard": true, "requested_at": rfc3339(SystemTime::now()),
+            }),
+        );
+        assert_eq!(result["outcome"], "failed");
+        assert_eq!(
+            result["detail"],
+            "It holds files outside its repos, which cannot be backed up, so nothing was removed."
+        );
+        assert!(notes.is_file());
+    }
+
+    #[test]
+    fn a_detail_that_would_be_too_long_for_watch_is_said_shorter() {
+        let rig = rig();
+        let worktree = rig.session("fix-login");
+        let payload = json!({ "name": "helper", "cwd": worktree }).to_string();
+        let out = common::run(rig.nucleate().arg("hook-create"), &payload);
+        assert!(out.status.success(), "{}", common::stderr(&out));
+        let sibling = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let smiles = "\u{1F600}".repeat(55);
+        for (place, branch) in [
+            (&worktree, format!("workspace/fix-login{smiles}")),
+            (&sibling, format!("workspace/helper{smiles}")),
+        ] {
+            git(place, &["branch", "-q", "-m", &branch]);
+            fs::write(place.join("only-here.txt"), "only here\n").unwrap();
+        }
+        // `act` holds the heartbeat that carries the result to the contract.
+        let result = act(&rig, action("fix-login", "clean_up", true));
+        assert_eq!(result["outcome"], "done", "{result}");
+        assert_eq!(result["detail"], "Backed up 2 repos to GitHub.");
+        let backups = git(
+            &rig.upstream,
+            &["for-each-ref", "--format=%(refname)", "refs/wip"],
+        );
+        assert_eq!(backups.lines().count(), 2, "{backups}");
+        assert!(!folder(&rig, "fix-login").exists());
     }
 }

@@ -115,11 +115,30 @@ fn valid_repo(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._/-".contains(c))
 }
 
-/// A branch as Watch takes one: at most 255 UTF-16 units, with no space or
-/// control character in it.
+/// A character JavaScript's `\s` matches, as Watch checks with it.
+fn js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+/// A branch as Watch takes one: at most 255 UTF-16 units, as JavaScript
+/// counts a string's length, with nothing in it that JavaScript's `\s`
+/// matches and no control character.
 fn reportable_branch(value: &str) -> bool {
     value.encode_utf16().count() <= MAX_BRANCH
-        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !value.chars().any(|c| js_space(c) || c.is_control())
 }
 
 /// The name a repo goes by in the report and in a result's detail: its
@@ -211,12 +230,16 @@ fn folder(
     name: &str,
     path: &Path,
 ) -> Option<Worktree> {
-    let worktrees = worktrees_of(workspace, path).ok()?;
+    let listed = workspace.session_worktrees(path).ok()?;
+    let worktrees: Vec<&(String, RepoInfo)> = listed
+        .iter()
+        .filter(|(_, info)| info.path.is_dir())
+        .collect();
     let sessions = housekeeping::agent_sessions(store, sharing, name);
     let in_use = housekeeping::in_use_because(&sessions, path).is_some();
     let git = workspace.git();
     let mut repos = Vec::new();
-    for (key, info) in &worktrees {
+    for (key, info) in worktrees.iter().copied() {
         let unsaved = workspace.unsaved(&info.path).ok()?;
         let branch = git.tree(&info.path, &["branch", "--show-current"]).ok()?;
         // One that does not fit is sent blank.
@@ -235,6 +258,21 @@ fn folder(
                 unpushed_commits: u64::from(unsaved.unpushed).min(MAX_UNPUSHED),
                 merged_pull_request: pulls.merged,
                 open_pull_request: pulls.open,
+            },
+        );
+    }
+    // Anything else at the folder's root is held nowhere else: the folder
+    // is not saved, and says so under its own name.
+    if !Workspace::other_files(path, &listed).is_empty() {
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: name.to_string(),
+                branch: String::new(),
+                uncommitted: true,
+                unpushed_commits: 0,
+                merged_pull_request: None,
+                open_pull_request: None,
             },
         );
     }
@@ -398,10 +436,9 @@ pub fn take(settings: &Settings, actions: &[Action], now: SystemTime) {
     if actions.is_empty() {
         return;
     }
-    let Ok(started) = read_started(&settings.state_dir) else {
-        eprintln!("nucleated: the record of worktree actions cannot be read; taking none");
-        return;
-    };
+    // Taken even when the record cannot be read: the thread that runs them
+    // then refuses each, and runs none.
+    let started = read_started(&settings.state_dir).unwrap_or_default();
     for action in actions.iter().filter(|action| action.valid()) {
         if started.contains_key(&action.id) || settings.environment(&action.env_id).is_none() {
             continue;
@@ -421,17 +458,44 @@ pub fn take(settings: &Settings, actions: &[Action], now: SystemTime) {
 }
 
 /// The results waiting to be sent for one environment, oldest first, at most
-/// [`MAX_RESULTS`]. Nothing when there are none.
+/// [`MAX_RESULTS`]. Nothing when there are none. A result file that cannot
+/// be read becomes a failed result, said so, and is sent like any other; a
+/// file not named for an action is removed.
 pub fn results(state_dir: &Path, env: &str) -> Option<Vec<ActionResult>> {
     if !valid_env_key(env) {
         return None;
     }
-    let mut found: Vec<ActionResult> = fs::read_dir(results_dir(state_dir, env))
-        .ok()?
-        .flatten()
-        .filter_map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).ok()?).ok())
-        .collect();
-    found.retain(|result| valid_id(&result.id));
+    let mut found = Vec::new();
+    for entry in fs::read_dir(results_dir(state_dir, env)).ok()?.flatten() {
+        let path = entry.path();
+        let read = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ActionResult>(&text).ok())
+            .filter(|result| valid_id(&result.id));
+        if let Some(result) = read {
+            found.push(result);
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .filter(|stem| valid_id(stem) && path.extension().is_some_and(|ext| ext == "json"));
+        let Some(id) = id else {
+            let _ = fs::remove_file(&path);
+            continue;
+        };
+        let lost = ActionResult {
+            id,
+            outcome: Outcome::Failed,
+            detail: "The box lost this action's result.".to_string(),
+            finished_at: rfc3339(SystemTime::now()),
+        };
+        // In its place, so that it goes once Watch has heard it.
+        if let Ok(text) = serde_json::to_string(&lost) {
+            let _ = paths::write_private(&path, text.as_bytes());
+        }
+        found.push(lost);
+    }
     for result in &mut found {
         result.detail = fit(std::mem::take(&mut result.detail), String::new);
     }
@@ -476,15 +540,20 @@ fn ended(outcome: Outcome, detail: impl Into<String>) -> Ended {
 }
 
 /// `text` when it is short enough for a detail, else `shorter`, as one line
-/// with no control character in it.
+/// with no control character in it. Length is counted as Watch counts it,
+/// in UTF-16 units, and anything over is cut at a character's edge.
 fn fit(text: String, shorter: impl FnOnce() -> String) -> String {
     let line = |text: String| -> String {
+        let mut units = 0;
         text.chars()
             .map(|c| if c.is_control() { ' ' } else { c })
-            .take(MAX_DETAIL)
+            .take_while(|c| {
+                units += c.len_utf16();
+                units <= MAX_DETAIL
+            })
             .collect()
     };
-    if text.chars().count() <= MAX_DETAIL {
+    if text.encode_utf16().count() <= MAX_DETAIL {
         line(text)
     } else {
         line(shorter())
@@ -687,6 +756,22 @@ fn new_gitlinks(git: &git::Git, worktree: &Path, tree: &str) -> anyhow::Result<b
     Ok(links(tree)?.iter().any(|link| !before.contains(link)))
 }
 
+/// The ref a discard's backup of `branch` goes to: `refs/wip/`, the branch
+/// with its slashes made hyphens, and the action's id. A git host keeps a
+/// ref as a file, whose name may be at most 255 bytes, so a long branch name
+/// is cut, at a character's edge, leaving room for git's `.lock` beside it;
+/// the id keeps it the action's own.
+fn backup_ref(branch: &str, id: &str) -> String {
+    let wip = housekeeping::wip_ref(branch);
+    let dashed = wip.strip_prefix("refs/wip/").unwrap_or(&wip);
+    let room = 255 - ".lock".len() - id.len() - 1;
+    let mut cut = dashed.len().min(room);
+    while !dashed.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("refs/wip/{}-{id}", &dashed[..cut])
+}
+
 /// The ref a backup went to, or why it could not be made.
 enum Backup {
     Pushed(String),
@@ -728,7 +813,7 @@ fn back_up(
     } else {
         housekeeping::wip_commit(git, &info.path, &seen.tree, &branch, SystemTime::now())?
     };
-    let reference = format!("{}-{}", housekeeping::wip_ref(&branch), action.id);
+    let reference = backup_ref(&branch, &action.id);
     let refspec = format!("{commit}:{reference}");
     let pushed = git.try_tree_within(
         &info.path,
@@ -757,9 +842,17 @@ fn clean_up(
             "A repo in it could not be read, so nothing was removed.",
         )
     };
-    let Ok(worktrees) = worktrees_of(workspace, path) else {
+    // The session's worktrees as listed, those gone included: what the
+    // removal is checked against at the end.
+    let Ok(as_listed) = workspace.session_worktrees(path) else {
         return unreadable();
     };
+    let other = Workspace::other_files(path, &as_listed);
+    let worktrees: Vec<(String, RepoInfo)> = as_listed
+        .iter()
+        .filter(|(_, info)| info.path.is_dir())
+        .cloned()
+        .collect();
     let mut holding = Vec::new();
     for (key, info) in &worktrees {
         let name = repo_name(key, info).unwrap_or_else(|| "a repo".to_string());
@@ -769,7 +862,7 @@ fn clean_up(
             Err(_) => return unreadable(),
         }
     }
-    if holding.is_empty() {
+    if holding.is_empty() && other.is_empty() {
         // Removed only if, looked at again, it still holds nothing unsaved.
         return match workspace.remove_session(path) {
             Ok(_) => ended(Outcome::Done, "Cleaned up."),
@@ -777,16 +870,27 @@ fn clean_up(
         };
     }
     if !action.discard {
-        let words: Vec<String> = holding
+        let mut words: Vec<String> = holding
             .iter()
             .flat_map(|(name, _, found)| unsaved_words(found, name))
             .collect();
+        if !other.is_empty() {
+            words.push("files outside its repos".to_string());
+        }
         let repos = holding.len();
         return ended(
             Outcome::Refused,
             fit(format!("It holds {}.", listed(&words)), || {
                 format!("It holds work that is not on GitHub in {repos} repos.")
             }),
+        );
+    }
+    // Files outside its repos are in no repo to back up to: they are not
+    // dropped.
+    if !other.is_empty() {
+        return ended(
+            Outcome::Failed,
+            "It holds files outside its repos, which cannot be backed up, so nothing was removed.",
         );
     }
     // How each worktree stands before anything is pushed: what is backed up,
@@ -845,7 +949,7 @@ fn clean_up(
             ),
         );
     }
-    match workspace.remove_session_with(path, true) {
+    match workspace.remove_session_as_listed(path, &as_listed, true) {
         Ok(_) => ended(Outcome::Done, backed),
         Err(_) => ended(
             Outcome::Failed,
@@ -916,8 +1020,8 @@ fn too_old(requested_at: &str, now: SystemTime) -> bool {
 }
 
 /// Run every action that is waiting, each once, and write down its result.
-/// Returns how many ran. Nothing runs while the record of what was started
-/// cannot be read.
+/// Returns how many ran. While the record of what was started cannot be
+/// read, nothing runs: each is refused, and Watch hears why.
 pub fn run_queued(settings: &Settings) -> usize {
     let state_dir = &settings.state_dir;
     let Ok(entries) = fs::read_dir(queue_dir(state_dir)) else {
@@ -946,8 +1050,19 @@ pub fn run_queued(settings: &Settings) -> usize {
         // Each action is judged by the time it starts, not the batch's.
         let now = SystemTime::now();
         let Ok(started) = read_started(state_dir) else {
+            // Without it, nothing can say whether this one ran before. It
+            // is not run, and Watch hears why.
             eprintln!("nucleated: the record of worktree actions cannot be read; running none");
-            return ran;
+            let refused = ActionResult {
+                id: action.id.clone(),
+                outcome: Outcome::Refused,
+                detail: "The box cannot read its record of earlier actions.".to_string(),
+                finished_at: rfc3339(now),
+            };
+            if write_result(state_dir, &action.env_id, &refused).is_ok() {
+                let _ = fs::remove_file(&file);
+            }
+            continue;
         };
         if started.contains_key(&action.id) {
             // Started before and never finished: the box stopped while it
@@ -1098,6 +1213,19 @@ mod tests {
         assert!(reportable_branch(&"\u{1F600}".repeat(127)));
         assert!(!reportable_branch("has space"));
         assert!(!reportable_branch("tab\there"));
+    }
+
+    #[test]
+    fn a_backup_ref_fits_in_a_file_name() {
+        let id = "wta_abcdefghijk23456";
+        assert_eq!(
+            backup_ref("workspace/fix-login", id),
+            "refs/wip/workspace-fix-login-wta_abcdefghijk23456"
+        );
+        let long = backup_ref(&format!("workspace/{}", "\u{1F600}".repeat(80)), id);
+        let name = long.strip_prefix("refs/wip/").unwrap();
+        assert!(name.len() + ".lock".len() <= 255, "{}", name.len());
+        assert!(name.ends_with(id));
     }
 
     #[test]

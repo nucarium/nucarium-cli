@@ -998,8 +998,12 @@ changes, how many commits are on no remote and in no merged pull request,
 and the addresses of a merged pull request that holds its commit and an
 open one whose head it is. GitHub is asked about a commit at most once an
 hour, never again once it was merged, and not at all about one on the
-default branch or one ahead of its own upstream. A folder one of whose
-repos cannot be read, or whose repos have no name Watch takes, is left out.
+default branch or one ahead of its own upstream. A folder that holds
+anything else at its root, a file or a folder nucleate did not put there, is
+listed with one more entry under its own name, with changes not committed. A
+folder one of whose repos cannot be read, or whose repos have no name Watch
+takes, is left out. A branch is sent blank when it is over 255 UTF-16 units
+or holds a character JavaScript's `\s` matches, or a control character.
 A heartbeat is kept under 768 KiB by leaving folders out of it, saved ones
 before unsaved ones and the longest unchanged first.
 
@@ -1012,9 +1016,12 @@ and is reported failed; while that record cannot be read, nothing runs. One
 that reached the box, or was asked for, more than ten minutes before it
 would start (eleven, for the asking, allowing for the two clocks) is
 dropped unrun, as Watch delivers none older. Each result is a fixed word
-and one plain sentence with no path, host or token in it, is never written
-over, and goes in every heartbeat until one carrying it is answered with
-success.
+and one plain sentence of at most 300 UTF-16 units with no path, host or
+token in it, is never written over, and goes in every heartbeat until one
+carrying it is answered with success. A result file the box cannot read is
+sent as failed, "The box lost this action's result.", and while the record
+of started actions cannot be read, each action is refused with "The box
+cannot read its record of earlier actions."
 
 - **Push** runs `git push -u origin -- refs/heads/<branch>:refs/heads/<branch>`,
   never forced, for each repo with commits that are not on GitHub. A branch
@@ -1023,14 +1030,17 @@ success.
   and refused when there was nothing to push.
 - **Clean up** is refused while the folder is in use or belongs to a driver.
   A folder with nothing unsaved is removed as `nucleate remove-session` does.
-  One with unsaved work is refused, unless Watch asked to discard it. Then
+  One with unsaved work, or with files at its root outside its repos, is
+  refused, unless Watch asked to discard it. Files outside its repos are
+  never discarded: such a folder fails, and nothing is removed. Otherwise
   the unsaved work of each repo is pushed first to a ref of the action's
   own, `refs/wip/<branch>-<action id>`, that nothing else writes,
   uncommitted changes as a commit on no branch. If any backup fails, or a
   repo holds another git repository that a commit cannot hold, nothing is
   removed. Just before the removal the folder is looked at again, and if a
   session came back to it, a repo was added or went, or anything was
-  committed or changed since the backup, nothing is removed either. A
+  committed or changed since the backup, nothing is removed either, and the
+  removal itself goes ahead only for the very worktrees that were backed up. A
   folder already gone is done.
 
 Both run only on a box whose config sets `worktree_actions = true`. Without
