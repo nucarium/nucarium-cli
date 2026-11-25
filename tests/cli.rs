@@ -97,7 +97,8 @@ impl Fixture {
     }
 
     /// Have the test user's git fetch `https://github.com/octo/<name>` from
-    /// `upstream/<name>` on this machine, so nothing reaches GitHub.
+    /// `upstream/<name>` on this machine, so nothing reaches GitHub, and make
+    /// the demo repo octo's.
     fn github_on_disk(&self) {
         let base = self.upstream.parent().unwrap();
         fs::write(
@@ -108,6 +109,14 @@ impl Fixture {
             ),
         )
         .unwrap();
+        self.git(
+            &self.bare(),
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/octo/demo",
+            ],
+        );
     }
 
     /// A repo on "GitHub" that the box has not fetched: `octo/<name>`.
@@ -282,6 +291,16 @@ fn a_repo_github_does_not_have_is_refused_and_leaves_nothing() {
     let said = f.fails(&f.session("s1"), &["add", "octo/missing"]);
     assert!(said.contains("cannot fetch octo/missing"), "{said}");
     assert!(!f.root.join(".repos").join("missing.git").exists());
+}
+
+#[test]
+fn a_repo_from_an_owner_the_box_has_nothing_from_is_refused() {
+    let f = Fixture::new();
+    f.github_on_disk();
+    f.ok(&f.root, &["create-session", "s1"]);
+    let said = f.fails(&f.session("s1"), &["add", "someone/other"]);
+    assert!(said.contains("no repos from someone"), "{said}");
+    assert!(!f.root.join(".repos").join("other.git").exists());
 }
 
 #[test]

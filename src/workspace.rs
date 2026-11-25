@@ -360,7 +360,7 @@ impl Workspace {
 
     /// Find a repo to add. One named `owner/name` that this nucleus does not
     /// have yet is fetched from GitHub first, with the box's GitHub sign-in,
-    /// so a session can add any repository the box can read.
+    /// when the box already has repositories from that owner.
     fn find_or_fetch(&self, value: &str) -> Result<Available> {
         let Some((owner, name)) = value.split_once('/') else {
             return self.lookup(value);
@@ -387,16 +387,32 @@ impl Workspace {
                 hit.repo
             );
         }
+        // Only from an owner the box already has repositories from: a session
+        // cannot bring in another owner's code under a name the box's own
+        // repositories may later need.
+        let owned_here = available.iter().any(|a| {
+            a.label
+                .split_once('/')
+                .is_some_and(|(have, _)| have.eq_ignore_ascii_case(owner))
+        });
+        if !owned_here {
+            bail!(
+                "cannot add {value}: this box has no repos from {owner}; \
+                 add the repo to the box's list of repos instead"
+            );
+        }
         let url = format!(
             "{}/{owner}/{name}.git",
             github::git_origin(&self.config.github_api)
         );
         match self.clone(&url, None) {
             Ok(fetched) => Ok(fetched),
-            // Another session fetched it at the same moment.
+            // Another session fetched the same repo at the same moment.
             Err(error) => self
-                .lookup(value)
-                .map_err(|_| error.context(format!("cannot fetch {value} from GitHub"))),
+                .available()?
+                .into_iter()
+                .find(|a| a.label.eq_ignore_ascii_case(value))
+                .ok_or_else(|| error.context(format!("cannot fetch {value} from GitHub"))),
         }
     }
 
