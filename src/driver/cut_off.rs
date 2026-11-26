@@ -138,6 +138,10 @@ impl Process {
     }
 }
 
+/// Whether it has been said that the box gives no pidfd.
+#[cfg(target_os = "linux")]
+static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// One process, held by a descriptor that names it and no other.
 #[cfg(target_os = "linux")]
 struct Held {
@@ -153,12 +157,20 @@ impl Held {
     /// same both times, the descriptor is of that process.
     fn open(pid: u32, start: u64, belongs: impl Fn(u32) -> bool) -> Option<Held> {
         use std::os::fd::FromRawFd;
+        use std::sync::atomic::Ordering;
         if stat(pid)?.start != start {
             return None;
         }
         // SAFETY: `pidfd_open` takes a process id and flags, no pointers.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if fd < 0 {
+            // A process gone since it was found is no news. Anything else
+            // means the box gives no pidfd, and no cut-off look is ended:
+            // said once.
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) && !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("nucleated: a cut-off look cannot be ended here: no pidfd ({error})");
+            }
             return None;
         }
         // SAFETY: `pidfd_open` just returned this descriptor, and nothing
