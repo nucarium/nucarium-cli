@@ -14,7 +14,7 @@
 mod common;
 
 use common::gate::{mark, MARK};
-use common::{contract, gate, run, Rig};
+use common::{contract, gate, run, Rig, CLIENT_A_CONTAINER_UNIT};
 use nucleate::driver::{self, Condition, Memory, LOOK_LIMIT};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -154,6 +154,20 @@ fn rig_with(driver: &str) -> (Rig, Fake) {
     (rig, fake)
 }
 
+/// As [`rig_with`], with Herdr running in `client-a`'s container, beside
+/// the agent's login, as the recipe runs a driver.
+fn rig_in_container(driver: &str) -> (Rig, Fake) {
+    let rig = Rig::new();
+    let fake = Fake::start();
+    rig.configure_in_container(&format!(
+        "[[environment]]\nname = \"herdr\"\nroot = \"{}\"\ndriver = \"{driver}\"\ncheck = \"true\"\n\
+         {CLIENT_A_CONTAINER_UNIT}driver_socket = \"{}\"\n",
+        rig.root.display(),
+        fake.path.display(),
+    ));
+    (rig, fake)
+}
+
 /// The moment of the `n`th look of a test: a second apart, so that what one
 /// look writes sorts before what the next does.
 fn at(n: u64) -> SystemTime {
@@ -209,10 +223,12 @@ fn events(session: &str, kinds: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Call the hook entry point for `client-a`, from a process with `vars` set.
+/// Call the hook entry point for `client-a`, inside its container, from a
+/// process with `vars` set.
 fn hook(rig: &Rig, event: &str, session: &str, cwd: &Path, vars: &[(&str, &str)]) {
     let payload = json!({ "session_id": session, "cwd": cwd });
     let mut command = rig.nucleated();
+    rig.in_container(&mut command);
     command.args(["hook", event, "--env", "client-a"]);
     for (name, value) in vars {
         command.env(name, value);
@@ -464,7 +480,7 @@ fn a_terminal_on_another_machine_is_never_reported_from_this_one() {
 
 #[test]
 fn a_herdr_core_terminal_whose_agent_has_hooks_of_its_own_is_left_to_them() {
-    let (rig, fake) = rig_with("herdr-core");
+    let (rig, fake) = rig_in_container("herdr-core");
     let worktree = rig.session("fix-login");
     let socket = fake.path.to_str().unwrap();
     // Claude Code in terminal t7 of this core.
@@ -486,7 +502,10 @@ fn a_herdr_core_terminal_whose_agent_has_hooks_of_its_own_is_left_to_them() {
             ("HC_TERMINAL_SOCKET", "/run/user/1/herdr-core/scratch.sock"),
         ],
     );
-    assert_eq!(rig.spooled().len(), 2);
+    assert_eq!(rig.spooled_in_container().len(), 2);
+    // The daemon takes the hooks' events in, and with them their claims.
+    gate::tick(&rig);
+    assert!(rig.spooled_in_container().is_empty());
 
     fake.terminals(json!([
         terminal("t7", json!({ "state": "working" })),
@@ -563,7 +582,7 @@ fn a_herdr_tui_agent_is_followed_from_its_first_word_to_its_last() {
 
 #[test]
 fn a_herdr_tui_agent_that_has_hooks_of_its_own_is_left_to_them() {
-    let (rig, fake) = rig_with("herdr-tui");
+    let (rig, fake) = rig_in_container("herdr-tui");
     let mock = gate::watch();
     rig.sign_in(&mock.url);
     let worktree = rig.session("fix-login");
@@ -598,6 +617,7 @@ fn a_herdr_tui_agent_that_has_hooks_of_its_own_is_left_to_them() {
     // The daemon takes the hooks' events in, so their sessions are known.
     gate::tick(&rig);
     assert!(rig.spooled().is_empty());
+    assert!(rig.spooled_in_container().is_empty());
 
     let mut second = agent("term_b2", "w1:p2", "working");
     second["agent_session"] =

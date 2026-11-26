@@ -11,7 +11,9 @@
 
 mod common;
 
-use common::{contract, files_under, gate, git, run, stderr, stdout_json, Rig};
+use common::{
+    contract, files_under, gate, git, run, stderr, stdout_json, Rig, CLIENT_A_CONTAINER_UNIT,
+};
 use nucleate::driver::{self, Condition, Memory, Phase};
 use nucleate::reporter::Reporter;
 use serde_json::{json, Value};
@@ -76,10 +78,12 @@ impl Orca {
         orca
     }
 
+    /// Orca runs in `client-a`'s container, beside the agent's login, as
+    /// the recipe runs a driver.
     fn configure(&self, more: &str) {
-        self.rig.configure(&format!(
+        self.rig.configure_in_container(&format!(
             "[[environment]]\nname = \"orca\"\nroot = \"{}\"\ndriver = \"orca\"\ncheck = \"true\"\n\
-             driver_cli = \"{}\"\ndriver_home = \"{}\"\n{more}",
+             {CLIENT_A_CONTAINER_UNIT}driver_cli = \"{}\"\ndriver_home = \"{}\"\n{more}",
             self.workspaces.display(),
             self.cli.display(),
             self.data.display(),
@@ -253,8 +257,13 @@ fn plain(orca: &Orca) -> Value {
     orca.fixture(PLAIN)
 }
 
+/// Claude Code's hook, inside `client-a`'s container, where the recipe has
+/// it name its login's environment. It writes the container's own spool.
 fn hook(rig: &Rig, event: &str, cwd: &Path) {
-    let out = rig.hook(event, &json!({ "session_id": HOOKED, "cwd": cwd }));
+    let out = run(
+        rig.in_container(rig.nucleated().args(["hook", event, "--env", "client-a"])),
+        &json!({ "session_id": HOOKED, "cwd": cwd }).to_string(),
+    );
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
 }
@@ -641,16 +650,20 @@ fn an_agent_whose_own_hook_reports_it_is_left_to_the_hook() {
     let inside = orca.workspaces.join("task-1").join("src");
     fs::create_dir_all(&inside).unwrap();
     hook(rig, "UserPromptSubmit", &inside);
-    let hooked = rig.spooled();
+    let hooked = rig.spooled_in_container();
     assert_eq!(hooked.len(), 1);
-    assert_eq!(hooked[0]["event"]["env_id"], "orca");
+    assert_eq!(hooked[0]["event"]["env_id"], "client-a");
     assert_eq!(hooked[0]["event"]["session_id"], HOOKED);
+    assert_eq!(hooked[0]["event"]["claim"]["driver_env"], "orca");
+    // The daemon takes it in, and with it the claim.
+    gate::tick(rig);
+    assert!(rig.spooled_in_container().is_empty());
 
     // Orca lists the same agent. It is not reported a second time; the
     // agent beside it that has no hook adapter is, and so is the Claude
     // Code in a worktree no hook has spoken from.
     orca.look();
-    let seen = spooled(rig, 1);
+    let seen = spooled(rig, 0);
     assert!(
         !seen.iter().any(|(session, _)| session == CLAUDE),
         "{seen:?}"
@@ -702,8 +715,9 @@ fn one_agents_hook_stands_in_for_that_agent_and_not_for_another_kind_beside_it()
     // it, and the Codex beside it is still Orca's to report.
     let inside = orca.workspaces.join("task-1");
     hook(rig, "UserPromptSubmit", &inside);
+    gate::tick(rig);
     orca.look();
-    let seen = spooled(rig, 1);
+    let seen = spooled(rig, 0);
     assert!(
         !seen.iter().any(|(session, _)| session == CLAUDE),
         "{seen:?}"
@@ -715,12 +729,19 @@ fn one_agents_hook_stands_in_for_that_agent_and_not_for_another_kind_beside_it()
 
     // Then the Codex is given its hooks too, and speaks for itself.
     let out = run(
-        rig.nucleated()
-            .args(["hook", "UserPromptSubmit", "--agent", "codex"]),
+        rig.in_container(rig.nucleated().args([
+            "hook",
+            "UserPromptSubmit",
+            "--env",
+            "client-a",
+            "--agent",
+            "codex",
+        ])),
         &json!({ "session_id": "0c9d8e7a-58b4-4d0c-9a6e-7f3c2a1e2b1f", "cwd": inside }).to_string(),
     );
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    gate::tick(rig);
     // Orca shows that Codex blocked on its owner, and its hook has said no
     // such thing. What the owner needs to hear is not taken back on the
     // hook's word that it is there.
@@ -1095,6 +1116,7 @@ fn no_content_orca_hands_over_reaches_the_wire_the_disk_or_the_status() {
     let inside = first.join("src").join(format!("{mark}_subfolder"));
     fs::create_dir_all(&inside).unwrap();
     hook(rig, "UserPromptSubmit", &inside);
+    gate::tick(rig);
     let before = rig.spooled().len();
     orca.look();
     assert_eq!(spooled(rig, before), events(&[(&id('1'), "session_end")]));
@@ -1102,7 +1124,8 @@ fn no_content_orca_hands_over_reaches_the_wire_the_disk_or_the_status() {
     // The count of what the worktrees hold, the daemon, and what is shown.
     Reporter::default().tick(&rig.settings(), SystemTime::now());
     gate::tick(rig);
-    let beat = mock.to(contract::HEARTBEATS)[0].json();
+    // The heartbeat after the count, from the daemon that ticked last.
+    let beat = gate::said(&mock);
     assert_eq!(beat["environments"][1]["unsaved"]["uncommitted_repos"], 2);
     assert_eq!(beat["environments"][1]["unsaved"]["unpushed_commits"], 2);
     assert!(!mock.to(contract::EVENTS).is_empty());

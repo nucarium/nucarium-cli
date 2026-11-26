@@ -29,7 +29,7 @@
 //!   session, and no change to whether the environment's server is alive,
 //!   which is asked of its supervisor and never of the driver.
 
-use crate::envelope::{unix_ms, valid_session_id, Draft, Envelope, EventType};
+use crate::envelope::{self, unix_ms, valid_env_key, valid_session_id, Draft, Envelope, EventType};
 use crate::housekeeping;
 use crate::paths;
 use crate::sessions::{Status, Store, ACTIVITY_BEAT};
@@ -76,7 +76,7 @@ const CLAIM_QUIET: Duration = Duration::from_secs(120);
 const CLAIM_UNHEARD: Duration = Duration::from_secs(90);
 /// A claim names at most this many folders: where its hook's session works,
 /// and the folders that one is in.
-const CLAIM_FOLDERS: usize = 64;
+const CLAIM_FOLDERS: usize = envelope::MAX_CLAIM_FOLDERS;
 
 /// What a driver's agent is doing, in the daemon's words. An adapter maps
 /// its driver's documented state words to these and says nothing for a word
@@ -589,29 +589,25 @@ fn same_place(environment: &Environment, folder: Option<&Path>, numbers: &[Strin
         .any(|above| folder_number(above) == *hooks)
 }
 
-/// Note that a hook-reported session is running inside one of a driver's
-/// sessions. Called from the hook entry point: one small file, written when
-/// it is not already there and again once it is [`CLAIM_RENEW`] old. A claim
-/// is only as good as its hook's last word. `folder` is where the hook's
-/// session works; the claim keeps numbers made from it and never its name.
-pub fn claim(
-    state_dir: &Path,
-    driver_environment: &str,
-    key: &str,
-    environment: &str,
-    session_id: &str,
-    folder: Option<&Path>,
-) {
-    if !valid_key(key) || !valid_session_id(session_id) {
+/// Note, in the daemon's own state, that a hook-reported session is running
+/// inside one of a driver's sessions: one small file, written when it is not
+/// already there and again once it is [`CLAIM_RENEW`] old, so a claim is
+/// only as good as its hook's last word. The daemon calls this for a claim
+/// it read in a hook's spool record and counted ([`claim_counts`]). The
+/// claim keeps numbers made from where the hook's session works and never
+/// that folder's name.
+pub fn note_claim(state_dir: &Path, claim: &envelope::Claim, environment: &str, session_id: &str) {
+    let fits = claim.fits() && valid_key(&claim.key);
+    if !fits || !valid_env_key(environment) || !valid_session_id(session_id) {
         return;
     }
-    let path = claims_dir(state_dir, driver_environment)
-        .join(key)
+    let path = claims_dir(state_dir, &claim.driver_env)
+        .join(&claim.key)
         .join(format!("{session_id}.json"));
     let mut note = environment.to_string();
-    if let Some(folder) = folder {
+    if !claim.folders.is_empty() {
         note.push('\n');
-        note.push_str(&folder_numbers(folder).join(" "));
+        note.push_str(&claim.folders.join(" "));
     }
     let renewed = fs::metadata(&path)
         .and_then(|meta| meta.modified())
@@ -625,37 +621,82 @@ pub fn claim(
 }
 
 /// Ask every configured driver whether a hook's agent is one of its own,
-/// and note each claim. The hook entry point calls this for every event it
+/// and say which, for the hook's spool record: the first driver environment
+/// whose adapter claims it, the key, and numbers made from where the hook's
+/// session works. The hook entry point calls this for every event it
 /// records.
-pub fn note_claims(
+pub fn hook_claim(
     settings: &Settings,
-    environment: &str,
     agent: &str,
-    session_id: &str,
     cwd: Option<&Path>,
     var: &dyn Fn(&str) -> Option<String>,
-) {
-    for candidate in &settings.environments {
-        let Some(adapter) = candidate.driver_adapter() else {
-            continue;
-        };
+) -> Option<envelope::Claim> {
+    settings.environments.iter().find_map(|candidate| {
+        let adapter = candidate.driver_adapter()?;
         let hook = HookProcess {
             environment: candidate,
             agent,
             cwd,
             var,
         };
-        if let Some(key) = adapter.claims(&hook) {
-            claim(
-                &settings.state_dir,
-                &candidate.name,
-                &key,
-                environment,
-                session_id,
-                cwd,
-            );
-        }
+        let key = adapter.claims(&hook).filter(|key| valid_key(key))?;
+        Some(envelope::Claim {
+            driver_env: candidate.name.clone(),
+            key,
+            folders: cwd.map(folder_numbers).unwrap_or_default(),
+        })
+    })
+}
+
+/// Whether the daemon counts a claim it read in a spool record. Only one
+/// read from the spool folder of the environment `from`, the record's own,
+/// that runs in the same container as the driver environment the claim
+/// names: that container's hooks are the only ones that can see its
+/// driver's sessions. Never one from the shared folder, from an environment
+/// on the host, or naming an environment with no driver.
+pub fn claim_counts(
+    settings: &Settings,
+    from: Option<&Environment>,
+    claim: &envelope::Claim,
+) -> bool {
+    let Some(from) = from else {
+        return false;
+    };
+    let Some(driver) = settings.environment(&claim.driver_env) else {
+        return false;
+    };
+    claim.fits()
+        && driver.driver_adapter().is_some()
+        && from.container().is_some()
+        && from.container() == driver.container()
+}
+
+/// The driver environment and key of a claim the daemon counted for a
+/// hook-reported session, while it stands: until the hook's session ends,
+/// or the claim lapses (see [`claims_stand`]). The session's events carry
+/// them to Watch as its driver reference.
+pub fn standing_claim(
+    settings: &Settings,
+    environment: &str,
+    session_id: &str,
+) -> Option<(String, String)> {
+    if !valid_session_id(session_id) {
+        return None;
     }
+    let file = format!("{session_id}.json");
+    settings
+        .environments
+        .iter()
+        .filter(|driver| driver.driver_adapter().is_some())
+        .find_map(|driver| {
+            let keys = fs::read_dir(claims_dir(&settings.state_dir, &driver.name)).ok()?;
+            keys.flatten().find_map(|key| {
+                let name = key.file_name().to_string_lossy().to_string();
+                let note = fs::read_to_string(key.path().join(&file)).ok()?;
+                let held = note.lines().next()?.trim() == environment;
+                (held && valid_key(&name)).then(|| (driver.name.clone(), name))
+            })
+        })
 }
 
 /// One live hook-reported session's claim on a driver's session.
@@ -1266,6 +1307,23 @@ mod tests {
 
     fn at(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_795_089_600 + seconds)
+    }
+
+    /// The daemon counting a claim a hook made from `folder`.
+    fn claim(
+        state_dir: &Path,
+        driver_environment: &str,
+        key: &str,
+        environment: &str,
+        session_id: &str,
+        folder: Option<&Path>,
+    ) {
+        let claim = envelope::Claim {
+            driver_env: driver_environment.into(),
+            key: key.into(),
+            folders: folder.map(folder_numbers).unwrap_or_default(),
+        };
+        note_claim(state_dir, &claim, environment, session_id);
     }
 
     fn seen(id: &str, phase: Phase) -> Observed {
@@ -2190,14 +2248,13 @@ mod tests {
         from(None);
         assert_eq!(look(&placed), events(&[]));
         // The agent's own hook, from a folder inside the thread's, is.
-        note_claims(
-            &settings,
-            "client-a",
-            "claude-code",
-            "hook-session",
-            Some(&inside),
-            &|_| Some("thread-7".to_string()),
-        );
+        let claimed = hook_claim(&settings, "claude-code", Some(&inside), &|_| {
+            Some("thread-7".to_string())
+        })
+        .unwrap();
+        assert_eq!(claimed.driver_env, "t3");
+        assert_eq!(claimed.key, "thread-7");
+        note_claim(&settings.state_dir, &claimed, "client-a", "hook-session");
         assert_eq!(look(&placed), events(&[("thread-7", "session_end")]));
         // So is one from above it that is still inside the driver's root:
         // a driver may place a session by what its agent is running.
@@ -2242,6 +2299,86 @@ mod tests {
             }
         }
         found
+    }
+
+    #[test]
+    fn a_claim_counts_only_from_inside_the_drivers_container() {
+        let (_dir, mut settings) = rig();
+        let claim = envelope::Claim {
+            driver_env: "t3".into(),
+            key: "thread-7".into(),
+            folders: Vec::new(),
+        };
+        let counts = |settings: &Settings, from: Option<&str>, claim: &envelope::Claim| {
+            claim_counts(
+                settings,
+                from.and_then(|name| settings.environment(name)),
+                claim,
+            )
+        };
+        // On the host, no environment runs in a container.
+        assert!(!counts(&settings, Some("client-a"), &claim));
+        for environment in &mut settings.environments {
+            environment.unit = "agent-env-client-a.service".into();
+        }
+        assert!(counts(&settings, Some("client-a"), &claim));
+        assert!(counts(&settings, Some("t3"), &claim));
+        // From the shared folder, which says nothing of where it came from.
+        assert!(!counts(&settings, None, &claim));
+        // Naming an environment that has no driver, or that is not there.
+        for driver_env in ["client-a", "client-z"] {
+            let other = envelope::Claim {
+                driver_env: driver_env.into(),
+                ..claim.clone()
+            };
+            assert!(!counts(&settings, Some("client-a"), &other), "{driver_env}");
+        }
+        // The driver in a container of its own.
+        let t3 = settings.environments.iter_mut().find(|e| e.name == "t3");
+        t3.unwrap().unit = "agent-env-t3.service".into();
+        assert!(!counts(&settings, Some("client-a"), &claim));
+    }
+
+    #[test]
+    fn a_standing_claim_is_found_by_its_session_until_it_is_gone() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-7".to_string()))
+        );
+        // Another session, or the same id in another environment, has none.
+        assert_eq!(standing_claim(&settings, "client-a", "s2"), None);
+        assert_eq!(standing_claim(&settings, "t3", "s1"), None);
+        fs::remove_dir_all(state.join("claims")).unwrap();
+        assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
+    }
+
+    #[test]
+    fn a_hook_says_which_drivers_session_it_runs_in_by_numbers_and_never_a_folder() {
+        let (dir, settings) = rig();
+        let inside = dir.path().join("work").join("SENTINEL named for a task");
+        fs::create_dir_all(&inside).unwrap();
+        let thread = |name: &str| (name == "T3CODE_THREAD_ID").then(|| "thread-7".to_string());
+        let claimed = hook_claim(&settings, "claude-code", Some(&inside), &thread).unwrap();
+        assert_eq!(claimed.driver_env, "t3");
+        assert_eq!(claimed.key, "thread-7");
+        assert_eq!(claimed.folders, folder_numbers(&inside));
+        assert!(claimed.fits());
+        assert!(!serde_json::to_string(&claimed)
+            .unwrap()
+            .contains("SENTINEL"));
+        // No folder, no numbers; no driver's variable, no claim.
+        assert!(hook_claim(&settings, "claude-code", None, &thread)
+            .unwrap()
+            .folders
+            .is_empty());
+        assert_eq!(
+            hook_claim(&settings, "claude-code", Some(&inside), &|_| None),
+            None
+        );
     }
 
     #[test]

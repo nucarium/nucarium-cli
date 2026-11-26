@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{contract, dead_api, mode, Mock, Reply, Request, Rig, TOKEN};
+use common::{contract, dead_api, mode, Mock, Reply, Request, Rig, CLIENT_A_CONTAINER_UNIT, TOKEN};
 use nucleate::daemon::{Daemon, Timings};
 use nucleate::envelope::{unix_ms, Draft, Envelope, EventType};
 use nucleate::hook;
@@ -1852,15 +1852,29 @@ fn a_process_found_running_before_a_restart_is_found_gone_after_it() {
     );
 }
 
-/// A waiting session that runs inside a driver's session, written to the
-/// spool with its driver reference and the hook's claim.
+/// A box whose `client-a` runs in its container beside `client-a-t3`, a T3
+/// Code there, as the recipe runs a driver.
+fn box_with_a_driver_beside_the_login() -> Rig {
+    let rig = Rig::new();
+    rig.configure_in_container(&format!(
+        "[[environment]]\nname = \"client-a-t3\"\nroot = \"{root}\"\ndriver = \"t3code\"\n\
+         check = \"true\"\n{CLIENT_A_CONTAINER_UNIT}driver_home = \"{home}\"\ndriver_poll = \"off\"\n",
+        root = rig.root.display(),
+        home = rig.home.dir.join("no-t3-here").display(),
+    ));
+    rig
+}
+
+/// A waiting session that runs inside a driver's session, written by its
+/// hook to the container's spool with the hook's claim, and with a driver
+/// reference no hook may write.
 fn spool_in_a_driver(rig: &Rig, session: &str) {
     let now = SystemTime::now();
     let draft = Draft {
         env_id: "client-a".into(),
         session_id: session.into(),
         driver_env: Some("client-a-t3".into()),
-        driver_session: Some("thread_01HZX".into()),
+        driver_session: Some("thread_FROM_THE_HOOK".into()),
         claim: Some(nucleate::envelope::Claim {
             driver_env: "client-a-t3".into(),
             key: "thread_01HZX".into(),
@@ -1868,7 +1882,7 @@ fn spool_in_a_driver(rig: &Rig, session: &str) {
         }),
         ..Draft::default()
     };
-    Spool::new(&rig.spool_dir())
+    Spool::new(&rig.container_spool())
         .write(&Record {
             event: Envelope::new(EventType::PermissionPrompt, draft, now).unwrap(),
             at_ms: unix_ms(now),
@@ -1881,7 +1895,7 @@ fn spool_in_a_driver(rig: &Rig, session: &str) {
 #[test]
 fn a_claim_never_leaves_the_box_and_a_driver_reference_goes_only_to_a_watch_that_takes_it() {
     // Watch as it is: the event goes, without the reference and the claim.
-    let rig = Rig::new();
+    let rig = box_with_a_driver_beside_the_login();
     let mock = common::gate::watch();
     rig.sign_in(&mock.url);
     spool_in_a_driver(&rig, "s1");
@@ -1893,8 +1907,9 @@ fn a_claim_never_leaves_the_box_and_a_driver_reference_goes_only_to_a_watch_that
     }
     common::gate::only_listed_fields(&mock);
 
-    // A Watch that takes it is sent the reference, whole, and still no claim.
-    let rig = Rig::new();
+    // A Watch that takes it is sent the reference, whole, from the claim the
+    // daemon counted and not from what the hook wrote, and still no claim.
+    let rig = box_with_a_driver_beside_the_login();
     let mock = common::gate::watch_taking(&["driver_session"]);
     rig.sign_in(&mock.url);
     spool_in_a_driver(&rig, "s1");

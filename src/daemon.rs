@@ -13,14 +13,14 @@
 //! reports and tidies, and starts, stops or pauses nothing.
 
 use crate::credentials::{self, Stored, Token};
-use crate::envelope::{rfc3339, unix_ms, Draft, Envelope, EventType};
+use crate::envelope::{self, rfc3339, unix_ms, Draft, Envelope, EventType};
 use crate::health;
 use crate::notifier::{Notifier, Waiting};
 use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
-use crate::spool::{Record, Spool};
+use crate::spool::{self, Record, Spool, Unread};
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
@@ -84,6 +84,8 @@ struct Pending {
     envelope: Envelope,
     at_ms: u64,
     seen: Instant,
+    /// The spool folder its file is in.
+    spool: Spool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -664,25 +666,89 @@ impl Daemon {
         self.next_heartbeat = Some(now + wait);
     }
 
+    /// The most entries of one spool folder looked at in a pass: more than a
+    /// hook ever leaves there, since it stops writing at twice `max_events`.
+    fn spool_limit(&self) -> usize {
+        self.settings
+            .spool_max_events
+            .saturating_mul(2)
+            .saturating_add(1_024)
+    }
+
+    /// Every spool folder there is to read: the shared one, which says
+    /// nothing of where a record came from, and each configured
+    /// environment's own, with that environment.
+    fn spools(&self) -> Vec<(Option<&Environment>, Spool)> {
+        let limit = self.spool_limit();
+        let own = self.settings.environments.iter().filter_map(|environment| {
+            Spool::of_environment(&self.settings.state_dir, &environment.name)
+                .map(|spool| (Some(environment), spool.capped(limit)))
+        });
+        std::iter::once((None, self.spool.clone().capped(limit)))
+            .chain(own)
+            .collect()
+    }
+
     /// Apply spool files not seen before to the local session state, and keep
-    /// the ones worth sending.
+    /// the ones worth sending. Every folder's files are applied together, in
+    /// the order their events happened.
+    ///
+    /// A record from an environment's own folder is that environment's or it
+    /// is dropped. A hook's claim on a driver's session counts only from the
+    /// folder of an environment in the driver's container, and is then kept
+    /// in the daemon's own state. A session's driver reference is never
+    /// taken from a record: the daemon puts it on the events of a session
+    /// whose claim it counted, while that claim stands.
     fn take_in(&mut self, now: Instant) {
         let hosted = self.hosted();
-        for id in self.spool.pending() {
-            if self.pending.contains_key(&id) {
+        let spools = self.spools();
+        let mut waiting: Vec<(String, usize)> = Vec::new();
+        for (at, (_, spool)) in spools.iter().enumerate() {
+            waiting.extend(spool.pending().into_iter().map(|id| (id, at)));
+        }
+        waiting.sort();
+        let mut taken: Vec<(String, Spool, Record, Option<envelope::Claim>)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (id, at) in waiting {
+            let (from, spool) = &spools[at];
+            // The same event in a second folder is not a second event.
+            if self.pending.contains_key(&id) || !seen.insert(id.clone()) {
                 continue;
             }
-            let Some(record) = self.spool.read(&id) else {
+            let mut record = match spool.take(&id) {
+                Ok(record) => record,
+                Err(Unread::Gone) => continue,
                 // Not a record this program wrote.
-                self.spool.reject(&id);
-                continue;
+                Err(Unread::NotARecord) => {
+                    spool.reject(&id);
+                    continue;
+                }
+                // A link, a pipe, something too big: no hook writes one.
+                Err(Unread::NotAFile | Unread::TooLarge) => {
+                    spool.remove(&id);
+                    continue;
+                }
             };
+            if from.is_some_and(|from| from.name != record.event.env_id) {
+                spool.remove(&id);
+                continue;
+            }
+            record.event.driver_env = None;
+            record.event.driver_session = None;
+            let claim = record
+                .event
+                .claim
+                .take()
+                .filter(|claim| driver::claim_counts(&self.settings, *from, claim));
+            taken.push((id, spool.clone(), record, claim));
+        }
+        for (id, spool, mut record, claim) in taken {
             let previous = self
                 .sessions
                 .load(&record.event.env_id, &record.event.session_id);
             let Some(applied) = sessions::apply(previous, &record) else {
                 // An outcome for a session the box does not know.
-                self.spool.remove(&id);
+                spool.remove(&id);
                 continue;
             };
             if applied.changed {
@@ -703,6 +769,22 @@ impl Daemon {
                     );
                 }
             }
+            if let Some(claim) = &claim {
+                driver::note_claim(
+                    &self.settings.state_dir,
+                    claim,
+                    &record.event.env_id,
+                    &record.event.session_id,
+                );
+            }
+            if let Some((driver_env, driver_session)) = driver::standing_claim(
+                &self.settings,
+                &record.event.env_id,
+                &record.event.session_id,
+            ) {
+                record.event.driver_env = Some(driver_env);
+                record.event.driver_session = Some(driver_session);
+            }
             if applied.forward && hosted {
                 self.pending.insert(
                     id,
@@ -710,17 +792,18 @@ impl Daemon {
                         envelope: record.event,
                         at_ms: record.at_ms,
                         seen: now,
+                        spool,
                     },
                 );
             } else {
                 // With no target, or nothing new to tell Watch, the event has
                 // done its work once the local state has it.
-                self.spool.remove(&id);
+                spool.remove(&id);
             }
         }
         if !hosted && !self.pending.is_empty() {
-            for id in std::mem::take(&mut self.pending).into_keys() {
-                self.spool.remove(&id);
+            for (id, pending) in std::mem::take(&mut self.pending) {
+                pending.spool.remove(&id);
             }
         }
     }
@@ -847,8 +930,9 @@ impl Daemon {
     }
 
     fn drop_event(&mut self, id: &str) {
-        self.pending.remove(id);
-        self.spool.remove(id);
+        if let Some(pending) = self.pending.remove(id) {
+            pending.spool.remove(id);
+        }
     }
 
     /// Keep the spool within its limits: nothing older than `max_age`, and no
@@ -966,12 +1050,14 @@ impl Daemon {
                 let refused: BTreeSet<&str> =
                     ack.rejected.iter().map(|r| r.event_id.as_str()).collect();
                 for id in ids {
+                    let Some(pending) = self.pending.remove(id) else {
+                        continue;
+                    };
                     if refused.contains(id.as_str()) {
-                        self.spool.reject(id);
+                        pending.spool.reject(id);
                     } else {
-                        self.spool.remove(id);
+                        pending.spool.remove(id);
                     }
-                    self.pending.remove(id);
                 }
                 if self.events.last_error.is_some() {
                     log("events are being accepted again");
@@ -986,9 +1072,10 @@ impl Daemon {
             // the event it objects to by halving, and set that one aside.
             Err(ApiError::Refused { .. }) => {
                 if let [only] = ids {
-                    log("Watch refused an event; set aside in spool/rejected");
-                    self.spool.reject(only);
-                    self.pending.remove(only);
+                    log("Watch refused an event; set aside");
+                    if let Some(pending) = self.pending.remove(only) {
+                        pending.spool.reject(only);
+                    }
                     return Ok(());
                 }
                 let (first, second) = ids.split_at(ids.len() / 2);
@@ -1053,7 +1140,9 @@ impl Daemon {
         }
         self.last_prune = Some(now);
         let wall = SystemTime::now();
-        self.spool.prune(self.settings.spool_max_age, wall);
+        for (_, spool) in self.spools() {
+            spool.prune(self.settings.spool_max_age, wall);
+        }
         let max_age_ms = self.settings.spool_max_age.as_millis() as u64;
         for env in &self.settings.environments {
             self.sessions.prune(&env.name, max_age_ms, unix_ms(wall));
@@ -1098,7 +1187,11 @@ impl Daemon {
             heartbeat: self.heartbeat.clone(),
             events: EventsState {
                 pending: self.pending.len(),
-                rejected: self.spool.rejected().len(),
+                rejected: self.spool.rejected().len()
+                    + spool::set_aside_from_environments(
+                        &self.settings.state_dir,
+                        self.spool_limit(),
+                    ),
                 ..self.events.clone()
             },
             environments: self.environments.clone(),

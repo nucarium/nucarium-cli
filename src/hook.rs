@@ -296,6 +296,12 @@ pub fn record_as(
         branch: place.branch,
         error_kind,
         limit_resets_at,
+        // If this agent runs inside a driver's session, the driver lists it
+        // too. The record says so, and the daemon has the driver's adapter
+        // stand aside: the hook wins.
+        claim: driver::hook_claim(settings, adapter.name(), cwd.as_deref(), &|name| {
+            std::env::var(name).ok()
+        }),
         // What a session left behind is the reporter's to say, not a hook's.
         ..Draft::default()
     };
@@ -310,18 +316,7 @@ pub fn record_as(
     if spool.holds_at_least(settings.spool_max_events.saturating_mul(2)) {
         return None;
     }
-    let written = spool.write(&record).ok()?;
-    // If this agent runs inside a driver's session, the driver lists it too.
-    // Say so, and the driver's adapter stands aside: the hook wins.
-    driver::note_claims(
-        settings,
-        &record.event.env_id,
-        adapter.name(),
-        &record.event.session_id,
-        cwd.as_deref(),
-        &|name| std::env::var(name).ok(),
-    );
-    Some(written)
+    spool.write(&record).ok()
 }
 
 #[cfg(test)]

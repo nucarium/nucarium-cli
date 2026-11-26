@@ -470,6 +470,10 @@ pub struct Rig {
 
 pub const TOKEN: &str = "nuc_4m7q1x8z5b6n2f9k_3Yt0v1c2SECRETSECRET";
 
+/// The unit of `client-a`'s container, `agent-env-client-a`, as the recipe
+/// names both: an environment with this line runs in that container.
+pub const CLIENT_A_CONTAINER_UNIT: &str = "unit = \"agent-env-client-a.service\"\n";
+
 impl Rig {
     pub fn new() -> Rig {
         Rig::under("")
@@ -639,6 +643,55 @@ impl Rig {
 
     pub fn spool_dir(&self) -> PathBuf {
         self.home.state_dir().join("spool")
+    }
+
+    /// Write the daemon's config with `client-a` in its own container, as
+    /// the recipe runs a container environment, plus whatever `extra` adds.
+    /// An environment in `extra` given [`CLIENT_A_CONTAINER_UNIT`] runs in
+    /// that container too.
+    pub fn configure_in_container(&self, extra: &str) {
+        self.configure_with(
+            &format!("check = \"true\"\n{CLIENT_A_CONTAINER_UNIT}"),
+            extra,
+        );
+    }
+
+    /// `client-a`'s container's own spool folder, as the daemon sees it.
+    pub fn container_spool(&self) -> PathBuf {
+        self.home.state_dir().join("spools").join("client-a")
+    }
+
+    /// Run `command` as a hook inside `client-a`'s container runs: with the
+    /// box's config, and the spool where the container's own is mounted.
+    pub fn in_container<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        let config = std::fs::read_to_string(self.home.config_file()).unwrap();
+        assert!(
+            !config.contains("[spool]"),
+            "the config already names a spool"
+        );
+        let inside = self.home.config_file().with_file_name("in-container.toml");
+        std::fs::write(
+            &inside,
+            format!(
+                "{config}\n[spool]\ndir = \"{}\"\n",
+                self.container_spool().display()
+            ),
+        )
+        .unwrap();
+        command.env("NUCLEATED_CONFIG", inside)
+    }
+
+    /// The events waiting in `client-a`'s container's spool, oldest first.
+    pub fn spooled_in_container(&self) -> Vec<serde_json::Value> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(self.container_spool())
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.retain(|path| path.extension().is_some_and(|ext| ext == "json"));
+        files.sort();
+        files
+            .iter()
+            .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
+            .collect()
     }
 
     /// The events waiting in the spool, oldest first.

@@ -12,7 +12,9 @@
 
 mod common;
 
-use common::{contract, gate, git, run, stderr, Mock, Reply, Request, Rig};
+use common::{
+    contract, gate, git, run, stderr, Mock, Reply, Request, Rig, CLIENT_A_CONTAINER_UNIT,
+};
 use gate::MARK;
 use nucleate::driver::{self, Condition, Memory, LOOK_LIMIT};
 use nucleate::envelope::rfc3339;
@@ -771,35 +773,44 @@ fn status_shows_the_driver_its_last_look_and_the_link_that_opens_a_thread() {
 #[test]
 fn an_agent_whose_own_hook_reports_it_is_not_reported_again_as_its_thread() {
     let (rig, t3, mut fixture) = boxed(Rig::new());
+    // T3 Code runs in `client-a`'s container, beside the agent's login.
+    write_token(&rig, T3_TOKEN, 0o600);
+    rig.configure_in_container(&format!(
+        "[[environment]]\nname = \"t3\"\nroot = \"{}\"\ndriver = \"t3code\"\ncheck = \"true\"\n\
+         {CLIENT_A_CONTAINER_UNIT}driver_token_file = \"{}\"\ndriver_url = \"{}\"\n",
+        rig.root.display(),
+        token_file(&rig).display(),
+        t3.url(),
+    ));
     let worktree = rig.root.join(".worktrees/fix-login/web");
-    // T3 Code launches an agent with its thread's id in the environment.
+    // T3 Code launches an agent with its thread's id in the environment,
+    // and its hook writes the container's spool, which the daemon takes in.
     let hook = |thread: &str, session: &str, event: &str| {
         let out = run(
-            rig.nucleated()
-                .args(["hook", event, "--env", "client-a"])
-                .env("T3CODE_THREAD_ID", thread),
+            rig.in_container(
+                rig.nucleated()
+                    .args(["hook", event, "--env", "client-a"])
+                    .env("T3CODE_THREAD_ID", thread),
+            ),
             &json!({ "session_id": session, "cwd": worktree, "hook_event_name": event })
                 .to_string(),
         );
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(rig.spooled_in_container().len(), 1);
+        gate::tick(&rig);
+        assert!(rig.spooled_in_container().is_empty());
     };
 
     // The driver saw the thread first.
     let memory = look(&rig);
     assert!(memory.sessions.contains_key("thread-working"));
-    let seen = rig.spooled().len();
 
     // Then the agent's own hook spoke up from inside it. The hook wins: the
     // driver's session for that thread ends, and is not started again.
     hook("thread-working", "claude-session-1", "SessionStart");
-    let hooked = rig.spooled().len();
-    assert_eq!(hooked, seen + 1);
     let memory = look(&rig);
     assert!(!memory.sessions.contains_key("thread-working"));
-    assert_eq!(
-        told(&rig, hooked),
-        expect(&[("thread-working", "session_end")])
-    );
+    assert_eq!(told(&rig, 0), expect(&[("thread-working", "session_end")]));
     let after = rig.spooled().len();
     look(&rig);
     assert_eq!(rig.spooled().len(), after);
@@ -807,13 +818,56 @@ fn an_agent_whose_own_hook_reports_it_is_not_reported_again_as_its_thread() {
     // A thread whose agent's hook is heard before the driver lists it is
     // never the driver's to report.
     hook("thread-late", "claude-session-2", "SessionStart");
-    let after = rig.spooled().len();
     add(&mut fixture, "thread-working", "thread-late", json!({}));
     t3.answer_shell(200, &fixture);
     let memory = look(&rig);
     assert!(!memory.sessions.contains_key("thread-late"));
-    assert_eq!(rig.spooled().len(), after);
+    assert!(rig.spooled().is_empty());
     // Every other thread is still the driver's.
+    assert!(memory.sessions.contains_key("thread-permission"));
+}
+
+#[test]
+fn a_hook_heard_from_the_shared_spool_or_another_container_does_not_hide_its_thread() {
+    let (rig, t3, _) = boxed(Rig::new());
+    // T3 Code in a container of its own, apart from `client-a`'s.
+    write_token(&rig, T3_TOKEN, 0o600);
+    rig.configure_in_container(&format!(
+        "[[environment]]\nname = \"t3\"\nroot = \"{}\"\ndriver = \"t3code\"\ncheck = \"true\"\n\
+         unit = \"agent-env-t3.service\"\ndriver_token_file = \"{}\"\ndriver_url = \"{}\"\n",
+        rig.root.display(),
+        token_file(&rig).display(),
+        t3.url(),
+    ));
+    let worktree = rig.root.join(".worktrees/fix-login/web");
+    let payload = json!({ "session_id": "claude-session-1", "cwd": worktree }).to_string();
+    // A hook in `client-a`'s container, and one writing the shared spool,
+    // each saying it runs in a thread of T3 Code's.
+    let inside = run(
+        rig.in_container(
+            rig.nucleated()
+                .args(["hook", "SessionStart", "--env", "client-a"])
+                .env("T3CODE_THREAD_ID", "thread-working"),
+        ),
+        &payload,
+    );
+    assert_eq!(inside.status.code(), Some(0));
+    let shared = run(
+        rig.nucleated()
+            .args(["hook", "SessionStart", "--env", "client-a"])
+            .env("T3CODE_THREAD_ID", "thread-permission"),
+        &json!({ "session_id": "claude-session-2", "cwd": worktree }).to_string(),
+    );
+    assert_eq!(shared.status.code(), Some(0));
+    gate::tick(&rig);
+    // Both sessions are known; neither claim counted.
+    let settings = rig.settings();
+    let store = nucleate::sessions::Store::new(&settings.state_dir);
+    assert!(store.load("client-a", "claude-session-1").is_some());
+    assert!(store.load("client-a", "claude-session-2").is_some());
+    assert!(!rig.home.state_dir().join("claims").exists());
+    let memory = look(&rig);
+    assert!(memory.sessions.contains_key("thread-working"));
     assert!(memory.sessions.contains_key("thread-permission"));
 }
 
