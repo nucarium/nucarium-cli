@@ -20,7 +20,7 @@ use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
-use crate::spool::{Record, Spool, Unread};
+use crate::spool::{self, Record, Spool, Unread};
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
@@ -722,6 +722,9 @@ impl Daemon {
         waiting.sort();
         let mut taken: Vec<(String, Spool, Record, Option<envelope::Claim>)> = Vec::new();
         let mut seen = BTreeSet::new();
+        // How many files that are not records each folder has had set aside
+        // this pass.
+        let mut set_aside = vec![0usize; spools.len()];
         for (id, at) in waiting {
             let (from, spool) = &spools[at];
             // The same event in a second folder is not a second event. An
@@ -736,9 +739,15 @@ impl Daemon {
                     record
                 }
                 Err(Unread::Gone) => continue,
-                // Not a record this program wrote.
+                // Not a record this program wrote: kept to look at, up to
+                // a few a folder each pass, and the rest removed.
                 Err(Unread::NotARecord) => {
-                    spool.reject(&id, None);
+                    if set_aside[at] < spool::MAX_SET_ASIDE_PER_PASS {
+                        set_aside[at] += 1;
+                        spool.reject(&id, None);
+                    } else {
+                        spool.remove(&id);
+                    }
                     continue;
                 }
                 // A link, a pipe, something too big: no hook writes one.

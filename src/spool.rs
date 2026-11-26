@@ -28,6 +28,11 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+/// The most files of one spool folder that are not records the daemon sets
+/// aside in one pass. The rest of that folder's are removed without a copy:
+/// a folder filled with them is not let make every pass slow for the rest.
+pub const MAX_SET_ASIDE_PER_PASS: usize = 16;
+
 /// The most bytes a spool file may hold. The largest record that fits the
 /// contract is a few kilobytes; anything bigger is no record, and is not read.
 pub const MAX_FILE: u64 = 64 * 1024;

@@ -10,7 +10,7 @@ mod common;
 use common::{gate, Rig, CLIENT_A_CONTAINER_UNIT};
 use nucleate::envelope::{unix_ms, Claim, Draft, Envelope, EventType};
 use nucleate::sessions::Store;
-use nucleate::spool::{Record, Spool, MAX_FILE};
+use nucleate::spool::{Record, Spool, MAX_FILE, MAX_SET_ASIDE_PER_PASS};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -231,6 +231,43 @@ fn a_name_planted_in_one_folder_never_hides_the_same_event_in_another() {
     let told = sent(&mock);
     assert_eq!(told.len(), 1, "{told:?}");
     assert_eq!(told[0]["event_id"], id.as_str());
+}
+
+#[test]
+fn a_folder_full_of_files_that_are_no_records_has_only_a_few_kept_and_holds_nothing_up() {
+    let rig = Rig::new();
+    rig.configure_in_container("");
+    let mock = gate::watch();
+    rig.sign_in(&mock.url);
+    // Many more files that are no records than are ever kept in one pass,
+    // each under a name a record would have, in `client-a`'s own folder.
+    let spool = rig.container_spool();
+    std::fs::create_dir_all(&spool).unwrap();
+    let junk = MAX_SET_ASIDE_PER_PASS * 4;
+    for n in 0..junk {
+        let id = write(
+            &rig.home.dir.join("scratch"),
+            EventType::Stop,
+            n as u64,
+            session("client-a", "planted"),
+        );
+        std::fs::write(spool.join(format!("{id}.json")), "{ not a record").unwrap();
+    }
+    // An event in another folder, after all of them.
+    let good = write(
+        &rig.spool_dir(),
+        EventType::PermissionPrompt,
+        junk as u64 + 10,
+        session("client-a", "its-own"),
+    );
+    gate::tick(&rig);
+    let told = sent(&mock);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["event_id"], good.as_str());
+    // A few are kept, and the rest are gone without a copy.
+    let aside = entries(&rig.home.state_dir().join("spools").join(".rejected"));
+    assert_eq!(aside.len(), MAX_SET_ASIDE_PER_PASS, "{aside:?}");
+    assert!(entries(&spool).is_empty());
 }
 
 #[test]

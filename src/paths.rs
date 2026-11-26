@@ -330,8 +330,13 @@ impl Dir {
 
     /// Make a new file of the daemon's own, mode 600, holding `bytes`. An
     /// entry already under that name, of any kind, is left as it is and is
-    /// an error.
+    /// an error. Not synced to disk: for a copy whose loss in a crash costs
+    /// nothing.
     pub fn create_new(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_new(name, bytes, false)
+    }
+
+    fn write_new(&self, name: &str, bytes: &[u8], sync: bool) -> std::io::Result<()> {
         let c = c_string(name.as_bytes())?;
         // SAFETY: a descriptor this folder owns, and a valid C string.
         let fd = checked(unsafe {
@@ -349,7 +354,9 @@ impl Dir {
         })?;
         // SAFETY: `openat` just made this file, and nothing else owns it.
         let mut file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        let written = file
+            .write_all(bytes)
+            .and_then(|()| if sync { file.sync_all() } else { Ok(()) });
         if written.is_err() {
             let _ = self.unlink(name);
         }
@@ -360,10 +367,12 @@ impl Dir {
     /// entry `name`: written whole under a name of its own first, then
     /// renamed over it, so whatever was there (a link included) is replaced
     /// as an entry and never written through. A folder is not replaced.
+    /// Synced to disk before the rename, so a crash leaves the old entry or
+    /// the whole new one.
     pub fn replace(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         let tmp = format!(".{name}.{}.tmp", std::process::id());
         let _ = self.unlink(&tmp);
-        self.create_new(&tmp, bytes)?;
+        self.write_new(&tmp, bytes, true)?;
         let (from, to) = (c_string(tmp.as_bytes())?, c_string(name.as_bytes())?);
         // SAFETY: the descriptor this folder owns, twice, and two valid C
         // strings.
