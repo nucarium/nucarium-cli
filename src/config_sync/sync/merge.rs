@@ -370,7 +370,12 @@ mod tests {
                             assert!(ours().owned(event, printed), "{name}: {printed}");
                             // The same handler under another event is not
                             // what the adapter printed.
-                            assert!(!ours().owned("PreToolUse", printed), "{printed}");
+                            let other = if event == "Stop" {
+                                "SessionStart"
+                            } else {
+                                "Stop"
+                            };
+                            assert!(!ours().owned(other, printed), "{name}: {printed}");
                         }
                     }
                 }
