@@ -74,8 +74,11 @@ pub const INNER_LIMIT: Duration = Duration::from_millis(4500);
 /// [`INNER_LIMIT`] with room for reading the folders it names.
 pub const ASK_LIMIT: Duration = Duration::from_secs(4);
 /// How long the host gives the container engine to say which process is a
-/// container's first, to end a look that ran past [`LOOK_LIMIT`].
+/// container's first, to end a look it gave up on.
 const END_LIMIT: Duration = Duration::from_secs(2);
+/// How long `podman exec` is then given to return by itself, as it does once
+/// the look has ended, before it is stopped.
+const END_GRACE: Duration = Duration::from_secs(3);
 /// A session a complete look does not list is ended once this many looks in
 /// a row have not listed it. One look can catch a driver between two states.
 pub const MISSING_LOOKS: u8 = 2;
@@ -1269,20 +1272,31 @@ impl Runner {
             serde_json::to_string(&previous).unwrap_or_default(),
         ];
         let mut command = self.command(settings, environment, &args);
-        let heard = bounded::try_stream(&mut command, LOOK_LIMIT, answer::MAX_ANSWER, |out| {
-            answer::read(out)
-        });
+        let read = |out: &mut dyn std::io::Read| answer::read(out);
+        let heard = match environment.container() {
+            Some(container) => {
+                // A look given up on is over for the host at once. What is
+                // left of it in the container is ended from the box, and
+                // `podman exec` then returns by itself, which is what lets
+                // the engine forget the exec.
+                let (runner, container) = (self.clone(), container.to_string());
+                let ending = bounded::Ending {
+                    end: Box::new(move || runner.end(&container, &token)),
+                    grace: END_GRACE,
+                };
+                bounded::try_stream_ending(
+                    &mut command,
+                    LOOK_LIMIT,
+                    answer::MAX_ANSWER,
+                    read,
+                    ending,
+                )
+            }
+            None => bounded::try_stream(&mut command, LOOK_LIMIT, answer::MAX_ANSWER, read),
+        };
         match heard {
             Ok(answer) => answer.check(driver),
-            Err(Failure::Late) => {
-                // On a thread of its own: the look is over for the host now,
-                // and ending what is left of it takes a moment more.
-                if let Some(container) = environment.container() {
-                    let (runner, container) = (self.clone(), container.to_string());
-                    std::thread::spawn(move || runner.end(&container, &token));
-                }
-                Err(Condition::Timeout)
-            }
+            Err(Failure::Late) => Err(Condition::Timeout),
             // No `podman`, no container running, or nothing that could be
             // started in it: the driver is not there to be asked.
             Err(Failure::Absent | Failure::Failed) => Err(Condition::Absent),
@@ -1290,12 +1304,11 @@ impl Runner {
         }
     }
 
-    /// The host gave up on a look before it ended itself. Whatever of it is
-    /// still running in `container` is ended from the box, where the
-    /// container cannot hold it (see [`cut_off`]), so that neither the
-    /// container nor the host keeps anything of it. Nothing more is run in
-    /// the container. A look on the host was a child of this program, and
-    /// has been stopped already.
+    /// The host gave up on a look in `container`, late or for printing too
+    /// much. Whatever of it is still running there is ended from the box,
+    /// where the container cannot hold it (see [`cut_off`]), so that neither
+    /// the container nor the host keeps anything of it. Nothing more is run
+    /// in the container.
     fn end(&self, container: &str, token: &str) {
         let mut command = Command::new(&self.podman);
         command

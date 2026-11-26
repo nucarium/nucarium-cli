@@ -269,6 +269,41 @@ pub fn try_stream<T>(
     max: u64,
     parse: impl FnOnce(&mut dyn Read) -> Option<T>,
 ) -> Result<T, Failure> {
+    streamed(command, timeout, max, parse, None)
+}
+
+/// What to do about a program given up on that runs something stopping it
+/// cannot reach: end that first, then give the program this long to leave by
+/// itself.
+pub struct Ending {
+    pub end: Box<dyn FnOnce() + Send>,
+    pub grace: Duration,
+}
+
+/// As [`try_stream`], for a program that runs something outside its own
+/// process group, such as `podman exec`, whose command runs under the
+/// container engine and not under it. When the program is given up on, late
+/// or for printing too much, the caller is told at once, and then, on a
+/// thread of its own, `ending.end` ends what stopping the program cannot,
+/// and the program is given `ending.grace` to leave by itself, as `podman
+/// exec` does once its command has ended, before it is stopped.
+pub fn try_stream_ending<T>(
+    command: &mut Command,
+    timeout: Duration,
+    max: u64,
+    parse: impl FnOnce(&mut dyn Read) -> Option<T>,
+    ending: Ending,
+) -> Result<T, Failure> {
+    streamed(command, timeout, max, parse, Some(ending))
+}
+
+fn streamed<T>(
+    command: &mut Command,
+    timeout: Duration,
+    max: u64,
+    parse: impl FnOnce(&mut dyn Read) -> Option<T>,
+    ending: Option<Ending>,
+) -> Result<T, Failure> {
     let deadline = Instant::now() + timeout;
     let mut child = spawn(command, Stdio::null())?;
     let late = Arc::new(AtomicBool::new(false));
@@ -279,15 +314,62 @@ pub fn try_stream<T>(
         })
     });
     if over {
-        stop(&mut child);
-        let _ = wait(&mut child);
+        give_up(child, ending);
         return Err(Failure::TooMuch);
     }
-    let status = reap(&mut child, &late, deadline)?;
+    let status = match ending {
+        None => reap(&mut child, &late, deadline)?,
+        Some(ending) => match finished(&mut child, &late, deadline) {
+            Some(status) => status,
+            None => {
+                give_up(child, Some(ending));
+                return Err(Failure::Late);
+            }
+        },
+    };
     if !status.success() {
         return Err(Failure::Failed);
     }
     parsed.ok_or(Failure::NoAnswer)
+}
+
+/// Wait for a child until the deadline. Nothing when it ran over, or its
+/// output did: the child is then still to be stopped.
+fn finished(child: &mut Child, late: &AtomicBool, deadline: Instant) -> Option<ExitStatus> {
+    let late = late.load(Ordering::SeqCst);
+    loop {
+        match exited(child) {
+            Ok(Some(status)) if !late => return Some(status),
+            Ok(None) if !late && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Stop a child given up on. With an ending, that comes first, and the
+/// child has its grace to leave by itself, on a thread of its own.
+fn give_up(mut child: Child, ending: Option<Ending>) {
+    let Some(ending) = ending else {
+        stop(&mut child);
+        let _ = wait(&mut child);
+        return;
+    };
+    std::thread::spawn(move || {
+        (ending.end)();
+        let until = Instant::now() + ending.grace;
+        let running = |child: &mut Child| matches!(exited(child), Ok(None));
+        while running(&mut child) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A child that has been reaped is not stopped: its id may be
+        // another's by now.
+        if running(&mut child) {
+            stop(&mut child);
+        }
+        let _ = wait(&mut child);
+    });
 }
 
 /// Run a program and keep what it printed, at most `max` bytes of it.
@@ -602,5 +684,74 @@ mod tests {
             stream(&mut sh("cat; echo done"), limit, 4096, text).as_deref(),
             Some("done\n")
         );
+    }
+
+    /// Wait a little for `file` to be there.
+    fn appears(file: &std::path::Path) -> bool {
+        let started = Instant::now();
+        while !file.exists() {
+            if started.elapsed() > Duration::from_secs(5) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    #[test]
+    fn a_program_given_up_on_has_what_it_runs_ended_first_and_may_then_leave_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ended, left) = (dir.path().join("ended"), dir.path().join("left"));
+        // A client that waits on something outside its own group, and leaves
+        // once that has ended, as `podman exec` does.
+        let mut client = sh(&format!(
+            "while [ ! -f '{ended}' ]; do sleep 0.05; done; touch '{left}'",
+            ended = ended.display(),
+            left = left.display()
+        ));
+        let mark = ended.clone();
+        let ending = Ending {
+            end: Box::new(move || std::fs::write(mark, "").unwrap()),
+            grace: Duration::from_secs(3),
+        };
+        let started = Instant::now();
+        let heard = try_stream_ending(&mut client, Duration::from_millis(200), 64, text, ending);
+        assert_eq!(heard, Err(Failure::Late));
+        // The caller is told at once; the ending comes after.
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            appears(&left),
+            "the client was stopped before it could leave"
+        );
+    }
+
+    #[test]
+    fn a_program_that_does_not_leave_once_its_ending_is_done_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let mut client = sh(&format!(
+            "trap '' TERM; echo $$ > '{}'; exec sleep 60",
+            pid.display()
+        ));
+        let ending = Ending {
+            end: Box::new(|| {}),
+            grace: Duration::from_millis(300),
+        };
+        let heard = try_stream_ending(&mut client, Duration::from_millis(200), 64, text, ending);
+        assert_eq!(heard, Err(Failure::Late));
+        assert!(appears(&pid));
+        let pid = std::fs::read_to_string(&pid).unwrap();
+        let started = Instant::now();
+        let alive = || {
+            Command::new("sh")
+                .args(["-c", &format!("kill -0 {} 2>/dev/null", pid.trim())])
+                .status()
+                .unwrap()
+                .success()
+        };
+        while alive() {
+            assert!(started.elapsed() < Duration::from_secs(5), "still running");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

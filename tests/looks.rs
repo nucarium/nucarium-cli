@@ -247,9 +247,9 @@ fn whatever_a_container_prints_in_place_of_an_answer_costs_one_short_look_and_sa
         assert_eq!(memory.sessions, remembered, "{what}");
         assert_eq!(rig.spooled().len(), spooled, "{what}");
     }
-    // For each look it gave up on, the host asked the engine which process
-    // is the container's first, to end the look from the box, and ran
-    // nothing more in the container.
+    // For each look it gave up on, late or for printing too much, the host
+    // asked the engine which process is the container's first, to end the
+    // look from the box, and ran nothing more in the container.
     let asked = || -> Vec<String> {
         rig.podman_calls()
             .into_iter()
@@ -257,12 +257,12 @@ fn whatever_a_container_prints_in_place_of_an_answer_costs_one_short_look_and_sa
             .collect()
     };
     let waited = Instant::now();
-    while asked().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
+    while asked().len() < 3 && waited.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(50));
     }
     let calls = rig.podman_calls();
     let asked = asked();
-    assert_eq!(asked.len(), 2, "{calls:?}");
+    assert_eq!(asked.len(), 3, "{calls:?}");
     for call in &asked {
         assert_eq!(
             call,
