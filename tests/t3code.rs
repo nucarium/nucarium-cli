@@ -262,9 +262,7 @@ fn boxed(rig: Rig) -> (Rig, T3, Value) {
 }
 
 fn look_at(rig: &Rig, now: SystemTime) -> Memory {
-    let settings = rig.settings();
-    let environment = settings.environment("t3").unwrap();
-    driver::look(&settings, environment, now).unwrap()
+    common::look(rig, "t3", now)
 }
 
 fn look(rig: &Rig) -> Memory {

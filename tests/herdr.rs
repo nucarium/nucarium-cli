@@ -15,7 +15,7 @@ mod common;
 
 use common::gate::{mark, MARK};
 use common::{contract, gate, run, Rig, CLIENT_A_CONTAINER_UNIT};
-use nucleate::driver::{self, Condition, Memory, LOOK_LIMIT};
+use nucleate::driver::{Condition, Memory, LOOK_LIMIT};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -175,9 +175,7 @@ fn at(n: u64) -> SystemTime {
 }
 
 fn look(rig: &Rig, n: u64) -> Memory {
-    let settings = rig.settings();
-    let environment = settings.environment("herdr").unwrap();
-    driver::look(&settings, environment, at(n)).unwrap()
+    common::look(rig, "herdr", at(n))
 }
 
 /// What is waiting in the spool, as (session, event type), oldest first.
@@ -267,10 +265,7 @@ fn with_no_herdr_socket_there_the_environment_is_alive_and_nothing_else_is_said(
         let rig = rig(name);
         let mock = gate::watch_ahead();
         rig.sign_in(&mock.url);
-        let settings = rig.settings();
-        let environment = settings.environment("herdr").unwrap();
-
-        let memory = driver::look(&settings, environment, SystemTime::now()).unwrap();
+        let memory = common::look(&rig, "herdr", SystemTime::now());
         assert_eq!(memory.condition, Condition::Absent, "{name}");
         assert!(memory.sessions.is_empty(), "{name}");
         assert!(rig.spooled().is_empty(), "{name}");

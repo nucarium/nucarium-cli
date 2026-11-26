@@ -1,10 +1,19 @@
 //! The seam between a driver and the event envelope.
 //!
 //! A driver is a tool people use to run and steer agents on the box: T3
-//! Code, Herdr, Orca. It calls no hook, so the daemon asks it, on a thread of
+//! Code, Herdr, Orca. It calls no hook, so the daemon asks it, on threads of
 //! its own beside housekeeping and the reporter. Each driver has one adapter,
 //! in a file of its own under `src/driver/`, and that file holds everything
 //! that knows how the driver is asked and what its answer looks like.
+//!
+//! The host never asks a driver, and never opens a file, a socket or a
+//! folder a driver names. A look is the box's own `nucleated`, run inside the
+//! environment's container through one `podman exec` with a deadline of its
+//! own ([`inside`]). There the adapter asks its driver and the folders it
+//! names are read, as a hook in that container would read them; what comes
+//! back is a small versioned answer of ids, fixed words, numbers, repo names
+//! and branches ([`answer`]), which the host holds field by field to fixed
+//! lists, patterns and caps before it believes any of it.
 //!
 //! An adapter does one thing: it takes one look at its driver and says which
 //! sessions it saw and what each is doing, in the words below. Everything
@@ -19,8 +28,8 @@
 //!   no driver offers a way to leave it out. An adapter reads its answer
 //!   through [`crate::allowlist`] into structs that name only the fields its
 //!   design lists. What comes out of an adapter is an id, a phase, a short
-//!   kind, a time, a counter and a folder; the folder is used on the box to
-//!   find a repo name and a branch, and is never stored or sent.
+//!   kind, a time, a counter and a folder; the folder is used inside the
+//!   container to find a repo name and a branch, and never leaves it.
 //! - **Observe only.** An adapter sends its driver only the read calls its
 //!   design names, and a test of its own asserts the exact calls made.
 //!   Nothing here starts, stops, steers or sends a command to anything.
@@ -29,6 +38,7 @@
 //!   session, and no change to whether the environment's server is alive,
 //!   which is asked of its supervisor and never of the driver.
 
+use crate::bounded::{self, Failure};
 use crate::envelope::{self, unix_ms, valid_env_key, valid_session_id, Draft, Envelope, EventType};
 use crate::housekeeping;
 use crate::paths;
@@ -39,16 +49,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod answer;
 pub mod herdr_core;
 pub mod herdr_tui;
+pub mod inside;
 pub mod orca;
 pub mod t3code;
 
-/// An adapter's look returns within this long, whatever its driver does.
+use answer::{Answer, Seen};
+
+/// A look is over within this long on the host, whatever the driver or the
+/// container does: `podman exec`, the look inside it, and its answer.
 pub const LOOK_LIMIT: Duration = Duration::from_secs(5);
+/// Inside the container, a look ends itself and everything it started
+/// within this long, so that it is over before the host gives up on it.
+pub const INNER_LIMIT: Duration = Duration::from_millis(4500);
+/// An adapter's own calls to its driver are given up after this long, inside
+/// [`INNER_LIMIT`] with room for reading the folders it names.
+pub const ASK_LIMIT: Duration = Duration::from_secs(4);
+/// How long the host gives its request to end a look that ran past
+/// [`LOOK_LIMIT`].
+const END_LIMIT: Duration = Duration::from_secs(2);
 /// A session a complete look does not list is ended once this many looks in
 /// a row have not listed it. One look can catch a driver between two states.
 pub const MISSING_LOOKS: u8 = 2;
@@ -127,8 +153,9 @@ pub struct Observed {
     /// With [`Phase::Failed`] on a usage limit, when the driver says the
     /// limit resets. A time the adapter parsed from a documented field.
     pub limit_resets_at: Option<SystemTime>,
-    /// The folder the session works in. Used on the box, as a hook's `cwd`
-    /// is, to find the session's repos and branch. Never stored, never sent.
+    /// The folder the session works in. Read inside the container, as a
+    /// hook's `cwd` is, to find the session's repos and branch, and never
+    /// handed to the host.
     pub cwd: Option<PathBuf>,
     /// A number that only grows while the agent is doing things: a count of
     /// items, or a time of last activity in milliseconds. While the session
@@ -185,10 +212,10 @@ pub struct Look {
     /// and are never sent.
     pub facts: BTreeMap<&'static str, u64>,
     /// For a driver that owns its worktrees: the folder of every git
-    /// worktree its answer listed, with an agent in it or not. Compared on
-    /// the box with what [`Driver::worktrees`] finds, so that the count of
-    /// unsaved work is never sent as a number while it leaves one of them
-    /// out. Never stored, never sent: only how many are left out is kept.
+    /// worktree its answer listed, with an agent in it or not. Compared
+    /// inside the container with what [`Driver::worktrees`] finds, so that
+    /// the count of unsaved work is never sent as a number while it leaves
+    /// one of them out. Only how many are left out reaches the host.
     pub worktrees: Vec<PathBuf>,
 }
 
@@ -286,9 +313,11 @@ pub trait Driver: Sync {
     }
 
     /// One look at the driver's agents: only the read calls the adapter's
-    /// design names, within [`LOOK_LIMIT`], touching nothing beyond the box.
+    /// design names, within [`ASK_LIMIT`], touching nothing beyond the box.
+    /// Runs inside the environment's container, in `nucleated look`.
     /// `previous` is what the last look left, for an adapter that asks its
-    /// driver something once and not at every look.
+    /// driver something once and not at every look: its condition, when it
+    /// last found the driver, its link reference and its facts.
     ///
     /// An `Err` is "could not know". The daemon then changes nothing.
     fn observe(
@@ -560,33 +589,6 @@ fn folder_numbers(folder: &Path) -> Vec<String> {
         .take(CLAIM_FOLDERS)
         .map(folder_number)
         .collect()
-}
-
-/// Whether a claim was made from where the driver says its session works.
-/// A driver that names no folder is taken at the claim's word. One that
-/// names a folder is agreed with by a hook whose session works in that
-/// folder or inside it, or in a folder above it that is still within the
-/// driver environment's own root: a driver may name the folder of whatever
-/// its agent is running at the moment. A claim that names no folder, or
-/// another, is some other session's.
-fn same_place(environment: &Environment, folder: Option<&Path>, numbers: &[String]) -> bool {
-    let Some(folder) = folder else {
-        return true;
-    };
-    let Some(hooks) = numbers.first() else {
-        return false;
-    };
-    let folder = resolved(folder);
-    if numbers.contains(&folder_number(&folder)) {
-        return true;
-    }
-    let root = resolved(&environment.root);
-    folder
-        .ancestors()
-        .skip(1)
-        .take(CLAIM_FOLDERS)
-        .take_while(|above| above.starts_with(&root))
-        .any(|above| folder_number(above) == *hooks)
 }
 
 /// Note, in the daemon's own state, that a hook-reported session is running
@@ -892,19 +894,20 @@ fn log(line: &str) {
 /// environment's driver, writing the lifecycle events the difference
 /// amounts to. Returns how many were written.
 ///
-/// A failed look changes the condition word and nothing else. A session is
+/// `result` is a look's answer as the host took it ([`Answer::check`]). A
+/// failed look changes the condition word and nothing else. A session is
 /// reported under the driver's own id for it; a session a live hook has
 /// claimed is not reported, and is ended if it was. A claim does not outlive
 /// its hook's silence for ever: see [`claims_stand`]. It counts only when it
 /// was made from where the driver says the session works: see
-/// [`same_place`]. And it never hides a session that waits on its owner or
-/// has failed unless the hook's own session shows the same: see
+/// [`Seen::same_place`]. And it never hides a session that waits on its
+/// owner or has failed unless the hook's own session shows the same: see
 /// [`CLAIM_UNHEARD`].
 pub fn apply(
     settings: &Settings,
     environment: &Environment,
     memory: &mut Memory,
-    result: Result<Look, Condition>,
+    result: Result<Answer, Condition>,
     now: SystemTime,
 ) -> usize {
     let now_ms = unix_ms(now);
@@ -935,9 +938,9 @@ pub fn apply(
         .facts
         .iter()
         .filter(|(name, _)| valid_key(name))
-        .map(|(name, value)| (name.to_string(), *value))
+        .map(|(name, value)| (name.clone(), *value))
         .collect();
-    memory.uncounted_worktrees = uncounted(settings, environment, &look.worktrees);
+    memory.uncounted_worktrees = look.uncounted_worktrees;
 
     let spool = Spool::new(&settings.spool_dir);
     // A spool nobody is emptying is not allowed to fill the disk. What was
@@ -950,7 +953,7 @@ pub fn apply(
     let store = Store::new(&settings.state_dir);
     // What each session a hook has reported under this id, and not ended,
     // is doing.
-    let hook_reports = |observed: &Observed, id: &str| -> Vec<Option<Status>> {
+    let hook_reports = |observed: &Seen, id: &str| -> Vec<Option<Status>> {
         if !valid_session_id(id) {
             return Vec::new();
         }
@@ -969,11 +972,13 @@ pub fn apply(
     let beat = ACTIVITY_BEAT.as_millis() as u64;
     let mut written = 0u64;
     let mut seen = BTreeSet::new();
-    let emit = |observed: &Observed, kinds: &[EventType], written: &mut u64| {
+    let emit = |observed: &Seen, kinds: &[EventType], written: &mut u64| {
         if kinds.is_empty() {
             return;
         }
-        let place = crate::hook::place(environment, observed.cwd.as_deref());
+        let limit_resets_at = observed
+            .limit_resets_at_ms
+            .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
         for kind in kinds {
             // Event ids sort by the millisecond they were made in, and a
             // session's events are applied in that order.
@@ -981,17 +986,17 @@ pub fn apply(
             let draft = Draft {
                 env_id: environment.name.clone(),
                 session_id: observed.id.clone(),
-                repos: place.repos.clone(),
-                branch: place.branch.clone(),
+                repos: observed.repos.clone(),
+                branch: observed.branch.clone(),
                 error_kind: observed.error_kind.clone(),
-                limit_resets_at: observed.limit_resets_at,
+                limit_resets_at,
                 ..Draft::default()
             };
             if let Some(event) = Envelope::new(*kind, draft, at) {
                 let record = Record {
                     event,
                     at_ms: unix_ms(at),
-                    workspace: place.workspace.clone(),
+                    workspace: observed.workspace.clone(),
                     process: None,
                 };
                 if spool.write(&record).is_ok() {
@@ -1022,9 +1027,7 @@ pub fn apply(
                     .get(key)
                     .into_iter()
                     .flatten()
-                    .filter(|claim| {
-                        same_place(environment, observed.cwd.as_deref(), &claim.folders)
-                    })
+                    .filter(|claim| observed.same_place(&claim.folders))
                     .map(|claim| claim.status),
             );
         }
@@ -1161,8 +1164,7 @@ pub fn apply(
             known.missing = known.missing.saturating_add(1);
             if known.missing >= MISSING_LOOKS {
                 if !known.silent {
-                    let ended = Observed::new(id.clone(), Some(Phase::Ended));
-                    emit(&ended, &[EventType::SessionEnd], &mut written);
+                    emit(&Seen::bare(&id), &[EventType::SessionEnd], &mut written);
                 }
                 memory.sessions.remove(&id);
             }
@@ -1173,27 +1175,192 @@ pub fn apply(
     written as usize
 }
 
+/// How the host has a look taken: the box's own `nucleated`, and `podman`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runner {
+    /// The box's own `nucleated`, by its full path. The recipe mounts the
+    /// folder it is in read-only at the same path in every container, and a
+    /// container's own `PATH` is never asked for it.
+    pub program: PathBuf,
+    /// The container engine's command-line program.
+    pub podman: PathBuf,
+}
+
+impl Runner {
+    /// This program and the box's `podman`: what the daemon uses.
+    pub fn of_this_box() -> Option<Runner> {
+        let program = std::env::current_exe().ok()?;
+        // A program replaced on disk while it runs is named with this after
+        // its path; the path is where the new one is.
+        let text = program.to_string_lossy();
+        let program = match text.strip_suffix(" (deleted)") {
+            Some(path) => PathBuf::from(path),
+            None => program,
+        };
+        Some(Runner {
+            program,
+            podman: PathBuf::from("podman"),
+        })
+    }
+
+    /// The command for one look at `environment`: inside its container
+    /// through one `podman exec` of the box's own `nucleated`, or, for an
+    /// environment on the host, that program itself with the daemon's
+    /// config. The arguments are the look's own fixed ones, the
+    /// environment's config name, numbers, and what the last look left.
+    fn command(&self, settings: &Settings, environment: &Environment, args: &[String]) -> Command {
+        match environment.container() {
+            Some(container) => {
+                let mut command = Command::new(&self.podman);
+                command
+                    .arg("exec")
+                    .arg(container)
+                    .arg(&self.program)
+                    .args(args);
+                command
+            }
+            None => {
+                let mut command = Command::new(&self.program);
+                command.args(args).env("NUCLEATED_CONFIG", &settings.path);
+                command
+            }
+        }
+    }
+
+    /// Take one look at `environment`'s driver and hold its answer to what
+    /// the host takes. "Could not know" is one of the fixed words.
+    fn ask(
+        &self,
+        settings: &Settings,
+        environment: &Environment,
+        driver: &str,
+        memory: &Memory,
+        now: SystemTime,
+    ) -> Result<Answer, Condition> {
+        let token = token(now);
+        // As much of the last look as an adapter may use: words and numbers.
+        let previous = Memory {
+            driver: driver.to_string(),
+            condition: memory.condition,
+            good_at_ms: memory.good_at_ms,
+            link_ref: memory.link_ref.clone(),
+            facts: memory.facts.clone(),
+            ..Memory::default()
+        };
+        let args = [
+            "look".to_string(),
+            "--env".to_string(),
+            environment.name.clone(),
+            "--within".to_string(),
+            INNER_LIMIT.as_millis().to_string(),
+            "--now".to_string(),
+            unix_ms(now).to_string(),
+            "--token".to_string(),
+            token.clone(),
+            "--previous".to_string(),
+            serde_json::to_string(&previous).unwrap_or_default(),
+        ];
+        let mut command = self.command(settings, environment, &args);
+        let heard = bounded::try_stream(&mut command, LOOK_LIMIT, answer::MAX_ANSWER, |out| {
+            answer::read(out)
+        });
+        match heard {
+            Ok(answer) => answer.check(driver),
+            Err(Failure::Late) => {
+                self.end(environment, &token);
+                Err(Condition::Timeout)
+            }
+            // No `podman`, no container running, or nothing that could be
+            // started in it: the driver is not there to be asked.
+            Err(Failure::Absent | Failure::Failed) => Err(Condition::Absent),
+            Err(Failure::TooMuch | Failure::NoAnswer) => Err(Condition::BadReply),
+        }
+    }
+
+    /// The host gave up on a look before it ended itself. Whatever of it is
+    /// still running in the container is ended there, so that neither the
+    /// container nor the host keeps anything of it. On the host the look was
+    /// a child of this program, and has been stopped already.
+    fn end(&self, environment: &Environment, token: &str) {
+        let Some(container) = environment.container() else {
+            return;
+        };
+        let mut command = Command::new(&self.podman);
+        command
+            .arg("exec")
+            .arg(container)
+            .arg(&self.program)
+            .args(["look", "--end", token]);
+        let _ = bounded::run(&mut command, END_LIMIT, 4096);
+    }
+}
+
+/// A look's token, so that one look can be told from another inside a
+/// container: sixteen lower-case hex digits.
+fn token(now: SystemTime) -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        bytes = (nanos ^ (u64::from(std::process::id()) << 32)).to_be_bytes();
+    }
+    format!("{:016x}", u64::from_be_bytes(bytes))
+}
+
 /// Take one look at an environment's driver and apply it. Returns what is
 /// now remembered, or nothing for an environment with no driver.
 pub fn look(settings: &Settings, environment: &Environment, now: SystemTime) -> Option<Memory> {
+    match Runner::of_this_box() {
+        Some(runner) => look_with(&runner, settings, environment, now),
+        None => {
+            // This program cannot say where it is: there is nothing to run.
+            let adapter = environment.driver_adapter()?;
+            let mut memory = remembered(settings, environment, adapter.name());
+            apply(
+                settings,
+                environment,
+                &mut memory,
+                Err(Condition::Absent),
+                now,
+            );
+            keep(settings, environment, &memory);
+            Some(memory)
+        }
+    }
+}
+
+/// As [`look`], with the programs `runner` names.
+pub fn look_with(
+    runner: &Runner,
+    settings: &Settings,
+    environment: &Environment,
+    now: SystemTime,
+) -> Option<Memory> {
     let adapter = environment.driver_adapter()?;
-    let mut memory = read_memory(&settings.state_dir, &environment.name)
-        // Another driver's memory says nothing about this one's sessions.
-        .filter(|memory| memory.driver == adapter.name())
-        .unwrap_or_else(|| Memory::new(adapter.name()));
-    // An adapter that panics has not looked. It costs this look and no more.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        adapter.observe(environment, &memory, now)
-    }))
-    .unwrap_or(Err(Condition::BadReply));
+    let mut memory = remembered(settings, environment, adapter.name());
+    let result = runner.ask(settings, environment, adapter.name(), &memory, now);
     apply(settings, environment, &mut memory, result, now);
-    if let Ok(text) = serde_json::to_string(&memory) {
+    keep(settings, environment, &memory);
+    Some(memory)
+}
+
+/// What the last look at this environment's driver left, or a fresh start.
+fn remembered(settings: &Settings, environment: &Environment, driver: &str) -> Memory {
+    read_memory(&settings.state_dir, &environment.name)
+        // Another driver's memory says nothing about this one's sessions.
+        .filter(|memory| memory.driver == driver)
+        .unwrap_or_else(|| Memory::new(driver))
+}
+
+fn keep(settings: &Settings, environment: &Environment, memory: &Memory) {
+    if let Ok(text) = serde_json::to_string(memory) {
         let _ = paths::write_private(
             &memory_file(&settings.state_dir, &environment.name),
             text.as_bytes(),
         );
     }
-    Some(memory)
 }
 
 /// How long to wait after a look: the environment's own interval after a
@@ -1208,47 +1375,79 @@ fn next_wait(every: Duration, failures: u32) -> Duration {
         .min(ceiling)
 }
 
-/// The driver thread: a few seconds after start, then once a second, look at
-/// each driver that is due. The config is read afresh each time, as
-/// housekeeping reads it. A slow driver delays only the other drivers, by at
-/// most [`LOOK_LIMIT`], and never a heartbeat or a hook.
+/// When an environment's next look is due, and whether one is under way.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    next: Instant,
+    failures: u32,
+    busy: bool,
+}
+
+/// The driver thread: a few seconds after start, then once a second, start
+/// a look at each driver that is due and has none under way. Each look runs
+/// on a thread of its own with its own deadline, so a driver that does not
+/// answer holds up no other environment's look, no heartbeat and no hook.
+/// The config is read afresh each time, as housekeeping reads it.
 pub fn run_schedule(config: &Path, stop: &AtomicBool) {
     if housekeeping::wait(stop, Duration::from_secs(5)) {
         return;
     }
-    let mut due: BTreeMap<String, (Instant, u32)> = BTreeMap::new();
+    let runner = Runner::of_this_box();
+    let slots: Arc<Mutex<BTreeMap<String, Slot>>> = Arc::new(Mutex::new(BTreeMap::new()));
     loop {
         if let Ok(settings) = settings::load_from(config) {
+            let settings = Arc::new(settings);
+            let mut table = lock(&slots);
             for environment in &settings.environments {
                 let Some(every) = environment.driver.as_ref().and_then(|driver| driver.poll) else {
                     continue;
                 };
-                let (next, failures) = due
-                    .get(&environment.name)
-                    .copied()
-                    .unwrap_or((Instant::now(), 0));
-                if Instant::now() < next {
+                let now = Instant::now();
+                let slot = table.entry(environment.name.clone()).or_insert(Slot {
+                    next: now,
+                    failures: 0,
+                    busy: false,
+                });
+                if slot.busy || now < slot.next {
                     continue;
                 }
-                let good = look(&settings, environment, SystemTime::now())
-                    .is_some_and(|memory| memory.condition == Condition::Ok);
-                let failures = if good { 0 } else { failures.saturating_add(1) };
-                due.insert(
-                    environment.name.clone(),
-                    (Instant::now() + next_wait(every, failures), failures),
-                );
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
+                slot.busy = true;
+                let (settings, environment) = (settings.clone(), environment.clone());
+                let (runner, slots) = (runner.clone(), slots.clone());
+                std::thread::spawn(move || {
+                    let looked = match &runner {
+                        Some(runner) => {
+                            look_with(runner, &settings, &environment, SystemTime::now())
+                        }
+                        None => look(&settings, &environment, SystemTime::now()),
+                    };
+                    let good = looked.is_some_and(|memory| memory.condition == Condition::Ok);
+                    let mut table = lock(&slots);
+                    if let Some(slot) = table.get_mut(&environment.name) {
+                        slot.failures = if good {
+                            0
+                        } else {
+                            slot.failures.saturating_add(1)
+                        };
+                        slot.next = Instant::now() + next_wait(every, slot.failures);
+                        slot.busy = false;
+                    }
+                });
             }
-            due.retain(|name, _| settings.environment(name).is_some());
+            table.retain(|name, slot| slot.busy || settings.environment(name).is_some());
         }
         // With no driver to ask, there is nothing to be on time for.
-        let pause = if due.is_empty() { 15 } else { 1 };
+        let pause = if lock(&slots).is_empty() { 15 } else { 1 };
         if housekeeping::wait(stop, Duration::from_secs(pause)) {
             return;
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The folders that belong to drivers that own their worktrees. Nothing in
@@ -1326,6 +1525,20 @@ mod tests {
         note_claim(state_dir, &claim, environment, session_id);
     }
 
+    /// Apply a look as the host takes it: settled into an answer, as inside
+    /// the container, then held to what the host accepts.
+    fn applied(
+        settings: &Settings,
+        environment: &Environment,
+        memory: &mut Memory,
+        result: Result<Look, Condition>,
+        now: SystemTime,
+    ) -> usize {
+        let driver = environment.driver_adapter().unwrap().name();
+        let answer = answer::settle(settings, environment, driver, result).check(driver);
+        apply(settings, environment, memory, answer, now)
+    }
+
     fn seen(id: &str, phase: Phase) -> Observed {
         Observed::new(id, Some(phase))
     }
@@ -1347,7 +1560,7 @@ mod tests {
         now: SystemTime,
     ) -> Vec<(String, String)> {
         let environment = settings.environment("t3").unwrap();
-        apply(settings, environment, memory, result, now);
+        applied(settings, environment, memory, result, now);
         let spool = Spool::new(&settings.spool_dir);
         spool
             .pending()
@@ -1472,7 +1685,7 @@ mod tests {
         let (_dir, settings) = rig();
         let mut memory = Memory::new("t3code");
         let environment = settings.environment("t3").unwrap();
-        apply(
+        applied(
             &settings,
             environment,
             &mut memory,
@@ -1503,7 +1716,7 @@ mod tests {
             limit_resets_at: Some(at(3_600)),
             ..seen("s1", phase)
         };
-        apply(
+        applied(
             &settings,
             environment,
             &mut memory,
@@ -2531,7 +2744,7 @@ mod tests {
             fs::write(settings.spool_dir.join(name), "{}").unwrap();
         }
         let environment = settings.environment("t3").unwrap();
-        let wrote = apply(
+        let wrote = applied(
             &settings,
             environment,
             &mut memory,

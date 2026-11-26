@@ -155,8 +155,7 @@ impl Orca {
     }
 
     fn look_at(&self, now: SystemTime) -> Memory {
-        let settings = self.rig.settings();
-        driver::look(&settings, settings.environment("orca").unwrap(), now).unwrap()
+        common::look(&self.rig, "orca", now)
     }
 
     /// How the stand-in has been run so far: one line per run and one per

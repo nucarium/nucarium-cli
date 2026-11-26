@@ -681,6 +681,40 @@ impl Rig {
         command.env("NUCLEATED_CONFIG", inside)
     }
 
+    /// How the tests have a look taken: the binary under test, and the
+    /// stand-in `podman`. The containers see the config as it is now.
+    pub fn looker(&self) -> nucleate::driver::Runner {
+        let config = std::fs::read_to_string(self.home.config_file()).unwrap();
+        std::fs::write(
+            self.home.config_file().with_file_name("inside.toml"),
+            config,
+        )
+        .unwrap();
+        nucleate::driver::Runner {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_nucleated")),
+            podman: stand_in_podman(&self.home),
+        }
+    }
+
+    /// From now on, `podman exec` into `container` runs `script` in place of
+    /// the command it was given, as a container that does what it likes
+    /// would. The command is in `"$@"`; a script that has nothing to say
+    /// about it can `exec "$@"`.
+    pub fn container_does(&self, container: &str, script: &str) {
+        let dir = self.home.dir.join("containers");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{container}.does")), script).unwrap();
+    }
+
+    /// Every command line the stand-in `podman` was given, in order.
+    pub fn podman_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.home.dir.join("podman-calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The events waiting in `client-a`'s container's spool, oldest first.
     pub fn spooled_in_container(&self) -> Vec<serde_json::Value> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(self.container_spool())
@@ -706,6 +740,49 @@ impl Rig {
             .map(|path| serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap())
             .collect()
     }
+}
+
+/// The stand-in for `podman` the tests run a look through. `podman exec
+/// <container> <program> <args>` writes its command line to
+/// [`Rig::podman_calls`], then runs the program on this machine as it would
+/// run in that container, with the container's config, unless the test has
+/// told the container to do something else ([`Rig::container_does`]).
+/// Anything but `exec` fails as podman does with a command it cannot run.
+pub fn stand_in_podman(home: &Home) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = home.dir.join("stand-ins");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("podman");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$*\" >> '{calls}'\n\
+         [ \"$1\" = exec ] || exit 125\n\
+         shift\n\
+         container=\"$1\"\n\
+         shift\n\
+         NUCLEATED_CONFIG='{inside}'\n\
+         export NUCLEATED_CONFIG\n\
+         does='{containers}'/\"$container\".does\n\
+         if [ -f \"$does\" ]; then . \"$does\"; exit $?; fi\n\
+         exec \"$@\"\n",
+        calls = home.dir.join("podman-calls.log").display(),
+        containers = home.dir.join("containers").display(),
+        inside = home.config_file().with_file_name("inside.toml").display(),
+    );
+    let fresh = path.with_extension("new");
+    std::fs::write(&fresh, script).unwrap();
+    std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&fresh, &path).unwrap();
+    path
+}
+
+/// One look at `environment`'s driver, as the daemon takes it: the box's own
+/// `nucleated look`, inside the environment's container through the
+/// stand-in `podman`, or on this machine for an environment on the host.
+pub fn look(rig: &Rig, environment: &str, now: std::time::SystemTime) -> nucleate::driver::Memory {
+    let settings = rig.settings();
+    let environment = settings.environment(environment).unwrap();
+    nucleate::driver::look_with(&rig.looker(), &settings, environment, now).unwrap()
 }
 
 /// Every file under a folder, as (path, contents).

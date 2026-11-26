@@ -26,7 +26,7 @@
 //! worktree outside those folders, and its answer says where each one is:
 //! while it lists one the count would leave out, no count is sent.
 
-use super::{Condition, Driver, HookProcess, Look, Memory, Observed, Phase, LOOK_LIMIT};
+use super::{Condition, Driver, HookProcess, Look, Memory, Observed, Phase, ASK_LIMIT};
 use crate::allowlist::{self, flag, number, short_string, Keyed, MAX_PAYLOAD};
 use crate::bounded::{self, Failure};
 use crate::settings::Environment;
@@ -404,7 +404,7 @@ impl Driver for Orca {
         );
         // Whether anything was printed, to tell silence from nonsense.
         let heard = Cell::new(false);
-        let answer = bounded::try_stream(&mut command, LOOK_LIMIT, MAX_PAYLOAD, |out| {
+        let answer = bounded::try_stream(&mut command, ASK_LIMIT, MAX_PAYLOAD, |out| {
             let mut counting = Counting {
                 stream: out,
                 bytes: 0,
