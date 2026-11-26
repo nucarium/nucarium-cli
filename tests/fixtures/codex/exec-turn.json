@@ -1,0 +1,171 @@
+{
+ "recorded": "codex exec, the vendor's model, one shell call. Codex 0.172.0, 2026-11-26.",
+ "events": [
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "source": "startup"
+   }
+  },
+  {
+   "event": "UserPromptSubmit",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "UserPromptSubmit",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "prompt": "ZZLEAKZZ prompt the user typed this"
+   }
+  },
+  {
+   "event": "PreModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PreModelRequest"
+   }
+  },
+  {
+   "event": "PostModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PostModelRequest",
+    "status": "completed",
+    "error": null,
+    "token_usage": {
+     "input_tokens": 12949,
+     "cached_input_tokens": 10752,
+     "cache_write_input_tokens": 0,
+     "output_tokens": 26,
+     "reasoning_output_tokens": 0,
+     "total_tokens": 12975
+    },
+    "response_id": "ZZLEAKZZ response_id the user typed this"
+   }
+  },
+  {
+   "event": "PreToolUse",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PreToolUse",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "ZZLEAKZZ tool_input.command the user typed this"
+    },
+    "tool_use_id": "ZZLEAKZZ tool_use_id the user typed this"
+   }
+  },
+  {
+   "event": "PostToolUse",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PostToolUse",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "tool_name": "Bash",
+    "tool_input": {
+     "command": "ZZLEAKZZ tool_input.command the user typed this"
+    },
+    "tool_response": "ZZLEAKZZ tool_response the user typed this",
+    "tool_use_id": "ZZLEAKZZ tool_use_id the user typed this"
+   }
+  },
+  {
+   "event": "PreModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PreModelRequest"
+   }
+  },
+  {
+   "event": "PostModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PostModelRequest",
+    "status": "completed",
+    "error": null,
+    "token_usage": {
+     "input_tokens": 13011,
+     "cached_input_tokens": 12800,
+     "cache_write_input_tokens": 0,
+     "output_tokens": 16,
+     "reasoning_output_tokens": 0,
+     "total_tokens": 13027
+    },
+    "response_id": "ZZLEAKZZ response_id the user typed this"
+   }
+  },
+  {
+   "event": "Stop",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "Stop",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "stop_hook_active": false,
+    "last_assistant_message": "ZZLEAKZZ last_assistant_message the user typed this"
+   }
+  },
+  {
+   "event": "SessionEnd",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000001",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000001.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionEnd",
+    "reason": "other"
+   }
+  }
+ ]
+}

@@ -1,0 +1,108 @@
+{
+ "recorded": "codex exec signed out: every model request fails (the first and the twelfth of twelve attempts) and no Stop runs. Codex 0.172.0, 2026-11-26.",
+ "events": [
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "source": "startup"
+   }
+  },
+  {
+   "event": "UserPromptSubmit",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "UserPromptSubmit",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "bypassPermissions",
+    "prompt": "ZZLEAKZZ prompt the user typed this"
+   }
+  },
+  {
+   "event": "PreModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PreModelRequest"
+   }
+  },
+  {
+   "event": "PostModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 1,
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PostModelRequest",
+    "status": "failed",
+    "error": "unexpected status 401 Unauthorized: ZZLEAKZZ error Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: ZZLEAKZZ_cf_ray",
+    "token_usage": null,
+    "response_id": null
+   }
+  },
+  {
+   "event": "PreModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 12,
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PreModelRequest"
+   }
+  },
+  {
+   "event": "PostModelRequest",
+   "payload": {
+    "kind": "sampling",
+    "request_id": "ZZLEAKZZ request_id the user typed this",
+    "attempt_number": 12,
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "thread_id": "ZZLEAKZZ thread_id the user typed this",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "cwd": "{cwd}",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "model": "ZZLEAKZZ model the user typed this",
+    "hook_event_name": "PostModelRequest",
+    "status": "failed",
+    "error": "unexpected status 401 Unauthorized: ZZLEAKZZ error Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: ZZLEAKZZ_cf_ray, request id: ZZLEAKZZ_request_id",
+    "token_usage": null,
+    "response_id": null
+   }
+  },
+  {
+   "event": "SessionEnd",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000002",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000002.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionEnd",
+    "reason": "other"
+   }
+  }
+ ]
+}

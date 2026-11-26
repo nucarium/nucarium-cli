@@ -1037,3 +1037,444 @@ fn content_where_a_codex_hook_has_a_short_word_is_dropped_not_sent() {
     gate::tick(&rig);
     gate::assert_clean(&rig, &mock);
 }
+
+// ---- what Codex 0.172.0 sent ------------------------------------------
+
+/// The payloads recorded in the spike, one file per run, in the order Codex
+/// ran the hooks. Each payload's `cwd` is `{cwd}`, for the folder the test
+/// puts the session in.
+const RECORDED: [(&str, &str); 7] = [
+    ("exec-turn", include_str!("fixtures/codex/exec-turn.json")),
+    (
+        "exec-failed-turn",
+        include_str!("fixtures/codex/exec-failed-turn.json"),
+    ),
+    (
+        "hosted-approval-refused",
+        include_str!("fixtures/codex/hosted-approval-refused.json"),
+    ),
+    (
+        "hosted-question",
+        include_str!("fixtures/codex/hosted-question.json"),
+    ),
+    (
+        "hosted-approval-given",
+        include_str!("fixtures/codex/hosted-approval-given.json"),
+    ),
+    (
+        "hosted-protocol-decline",
+        include_str!("fixtures/codex/hosted-protocol-decline.json"),
+    ),
+    (
+        "from-schema",
+        include_str!("fixtures/codex/from-schema.json"),
+    ),
+];
+
+/// The run's session, and Codex's title session beside it in
+/// `hosted-approval-refused`, as the fixtures name them.
+const RUN_SESSION: &str = "00000000-0000-7000-8000-000000000003";
+const TITLE_SESSION: &str = "00000000-0000-7000-8000-000000000004";
+
+/// Words a recorded payload holds as Codex sent them, not as the sentinel.
+/// None of them may leave the hook either.
+const RECORDED_WORDS: [&str; 4] = ["Bash", QUESTION, "bypassPermissions", "sampling"];
+
+/// One run's hooks: each event's name and its payload, with `{cwd}` made the
+/// folder given.
+fn recorded(name: &str, cwd: &Path) -> Vec<(String, Value)> {
+    let text = RECORDED
+        .iter()
+        .find(|(run, _)| *run == name)
+        .map(|(_, text)| *text)
+        .expect("a recorded run");
+    let file: Value = serde_json::from_str(text).expect("the fixture is JSON");
+    file["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|event| {
+            let mut payload = event["payload"].clone();
+            for value in payload.as_object_mut().unwrap().values_mut() {
+                if value == "{cwd}" {
+                    *value = json!(cwd);
+                }
+            }
+            (event["event"].as_str().unwrap().to_string(), payload)
+        })
+        .collect()
+}
+
+/// Every file and folder name under the state folder, and what each file
+/// holds, as one string.
+fn state_text(rig: &Rig) -> String {
+    common::files_under(&rig.home.state_dir())
+        .into_iter()
+        .map(|(path, bytes)| format!("{}\n{}", path.display(), String::from_utf8_lossy(&bytes)))
+        .collect()
+}
+
+/// The records in the spool, as (session, type).
+fn spooled_pairs(rig: &Rig) -> Vec<(String, String)> {
+    rig.spooled()
+        .iter()
+        .map(|record| {
+            let event = &record["event"];
+            (
+                event["session_id"].as_str().unwrap().to_string(),
+                event["type"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn status_of_session(rig: &Rig, env: &str, session: &str) -> Option<Status> {
+    Store::new(&rig.home.state_dir())
+        .list(env)
+        .into_iter()
+        .find(|known| known.session_id == session)
+        .map(|known| known.status)
+}
+
+#[test]
+fn the_recorded_codex_fixtures_would_catch_a_leak() {
+    let cwd = PathBuf::from(format!("/home/agent/{MARK}_folder/work"));
+    let mut events = std::collections::BTreeSet::new();
+    let mut sources = std::collections::BTreeSet::new();
+    for (name, text) in RECORDED {
+        // Scrubbed: no folder of the scratch box, and no id of the vendor's.
+        for scrubbed in ["spike", "/home/agent/spike", "req_", "resp_", "-AKL"] {
+            assert!(!text.contains(scrubbed), "{name} still holds {scrubbed}");
+        }
+        let run = recorded(name, &cwd);
+        gate::assert_fixture_would_catch_a_leak(
+            text,
+            run.len(),
+            &["session_id", "cwd", "hook_event_name"],
+        );
+        for (event, payload) in &run {
+            assert_eq!(payload["hook_event_name"], *event, "{name}");
+            // Every payload carries the sentinel, if only in its folder.
+            assert!(payload.to_string().contains(MARK), "{name}: {event}");
+            // Every string Codex sent is the sentinel, or one of the words
+            // the payload carries as Codex sent them.
+            for (key, value) in payload.as_object().unwrap() {
+                let Some(text) = value.as_str() else { continue };
+                assert!(
+                    text.contains(MARK)
+                        || [
+                            "session_id",
+                            "hook_event_name",
+                            "permission_mode",
+                            "source",
+                            "kind",
+                            "status",
+                            "reason",
+                            "trigger",
+                            "tool_name",
+                        ]
+                        .contains(&key.as_str()),
+                    "{name}: {event}: {key} = {text}"
+                );
+            }
+            events.insert(event.clone());
+            if event == "SessionStart" {
+                sources.insert(payload["source"].as_str().unwrap().to_string());
+            }
+        }
+    }
+    // Every event Codex has, and every source a session can start from.
+    assert_eq!(events, EVENTS.iter().map(|e| e.to_string()).collect());
+    assert_eq!(sources, SOURCES.iter().map(|s| s.to_string()).collect());
+
+    // The shapes the spike found, as it found them.
+    let tools: Vec<(String, Value, Value)> = RECORDED
+        .iter()
+        .flat_map(|(name, _)| recorded(name, &cwd))
+        .filter(|(event, _)| event == "PostToolUse")
+        .map(|(_, payload)| {
+            (
+                payload["tool_name"].as_str().unwrap().to_string(),
+                payload["tool_response"].clone(),
+                payload["permission_mode"].clone(),
+            )
+        })
+        .collect();
+    assert!(tools
+        .iter()
+        .all(|(_, response, _)| response.as_str().is_some_and(|r| r.contains(MARK))));
+    assert!(tools.iter().any(|(tool, _, _)| tool == "Bash"));
+    assert!(tools.iter().any(|(tool, _, _)| tool == QUESTION));
+    let mode = |name: &str| -> Vec<Value> {
+        recorded(name, &cwd)
+            .into_iter()
+            .filter(|(_, payload)| payload["session_id"] != TITLE_SESSION)
+            .filter_map(|(_, payload)| payload.get("permission_mode").cloned())
+            .collect()
+    };
+    assert!(mode("exec-turn").iter().all(|m| m == "bypassPermissions"));
+    assert!(mode("hosted-question").iter().all(|m| m == "default"));
+    // The title session: no transcript, and no approvals.
+    let title: Vec<Value> = recorded("hosted-approval-refused", &cwd)
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .filter(|payload| payload["session_id"] == TITLE_SESSION)
+        .collect();
+    assert_eq!(title.len(), 6);
+    for payload in &title {
+        assert_eq!(payload["transcript_path"], Value::Null);
+        if let Some(mode) = payload.get("permission_mode") {
+            assert_eq!(mode, "bypassPermissions");
+        }
+    }
+}
+
+#[test]
+fn no_content_from_what_codex_sent_reaches_the_spool_the_local_state_or_the_wire() {
+    let (rig, cwd, codex) = gate_rig();
+    // A later Watch, so the agent's name goes out too.
+    let mock = gate::watch_taking(&["agent"]);
+    rig.sign_in(&mock.url);
+    let main = |kind: &str| (RUN_SESSION.to_string(), kind.to_string());
+    let title = |kind: &str| (TITLE_SESSION.to_string(), kind.to_string());
+    let each = |session: &str, kinds: &[&str]| -> Vec<(String, String)> {
+        kinds
+            .iter()
+            .map(|kind| (session.to_string(), kind.to_string()))
+            .collect()
+    };
+
+    let runs: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "exec-turn",
+            each(
+                "00000000-0000-7000-8000-000000000001",
+                &[
+                    "session_start",
+                    "user_prompt_submit",
+                    "activity",
+                    "stop",
+                    "session_end",
+                ],
+            ),
+        ),
+        // No hook says the turn failed.
+        (
+            "exec-failed-turn",
+            each(
+                "00000000-0000-7000-8000-000000000002",
+                &["session_start", "user_prompt_submit", "session_end"],
+            ),
+        ),
+        // The title session is recorded as a session of its own: nothing in
+        // its hooks tells it from an ephemeral one.
+        (
+            "hosted-approval-refused",
+            vec![
+                main("session_start"),
+                main("user_prompt_submit"),
+                title("session_start"),
+                title("user_prompt_submit"),
+                main("permission_prompt"),
+                title("stop"),
+                main("stop"),
+                title("session_end"),
+            ],
+        ),
+        (
+            "hosted-question",
+            vec![
+                main("user_prompt_submit"),
+                main("input_prompt"),
+                main("activity"),
+                main("stop"),
+                main("session_end"),
+            ],
+        ),
+        (
+            "hosted-approval-given",
+            each(
+                "00000000-0000-7000-8000-000000000005",
+                &[
+                    "session_start",
+                    "user_prompt_submit",
+                    "permission_prompt",
+                    "activity",
+                    "stop",
+                    "session_end",
+                ],
+            ),
+        ),
+        (
+            "hosted-protocol-decline",
+            each(
+                "00000000-0000-7000-8000-000000000006",
+                &[
+                    "session_start",
+                    "user_prompt_submit",
+                    "permission_prompt",
+                    "stop",
+                    "session_end",
+                ],
+            ),
+        ),
+        // A compaction is not a start, and nothing else here says anything.
+        (
+            "from-schema",
+            each(
+                "00000000-0000-7000-8000-000000000099",
+                &[
+                    "session_start",
+                    "session_start",
+                    "session_start",
+                    "session_start",
+                ],
+            ),
+        ),
+    ];
+    for (name, expected) in runs {
+        let before = rig.spooled().len();
+        // Through the hooks file `nucleated hooks print` writes, so its
+        // matcher decides which tools start a hook at all.
+        for (event, payload) in recorded(name, &cwd) {
+            codex.fire_with(&event, &cwd, &payload);
+        }
+        assert_eq!(spooled_pairs(&rig)[before..], expected[..], "{name}");
+    }
+    assert_eq!(
+        gate::leaks_on_disk(&rig.home.state_dir()),
+        Vec::<String>::new(),
+        "content in the spool"
+    );
+
+    gate::tick(&rig);
+    // The agent's name went out with the second heartbeat, and nothing else
+    // about Codex did.
+    let said = gate::said(&mock);
+    assert_eq!(said["environments"][0]["agent"], "codex");
+    assert!(said["environments"][0].get("agent_version").is_none());
+    assert!(said["environments"][0].get("login_expires_at").is_none());
+    gate::assert_clean(&rig, &mock);
+    let wire = mock.everything();
+    let state = state_text(&rig);
+    let shown = gate::status_shown(&rig).to_string();
+    for word in RECORDED_WORDS {
+        assert!(!wire.contains(word), "{word} on the wire");
+        assert!(!state.contains(word), "{word} in the local state");
+        assert!(!shown.contains(word), "{word} in nucleated status");
+    }
+    assert!(!rig.home.dir.join("codex-was-started").exists());
+}
+
+#[test]
+fn each_recorded_codex_run_leaves_its_session_where_codex_left_it() {
+    let rig = rig();
+    let mock = gate::watch();
+    rig.sign_in(&mock.url);
+    let cwd = rig.session("fix-login");
+    let codex = Codex::registered(&rig, &["--env", "client-a"], None);
+    // Fire a run's hooks up to the first that matches `until`, then tick.
+    let play = |run: &[(String, Value)], from: usize, until: &dyn Fn(&str, &Value) -> bool| {
+        let mut at = from;
+        while at < run.len() {
+            let (event, payload) = &run[at];
+            codex.fire_with(event, &cwd, payload);
+            at += 1;
+            if until(event, payload) {
+                break;
+            }
+        }
+        gate::tick(&rig);
+        at
+    };
+    let is = |name: &'static str| move |event: &str, _: &Value| event == name;
+    let status = |session: &str| status_of_session(&rig, "client-a", session);
+
+    // A question in Plan mode: needs input until it is answered.
+    let run = recorded("hosted-question", &cwd);
+    let at = play(&run, 0, &is("PreToolUse"));
+    assert_eq!(status(RUN_SESSION), Some(Status::NeedsInput));
+    let at = play(&run, at, &is("PostToolUse"));
+    assert_eq!(status(RUN_SESSION), Some(Status::Working));
+    let at = play(&run, at, &is("Stop"));
+    assert_eq!(status(RUN_SESSION), Some(Status::Idle));
+    play(&run, at, &is("SessionEnd"));
+    assert_eq!(status(RUN_SESSION), Some(Status::Ended));
+
+    // An approval refused with Esc ends the turn: Interrupt, idle.
+    let run = recorded("hosted-approval-refused", &cwd);
+    let at = play(&run, 0, &is("PermissionRequest"));
+    assert_eq!(status(RUN_SESSION), Some(Status::NeedsInput));
+    play(&run, at, &is("Interrupt"));
+    assert_eq!(status(RUN_SESSION), Some(Status::Idle));
+
+    // A decline that lets the turn go on: needs input until Stop.
+    let session = "00000000-0000-7000-8000-000000000006";
+    let run = recorded("hosted-protocol-decline", &cwd);
+    let at = play(&run, 0, &is("PermissionRequest"));
+    assert_eq!(status(session), Some(Status::NeedsInput));
+    let at = play(&run, at, &is("PostModelRequest"));
+    assert_eq!(status(session), Some(Status::NeedsInput));
+    play(&run, at, &is("Stop"));
+    assert_eq!(status(session), Some(Status::Idle));
+
+    // A turn that fails runs no Stop: the session stays working until it
+    // ends.
+    let session = "00000000-0000-7000-8000-000000000002";
+    let run = recorded("exec-failed-turn", &cwd);
+    let at = play(&run, 0, &|event, payload| {
+        event == "PostModelRequest" && payload["attempt_number"] == 12
+    });
+    assert_eq!(status(session), Some(Status::Working));
+    play(&run, at, &is("SessionEnd"));
+    assert_eq!(status(session), Some(Status::Ended));
+    gate::assert_clean(&rig, &mock);
+}
+
+#[test]
+fn a_codex_environment_names_its_agent_to_a_watch_that_takes_it_and_only_then() {
+    let (rig, ..) = mixed_box();
+    let later = gate::watch_taking(&["agent"]);
+    rig.sign_in(&later.url);
+    gate::tick(&rig);
+    let beats = later.to(contract::HEARTBEATS);
+    assert_eq!(beats.len(), 2);
+    // The first heartbeat is one every Watch takes; its answer named the
+    // field, so the next carries it, for each environment's own agent.
+    for environment in beats[0].json()["environments"].as_array().unwrap() {
+        assert!(environment.get("agent").is_none());
+    }
+    let agents: Vec<(String, String)> = beats[1].json()["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|environment| {
+            (
+                environment["env_id"].as_str().unwrap().to_string(),
+                environment["agent"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        agents,
+        [
+            ("client-a".to_string(), "claude-code".to_string()),
+            ("codex-a".to_string(), "codex".to_string()),
+            ("codex-b".to_string(), "codex".to_string()),
+        ]
+    );
+    gate::assert_clean(&rig, &later);
+
+    // A Watch that does not say it takes the field is never sent it.
+    let (rig, ..) = mixed_box();
+    let today = gate::watch();
+    rig.sign_in(&today.url);
+    gate::tick(&rig);
+    assert!(!today.to(contract::HEARTBEATS).is_empty());
+    for beat in today.to(contract::HEARTBEATS) {
+        for environment in beat.json()["environments"].as_array().unwrap() {
+            assert!(environment.get("agent").is_none());
+        }
+    }
+    gate::assert_clean(&rig, &today);
+}
