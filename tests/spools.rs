@@ -552,3 +552,52 @@ fn a_hooks_claim_crosses_inside_its_spool_record_and_nowhere_else() {
     gate::tick(&rig);
     assert_eq!(claims(&rig).len(), 1);
 }
+
+#[test]
+fn thousands_of_claims_a_container_left_behind_do_not_slow_the_daemon_down() {
+    // The same records, read by a box with no claims and by one holding
+    // thousands, each made for some session that never ends.
+    let pass = |planted: usize| {
+        let rig = box_with_t3_beside_the_login();
+        let driver = rig.home.state_dir().join("claims/client-a-t3");
+        for n in 0..planted {
+            let key = driver.join(format!("thread_{n:05}"));
+            std::fs::create_dir_all(&key).unwrap();
+            std::fs::write(key.join(format!("other{n}.json")), "client-a").unwrap();
+        }
+        let spool = rig.container_spool();
+        for n in 0..200 {
+            write(
+                &spool,
+                EventType::PermissionPrompt,
+                n,
+                session("client-a", &format!("s{n}")),
+            );
+        }
+        write(
+            &spool,
+            EventType::PermissionPrompt,
+            200,
+            Draft {
+                claim: Some(claim()),
+                ..session("client-a", "s200")
+            },
+        );
+        let started = Instant::now();
+        gate::tick(&rig);
+        let took = started.elapsed();
+        let store = Store::new(&rig.home.state_dir());
+        assert_eq!(store.list("client-a").len(), 201);
+        assert!(entries(&spool).is_empty());
+        (took, driver.join("thread_01HZX").exists())
+    };
+    let (plain, noted) = pass(0);
+    assert!(noted);
+    let (held, noted) = pass(10_000);
+    // No more claims fit beside the ones already held.
+    assert!(!noted);
+    assert!(
+        held < plain * 2 + Duration::from_millis(500),
+        "{held:?} against {plain:?}"
+    );
+}

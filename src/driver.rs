@@ -107,6 +107,13 @@ const CLAIM_UNHEARD: Duration = Duration::from_secs(90);
 /// A claim names at most this many folders: where its hook's session works,
 /// and the folders that one is in.
 const CLAIM_FOLDERS: usize = envelope::MAX_CLAIM_FOLDERS;
+/// A driver environment holds claims on at most this many of its sessions,
+/// as many as one look can report.
+const CLAIMED_KEYS: usize = answer::MAX_SESSIONS;
+/// At most this many hook-reported sessions hold a claim on one of a
+/// driver's sessions at once. A claim beyond either limit is not noted: the
+/// claims are the box's own, but a container chooses how many it makes.
+const CLAIMS_PER_KEY: usize = 8;
 
 /// What a driver's agent is doing, in the daemon's words. An adapter maps
 /// its driver's documented state words to these and says nothing for a word
@@ -601,29 +608,70 @@ fn folder_numbers(folder: &Path) -> Vec<String> {
 /// only as good as its hook's last word. The daemon calls this for a claim
 /// it read in a hook's spool record and counted ([`claim_counts`]). The
 /// claim keeps numbers made from where the hook's session works and never
-/// that folder's name.
+/// that folder's name. Beside it goes the session's note of which claim it
+/// holds ([`claim_index`]). A new claim past [`CLAIMED_KEYS`] or
+/// [`CLAIMS_PER_KEY`] is not noted.
 pub fn note_claim(state_dir: &Path, claim: &envelope::Claim, environment: &str, session_id: &str) {
     let fits = claim.fits() && valid_key(&claim.key);
     if !fits || !valid_env_key(environment) || !valid_session_id(session_id) {
         return;
     }
-    let path = claims_dir(state_dir, &claim.driver_env)
-        .join(&claim.key)
-        .join(format!("{session_id}.json"));
+    let driver = claims_dir(state_dir, &claim.driver_env);
+    let path = driver.join(&claim.key).join(format!("{session_id}.json"));
     let mut note = environment.to_string();
     if !claim.folders.is_empty() {
         note.push('\n');
         note.push_str(&claim.folders.join(" "));
     }
-    let renewed = fs::metadata(&path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age < CLAIM_RENEW);
-    if renewed && fs::read_to_string(&path).is_ok_and(|held| held == note) {
+    let meta = fs::symlink_metadata(&path).ok();
+    if meta.is_none() && !room_for(&driver, &claim.key) {
         return;
     }
-    let _ = paths::write_private(&path, note.as_bytes());
+    let renewed = meta
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < CLAIM_RENEW);
+    if !renewed || fs::read_to_string(&path).ok().as_deref() != Some(note.as_str()) {
+        let _ = paths::write_private(&path, note.as_bytes());
+    }
+    let index = claim_index(state_dir, environment, session_id);
+    let names = index_note(&claim.driver_env, &claim.key);
+    if fs::read_to_string(&index).ok().as_deref() != Some(names.as_str()) {
+        let _ = paths::write_private(&index, names.as_bytes());
+    }
+}
+
+/// Whether a new claim on `key` fits under [`CLAIMED_KEYS`] and
+/// [`CLAIMS_PER_KEY`]. It reads one folder, and only as far as its limit,
+/// however many entries that folder has.
+fn room_for(driver: &Path, key: &str) -> bool {
+    let under = |dir: &Path, limit: usize| {
+        fs::read_dir(dir).map_or(0, |entries| entries.take(limit).count()) < limit
+    };
+    let folder = driver.join(key);
+    if folder.is_dir() {
+        under(&folder, CLAIMS_PER_KEY)
+    } else {
+        under(driver, CLAIMED_KEYS)
+    }
+}
+
+/// Where the daemon notes which claim a hook-reported session holds, so that
+/// finding it is one small read however many claims there are.
+fn claim_index(state_dir: &Path, environment: &str, session_id: &str) -> PathBuf {
+    state_dir.join("claimed").join(environment).join(session_id)
+}
+
+fn index_note(driver_environment: &str, key: &str) -> String {
+    format!("{driver_environment}\n{key}")
+}
+
+/// Remove a session's note of its claim if it still names `names`: a later
+/// claim the session made elsewhere is left standing.
+fn forget_index(index: &Path, names: &str) {
+    if fs::read_to_string(index).is_ok_and(|held| held == names) {
+        let _ = fs::remove_file(index);
+    }
 }
 
 /// Ask the drivers in the hook's own container whether its agent is one of
@@ -693,28 +741,35 @@ pub fn standing_claim(
     environment: &str,
     session_id: &str,
 ) -> Option<(String, String)> {
-    if !valid_session_id(session_id) {
+    if !valid_env_key(environment) || !valid_session_id(session_id) {
         return None;
     }
-    let file = format!("{session_id}.json");
-    settings
-        .environments
-        .iter()
-        .filter(|driver| driver.driver_adapter().is_some())
-        .find_map(|driver| {
-            let keys = fs::read_dir(claims_dir(&settings.state_dir, &driver.name)).ok()?;
-            keys.flatten().find_map(|key| {
-                let name = key.file_name().to_string_lossy().to_string();
-                let note = fs::read_to_string(key.path().join(&file)).ok()?;
-                let held = note.lines().next()?.trim() == environment;
-                (held && valid_key(&name)).then(|| (driver.name.clone(), name))
-            })
-        })
+    let index = claim_index(&settings.state_dir, environment, session_id);
+    let names = fs::read_to_string(&index).ok()?;
+    let (driver_env, key) = names.split_once('\n')?;
+    let file = claims_dir(&settings.state_dir, driver_env)
+        .join(key)
+        .join(format!("{session_id}.json"));
+    let stands = settings
+        .environment(driver_env)
+        .is_some_and(|driver| driver.driver_adapter().is_some())
+        && valid_key(key)
+        && fs::read_to_string(file)
+            .is_ok_and(|note| note.lines().next().map(str::trim) == Some(environment));
+    if !stands {
+        let _ = fs::remove_file(&index);
+        return None;
+    }
+    Some((driver_env.to_string(), key.to_string()))
 }
 
 /// One live hook-reported session's claim on a driver's session.
 struct Claim {
     file: PathBuf,
+    /// The session's note of which claim it holds, and what that note says
+    /// while it is this one: see [`claim_index`].
+    index: PathBuf,
+    names: String,
     /// The hook has spoken from inside the driver's session within
     /// [`CLAIM_QUIET`].
     fresh: bool,
@@ -752,10 +807,12 @@ fn claimed(
             };
             let note = fs::read_to_string(claim.path()).unwrap_or_default();
             let mut lines = note.lines();
-            let session = lines.next().and_then(|environment| {
-                settings.environment(environment.trim())?;
-                Some(store.load(environment.trim(), session_id))
-            });
+            let environment = lines.next().unwrap_or_default().trim().to_string();
+            let session = settings
+                .environment(&environment)
+                .map(|_| store.load(&environment, session_id));
+            let index = claim_index(&settings.state_dir, &environment, session_id);
+            let names = index_note(driver_environment, &name);
             // The file is the box's own, and something else may have
             // written to it: a number is sixteen digits or it is nothing.
             let folders: Vec<String> = lines
@@ -785,12 +842,17 @@ fn claimed(
             match status {
                 Some(status) => live.push(Claim {
                     file: claim.path(),
+                    index,
+                    names,
                     fresh: age.is_none_or(|age| age < CLAIM_QUIET),
                     status,
                     folders,
                 }),
                 None => {
                     let _ = fs::remove_file(claim.path());
+                    if valid_env_key(&environment) && valid_session_id(session_id) {
+                        forget_index(&index, &names);
+                    }
                 }
             }
         }
@@ -847,6 +909,7 @@ fn claims_stand(
     }
     for claim in held {
         let _ = fs::remove_file(&claim.file);
+        forget_index(&claim.index, &claim.names);
     }
     doubts.remove(key);
     false
@@ -2603,6 +2666,78 @@ mod tests {
         assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
     }
 
+    #[test]
+    fn a_session_that_claims_again_elsewhere_is_found_by_its_latest_claim() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        claim(state, "t3", "thread-8", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-8".to_string()))
+        );
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-7".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_driver_holds_claims_on_no_more_sessions_than_a_look_reports() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        for n in 0..answer::MAX_SESSIONS + 10 {
+            claim(
+                state,
+                "t3",
+                &format!("thread-{n}"),
+                "client-a",
+                &format!("s{n}"),
+                None,
+            );
+        }
+        assert_eq!(
+            files_under(&claims_dir(state, "t3")).len(),
+            answer::MAX_SESSIONS
+        );
+        let past = answer::MAX_SESSIONS + 5;
+        assert_eq!(
+            standing_claim(&settings, "client-a", &format!("s{past}")),
+            None
+        );
+        // A session that holds a claim goes on renewing it.
+        claim(state, "t3", "thread-0", "client-a", "s0", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s0"),
+            Some(("t3".to_string(), "thread-0".to_string()))
+        );
+    }
+
+    #[test]
+    fn one_driver_session_holds_a_few_claims_and_no_more() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        for n in 0..100 {
+            claim(state, "t3", "thread-7", "client-a", &format!("s{n}"), None);
+        }
+        assert_eq!(files_under(&claims_dir(state, "t3")).len(), 8);
+        assert_eq!(standing_claim(&settings, "client-a", "s50"), None);
+    }
+
+    #[test]
+    fn a_claim_forgotten_with_its_ended_session_leaves_no_note_behind() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert!(!files_under(&state.join("claimed")).is_empty());
+        // Long past the grace, with no session the daemon ever applied.
+        let held = claimed(&settings, "t3", SystemTime::now() + 2 * CLAIM_GRACE);
+        assert!(held.is_empty());
+        assert!(files_under(&claims_dir(state, "t3")).is_empty());
+        assert!(files_under(&state.join("claimed")).is_empty());
+    }
+
     /// `settings` with every environment in `client-a`'s container.
     fn in_one_container(settings: &Settings) -> Settings {
         let mut settings = settings.clone();
@@ -2674,13 +2809,21 @@ mod tests {
         assert!(files_under(state).is_empty());
         claim(state, "t3", "t7", "client-a", "s1", None);
         claim(state, "t3", "t7", "client-a", "s1", None);
-        assert_eq!(files_under(state).len(), 1);
+        let sorted = |mut files: Vec<PathBuf>| {
+            files.sort();
+            files
+        };
+        let one = [
+            state.join("claimed/client-a/s1"),
+            claims_dir(state, "t3").join("t7/s1.json"),
+        ];
+        assert_eq!(sorted(files_under(state)), one);
         // A claim for an environment the config does not have stands for
         // nothing, and is cleared away.
         claim(state, "t3", "t8", "gone", "s2", None);
         let held = claimed(&settings, "t3", SystemTime::now());
         assert_eq!(held.into_keys().collect::<Vec<_>>(), ["t7"]);
-        assert_eq!(files_under(state).len(), 1);
+        assert_eq!(sorted(files_under(state)), one);
     }
 
     #[test]
