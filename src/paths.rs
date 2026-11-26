@@ -105,21 +105,64 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     written.with_context(|| format!("writing {}", path.display()))
 }
 
-/// The text of a small plain file that something else may have written: not
-/// through a link, not a pipe or a device, and not past `max` bytes. Any of
-/// those is an error, and nothing of it is read.
-pub fn read_plain(path: &Path, max: u64) -> std::io::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)?;
-    let meta = file.metadata()?;
+/// What a first look at a file found, before it is opened: enough to tell,
+/// once it is open, that the open reached that same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Looked {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+}
+
+/// Look at a file without opening it, and refuse it unless it is a regular
+/// file: a pipe, a device, a socket or a folder is never opened. With
+/// `follow`, a link is looked through and what it names must be a regular
+/// file; without it, a link is refused.
+pub fn look_regular(path: &Path, follow: bool) -> std::io::Result<Looked> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match follow {
+        true => fs::metadata(path)?,
+        false => fs::symlink_metadata(path)?,
+    };
     if !meta.is_file() {
         return Err(std::io::Error::other("not a plain file"));
     }
-    if meta.len() > max {
+    Ok(Looked {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+    })
+}
+
+/// Open, for reading, the file a [`look_regular`] looked at, and refuse it
+/// if what opened is not that same file: something swapped in between the
+/// look and the open is never read. Opening does not wait on anything.
+pub fn open_looked(path: &Path, follow: bool, looked: &Looked) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if (meta.dev(), meta.ino()) != (looked.dev, looked.ino) || !meta.is_file() {
+        return Err(std::io::Error::other("not the file that was looked at"));
+    }
+    Ok(file)
+}
+
+/// The text of a small plain file that something else may have written: not
+/// through a link, not a pipe or a device, and not past `max` bytes. Any of
+/// those is an error, and nothing of it is read; a pipe or a device is not
+/// even opened.
+pub fn read_plain(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let looked = look_regular(path, false)?;
+    if looked.len > max {
+        return Err(std::io::Error::other("too large"));
+    }
+    let file = open_looked(path, false, &looked)?;
+    if file.metadata()?.len() > max {
         return Err(std::io::Error::other("too large"));
     }
     let mut text = String::new();
@@ -145,7 +188,66 @@ pub fn mode(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_private;
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{Duration, Instant};
+
+    fn fifo(path: &Path) {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn a_pipe_or_a_device_is_refused_before_it_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe");
+        fifo(&pipe);
+        let device = dir.path().join("device");
+        symlink("/dev/zero", &device).unwrap();
+        let started = Instant::now();
+        for follow in [false, true] {
+            assert!(look_regular(&pipe, follow).is_err());
+            assert!(read_plain(&pipe, 64).is_err());
+        }
+        // Through a link only when asked, and then never to a device.
+        assert!(look_regular(&device, false).is_err());
+        assert!(look_regular(&device, true).is_err());
+        assert!(read_plain(&device, 64).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // A plain file reads, and a link to one only when following.
+        let plain = dir.path().join("plain");
+        fs::write(&plain, "text").unwrap();
+        let link = dir.path().join("link");
+        symlink(&plain, &link).unwrap();
+        assert_eq!(read_plain(&plain, 64).unwrap(), "text");
+        assert!(read_plain(&link, 64).is_err());
+        assert_eq!(look_regular(&link, true).unwrap().len, 4);
+    }
+
+    #[test]
+    fn a_file_swapped_in_between_the_look_and_the_open_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pointer");
+        fs::write(&path, "first").unwrap();
+        let looked = look_regular(&path, false).unwrap();
+        // Another file renamed into its place after the look.
+        let other = dir.path().join("other");
+        fs::write(&other, "second").unwrap();
+        fs::rename(&other, &path).unwrap();
+        assert!(open_looked(&path, false, &looked).is_err());
+        assert!(open_looked(&path, true, &looked).is_err());
+        // A pipe swapped in is refused too, without waiting for a writer.
+        fs::remove_file(&path).unwrap();
+        fifo(&path);
+        let started = Instant::now();
+        assert!(open_looked(&path, false, &looked).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // The file that was looked at opens.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, "third").unwrap();
+        let looked = look_regular(&path, false).unwrap();
+        assert!(open_looked(&path, false, &looked).is_ok());
+    }
 
     #[test]
     fn threads_writing_one_file_at_once_each_write_a_whole_file() {

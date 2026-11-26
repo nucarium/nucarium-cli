@@ -1,6 +1,7 @@
 //! Thin wrappers around the `git` command line, and the guarded way
 //! `nucleate` and the daemon run it.
 
+use crate::paths;
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -399,18 +400,13 @@ fn short_name(path: &Path) -> String {
     name.strip_suffix(".git").unwrap_or(&name).to_string()
 }
 
-/// A small file's text. Anything but a plain file is an error: opening a
-/// pipe a session planted in place of a pointer must not wait for a writer.
+/// A small file's text. Anything but a plain file is an error, and is not
+/// opened: a pipe a session planted in place of a pointer is never waited
+/// on, and a device never opened. A link is followed, to a plain file only.
 pub(crate) fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a plain file"));
-    }
+    let looked = paths::look_regular(path, true)?;
+    let file = paths::open_looked(path, true, &looked)?;
     let mut text = String::new();
     file.take(max).read_to_string(&mut text)?;
     Ok(text)
