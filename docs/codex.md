@@ -37,7 +37,11 @@ and no `codex` process is started, at a heartbeat or at any other time.
   field that can carry content. `PreCompact`, `PostCompact`,
   `SubagentStart`, `SubagentStop` and the `SessionStart` sources other than
   `startup` never fired; their fixtures are written from the generated
-  schemas at that tag.
+  schemas at that tag. One session was started from the ChatGPT phone app.
+- The hooks file as `nucleated hooks print --agent codex` writes it, run as
+  `/etc/codex/hooks.json` with this adapter on 0.172.0: a question in Plan
+  mode recorded `input_prompt` and then `activity`, a shell call started no
+  `PreToolUse` hook, and `codex exec --ephemeral` recorded nothing.
 - The hooks, auth, remote-connections and CLI reference pages under
   <https://learn.chatgpt.com/docs/>.
 
@@ -189,9 +193,9 @@ by a signal runs no `SessionEnd`.
 **The title session.** On a server, with the vendor's model, a session's
 first prompt starts a second, hidden session that writes the task's title.
 It never shows. Its hooks carry `transcript_path: null`, and nothing from a
-hook with a null `transcript_path` is recorded. Codex sends the same for
-`codex exec --ephemeral` (Codex's source at `rust-v0.172.0`), so an
-ephemeral `exec` never shows either.
+hook with a null `transcript_path` is recorded. `codex exec --ephemeral`
+sends the same, so an ephemeral `exec` never shows either. A session
+started from the phone app carries a `transcript_path` and shows.
 
 ## What Codex never reports
 

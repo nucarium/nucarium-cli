@@ -1043,7 +1043,7 @@ fn content_where_a_codex_hook_has_a_short_word_is_dropped_not_sent() {
 /// The payloads recorded in the spike, one file per run, in the order Codex
 /// ran the hooks. Each payload's `cwd` is `{cwd}`, for the folder the test
 /// puts the session in.
-const RECORDED: [(&str, &str); 7] = [
+const RECORDED: [(&str, &str); 8] = [
     ("exec-turn", include_str!("fixtures/codex/exec-turn.json")),
     (
         "exec-failed-turn",
@@ -1066,6 +1066,10 @@ const RECORDED: [(&str, &str); 7] = [
         include_str!("fixtures/codex/hosted-protocol-decline.json"),
     ),
     (
+        "hosted-phone",
+        include_str!("fixtures/codex/hosted-phone.json"),
+    ),
+    (
         "from-schema",
         include_str!("fixtures/codex/from-schema.json"),
     ),
@@ -1075,6 +1079,11 @@ const RECORDED: [(&str, &str); 7] = [
 /// `hosted-approval-refused`, as the fixtures name them.
 const RUN_SESSION: &str = "00000000-0000-7000-8000-000000000003";
 const TITLE_SESSION: &str = "00000000-0000-7000-8000-000000000004";
+
+/// A session started from the phone app, and its title session, in
+/// `hosted-phone`.
+const PHONE_SESSION: &str = "00000000-0000-7000-8000-000000000007";
+const PHONE_TITLE_SESSION: &str = "00000000-0000-7000-8000-000000000008";
 
 /// Words a recorded payload holds as Codex sent them, not as the sentinel.
 /// None of them may leave the hook either.
@@ -1312,6 +1321,14 @@ fn no_content_from_what_codex_sent_reaches_the_spool_the_local_state_or_the_wire
                 ],
             ),
         ),
+        // Started from a phone: it shows. Its title session does not.
+        (
+            "hosted-phone",
+            each(
+                PHONE_SESSION,
+                &["session_start", "user_prompt_submit", "stop"],
+            ),
+        ),
         // A compaction is not a start, and nothing else here says anything.
         (
             "from-schema",
@@ -1415,6 +1432,16 @@ fn each_recorded_codex_run_leaves_its_session_where_codex_left_it() {
     assert_eq!(status(session), Some(Status::NeedsInput));
     play(&run, at, &is("Stop"));
     assert_eq!(status(session), Some(Status::Idle));
+
+    // A session started from the phone app: working, then idle. Its title
+    // session, run to its end, never shows.
+    let run = recorded("hosted-phone", &cwd);
+    let at = play(&run, 0, &is("UserPromptSubmit"));
+    assert_eq!(status(PHONE_SESSION), Some(Status::Working));
+    play(&run, at, &|_, _| false);
+    assert_eq!(status(PHONE_SESSION), Some(Status::Idle));
+    assert_eq!(status(PHONE_TITLE_SESSION), None);
+    assert!(!mock.everything().contains(PHONE_TITLE_SESSION));
 
     // A turn that fails runs no Stop: the session stays working until it
     // ends.
