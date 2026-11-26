@@ -234,6 +234,7 @@ fn whatever_a_container_prints_in_place_of_an_answer_costs_one_short_look_and_sa
             Condition::BadReply,
         ),
     ];
+    let looks = hostile.len();
     for (what, script, expected) in hostile {
         rig.container_does("agent-env-client-a", &script);
         let (memory, took) = boxed.timed_look();
@@ -246,35 +247,36 @@ fn whatever_a_container_prints_in_place_of_an_answer_costs_one_short_look_and_sa
         assert_eq!(memory.sessions, remembered, "{what}");
         assert_eq!(rig.spooled().len(), spooled, "{what}");
     }
-    // The host asked the container to end each look it gave up on, by the
-    // look's own token, a moment after giving up on it.
-    let ends = || -> Vec<String> {
+    // For each look it gave up on, the host asked the engine which process
+    // is the container's first, to end the look from the box, and ran
+    // nothing more in the container.
+    let asked = || -> Vec<String> {
         rig.podman_calls()
             .into_iter()
-            .filter(|call| call.contains(" --end "))
+            .filter(|call| call.starts_with("container inspect "))
             .collect()
     };
     let waited = Instant::now();
-    while ends().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
+    while asked().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(50));
     }
     let calls = rig.podman_calls();
-    let ends = ends();
-    assert_eq!(ends.len(), 2, "{calls:?}");
-    for end in &ends {
-        let token = end.rsplit(' ').next().unwrap();
-        assert!(calls
-            .iter()
-            .any(|call| call.contains(&format!(" --token {token} "))));
-        assert!(end.starts_with(&format!(
-            "exec agent-env-client-a {} look --end ",
-            env!("CARGO_BIN_EXE_nucleated")
-        )));
+    let asked = asked();
+    assert_eq!(asked.len(), 2, "{calls:?}");
+    for call in &asked {
+        assert_eq!(
+            call,
+            "container inspect --format {{.State.Pid}} agent-env-client-a"
+        );
     }
-    // Nothing a hung look started is still running, on either side: the two
-    // looks, and the container hanging a request to end one as well.
+    let execs = calls
+        .iter()
+        .filter(|call| call.starts_with("exec "))
+        .count();
+    assert_eq!(execs, 2 + looks, "{calls:?}");
+    // Nothing a hung look started is still running.
     let pids = pids_in(&pid_file);
-    assert!(pids.len() >= 2, "{pids:?}");
+    assert_eq!(pids.len(), 2, "{pids:?}");
     for pid in pids {
         assert!(gone(&pid), "{pid} is still running");
     }
@@ -331,6 +333,75 @@ fn a_driver_that_hangs_inside_the_container_is_ended_there_with_everything_it_st
     for pid in &started {
         assert!(gone(pid), "{pid} is still running");
     }
+}
+
+/// A container that holds its look still, where the daemon's own `podman
+/// exec` cannot reach it: run, as the engine's monitor runs it, in a session
+/// of its own, then stopped, with its driver hung beneath it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_look_the_container_holds_still_is_ended_from_the_box_with_everything_it_started() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let home = &rig.home.dir;
+    let (client, looks, drivers) = (
+        home.join("client.pid"),
+        home.join("look.pids"),
+        home.join("driver.pids"),
+    );
+    stand_in(
+        &boxed.cli,
+        &format!(
+            "echo $$ >> '{drivers}'\nsleep 60 &\necho $! >> '{drivers}'\nwait",
+            drivers = drivers.display()
+        ),
+    );
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "echo $$ > '{client}'\nsetsid \"$@\" 2> /dev/null &\nlook=$!\necho $look >> '{looks}'\n\
+             sleep 1\nkill -STOP $look\nwait",
+            client = client.display(),
+            looks = looks.display(),
+        ),
+    );
+    // Another look on the box, held still as well, that is none of this
+    // one's business.
+    let mut other = rig.nucleated();
+    other
+        .env(
+            "NUCLEATED_CONFIG",
+            rig.home.config_file().with_file_name("inside.toml"),
+        )
+        .args(["look", "--env", "orca-b", "--token", "00112233445566aa"])
+        .stdout(std::process::Stdio::null());
+    let mut other = other.spawn().unwrap();
+    let other_pid = other.id().to_string();
+    assert!(std::process::Command::new("kill")
+        .args(["-STOP", &other_pid])
+        .status()
+        .unwrap()
+        .success());
+
+    let (memory, took) = boxed.timed_look();
+    assert_eq!(memory.condition, Condition::Timeout);
+    assert!(took < LOOK_LIMIT + Duration::from_millis(1500), "{took:?}");
+    let look = pids_in(&looks);
+    let driver = pids_in(&drivers);
+    assert_eq!((look.len(), driver.len()), (1, 2), "{look:?} {driver:?}");
+    for pid in pids_in(&client).iter().chain(&look).chain(&driver) {
+        assert!(gone(pid), "{pid} is still running");
+    }
+    assert!(alive(&other_pid), "another look was ended");
+    let _ = other.kill();
+    let _ = other.wait();
+    // Nothing more was run in the container to end it.
+    let calls = rig.podman_calls();
+    let execs = calls
+        .iter()
+        .filter(|call| call.starts_with("exec "))
+        .count();
+    assert_eq!(execs, 1, "{calls:?}");
 }
 
 #[test]
@@ -400,11 +471,10 @@ fn one_environments_hung_look_holds_up_no_other() {
     let started = Instant::now();
     let second_look_at_b = std::cell::Cell::new(None);
     // Until `orca-b` has been looked at twice, and the daemon has given up
-    // on `orca`'s first look and on its request to end it, and both are
-    // over.
+    // on `orca`'s first look and it is over.
     let hung_and_ended = || {
         let pids = pids_in(&pid_file);
-        pids.len() >= 2 && pids.iter().all(|pid| !alive(pid))
+        !pids.is_empty() && pids.iter().all(|pid| !alive(pid))
     };
     gate::daemon_until(rig, Some(&path), "two looks at orca-b", &|| {
         if second_look_at_b.get().is_none() && looks_at_b() >= 2 {

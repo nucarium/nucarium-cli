@@ -47,15 +47,12 @@ enum Command {
         /// The daemon's clock, in Unix milliseconds.
         #[arg(long, value_name = "MS")]
         now: Option<u64>,
-        /// Tells this look from another, for `--end`.
+        /// Tells this look from another, so that the daemon can end it.
         #[arg(long)]
         token: Option<String>,
         /// What the last look left, as the daemon keeps it.
         #[arg(long, value_name = "JSON")]
         previous: Option<String>,
-        /// End the look started with this token, and what it started.
-        #[arg(long, value_name = "TOKEN")]
-        end: Option<String>,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -384,18 +381,14 @@ fn main() -> ExitCode {
         now,
         token: _,
         previous,
-        end,
     } = &cli.command
     {
-        match end {
-            Some(token) => inside::end(token),
-            None => inside::run(&inside::Asked {
-                env: env.as_deref(),
-                within_ms: *within,
-                now_ms: *now,
-                previous: previous.as_deref(),
-            }),
-        }
+        inside::run(&inside::Asked {
+            env: env.as_deref(),
+            within_ms: *within,
+            now_ms: *now,
+            previous: previous.as_deref(),
+        });
         return ExitCode::SUCCESS;
     }
     match run(cli) {

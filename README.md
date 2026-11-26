@@ -764,9 +764,10 @@ container.
 Each environment's look runs on a thread of its own with its own deadline, so
 one that hangs holds up no other. Inside the container a look ends itself,
 and every program it started, after 4.5 seconds, and says it ran out of time.
-On the host it is over after 5: the daemon stops its `podman exec`, and asks
-the container, by the look's own token, to end whatever of it is still
-running there.
+On the host it is over after 5: the daemon stops its `podman exec`, and ends
+from the box whatever of the look is still running in the container, by the
+look's own token, with `SIGKILL`, which nothing in the container can block.
+Nothing more is run in the container to end it.
 
 | `driver` | Adapter | Its page |
 |---|---|---|

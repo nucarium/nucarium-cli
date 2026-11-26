@@ -13,7 +13,8 @@
 //! up it stops every program it started, prints that it ran out of time and
 //! leaves, so the `podman exec` that started it returns by itself and leaves
 //! nothing behind on either side. The host keeps a deadline of its own as
-//! well, a little longer.
+//! well, a little longer, and ends from the box a look the container held
+//! past it (see [`super::cut_off`]).
 
 use super::answer::{self, Answer};
 use super::{Condition, Memory, INNER_LIMIT};
@@ -114,87 +115,10 @@ fn previous(driver: &str, text: Option<&str>) -> Memory {
     memory
 }
 
-/// `nucleated look --end <token>`: end the look started with this token, and
-/// everything it started, inside this container. The host asks for this when
-/// its own deadline passed before the look had ended itself.
-pub fn end(token: &str) {
-    if valid_token(token) {
-        end_looks(token);
-    }
-}
-
-/// A look's token: sixteen lower-case hex digits.
+/// A look's token: sixteen lower-case hex digits. It tells one look from
+/// another on the box, so that the host can end one it gave up on.
 pub fn valid_token(token: &str) -> bool {
     crate::envelope::valid_folder_number(token)
-}
-
-#[cfg(target_os = "linux")]
-fn end_looks(token: &str) {
-    use std::collections::{BTreeMap, BTreeSet};
-    let own = std::process::id();
-    // Every process here: its parent, and its command line.
-    let mut parents: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut looks: BTreeSet<u32> = BTreeSet::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == own {
-            continue;
-        }
-        let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
-        // `pid (name) state ppid ...`: the name can hold anything, so the
-        // fields are counted from its closing bracket.
-        let parent = stat
-            .rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-            .and_then(|ppid| ppid.parse::<u32>().ok());
-        if let Some(parent) = parent {
-            parents.insert(pid, parent);
-        }
-        let line = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
-        let args: Vec<&[u8]> = line.split(|byte| *byte == 0).collect();
-        let is_look = args.iter().any(|arg| *arg == b"look")
-            && args
-                .windows(2)
-                .any(|pair| pair[0] == b"--token".as_slice() && pair[1] == token.as_bytes())
-            && !args.iter().any(|arg| *arg == b"--end");
-        if is_look {
-            looks.insert(pid);
-        }
-    }
-    // The looks, and everything they started, however deep.
-    let mut doomed = looks.clone();
-    loop {
-        let more: Vec<u32> = parents
-            .iter()
-            .filter(|(pid, parent)| doomed.contains(parent) && !doomed.contains(pid))
-            .map(|(pid, _)| *pid)
-            .collect();
-        if more.is_empty() {
-            break;
-        }
-        doomed.extend(more);
-    }
-    // Held still first, so none of them starts another meanwhile.
-    for signal in [libc::SIGSTOP, libc::SIGKILL] {
-        for pid in &doomed {
-            // SAFETY: `kill` takes no pointers. Each id was read from this
-            // container's own process list a moment ago.
-            unsafe {
-                libc::kill(*pid as libc::pid_t, signal);
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn end_looks(_token: &str) {
-    // Boxes are Linux. Elsewhere there is no container to end a look in.
 }
 
 #[cfg(test)]
@@ -229,39 +153,5 @@ mod tests {
         assert!(!valid_token("0123456789ABCDEF"));
         assert!(!valid_token("--token"));
         assert!(!valid_token(""));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn ending_a_look_ends_it_and_what_it_started_and_nothing_else() {
-        use std::process::Command;
-        let token = "00112233445566ff";
-        // A stand-in look: a program whose command line carries the token,
-        // with a child of its own.
-        let mut look = Command::new("sh")
-            .args(["-c", "sleep 30 & wait", "look", "look", "--token", token])
-            .spawn()
-            .unwrap();
-        let mut other = Command::new("sh")
-            .args([
-                "-c",
-                "sleep 30",
-                "look",
-                "look",
-                "--token",
-                "00112233445566aa",
-            ])
-            .spawn()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        end(token);
-        let status = look.wait().unwrap();
-        assert!(!status.success());
-        assert!(
-            other.try_wait().unwrap().is_none(),
-            "another look was ended"
-        );
-        let _ = other.kill();
-        let _ = other.wait();
     }
 }

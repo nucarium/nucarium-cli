@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub mod answer;
+pub mod cut_off;
 pub mod herdr_core;
 pub mod herdr_tui;
 pub mod inside;
@@ -72,8 +73,8 @@ pub const INNER_LIMIT: Duration = Duration::from_millis(4500);
 /// An adapter's own calls to its driver are given up after this long, inside
 /// [`INNER_LIMIT`] with room for reading the folders it names.
 pub const ASK_LIMIT: Duration = Duration::from_secs(4);
-/// How long the host gives its request to end a look that ran past
-/// [`LOOK_LIMIT`].
+/// How long the host gives the container engine to say which process is a
+/// container's first, to end a look that ran past [`LOOK_LIMIT`].
 const END_LIMIT: Duration = Duration::from_secs(2);
 /// A session a complete look does not list is ended once this many looks in
 /// a row have not listed it. One look can catch a driver between two states.
@@ -1275,7 +1276,7 @@ impl Runner {
             Ok(answer) => answer.check(driver),
             Err(Failure::Late) => {
                 // On a thread of its own: the look is over for the host now,
-                // and ending it in the container takes a moment more.
+                // and ending what is left of it takes a moment more.
                 if let Some(container) = environment.container() {
                     let (runner, container) = (self.clone(), container.to_string());
                     std::thread::spawn(move || runner.end(&container, &token));
@@ -1290,17 +1291,23 @@ impl Runner {
     }
 
     /// The host gave up on a look before it ended itself. Whatever of it is
-    /// still running in `container` is ended there, so that neither the
-    /// container nor the host keeps anything of it. A look on the host was a
-    /// child of this program, and has been stopped already.
+    /// still running in `container` is ended from the box, where the
+    /// container cannot hold it (see [`cut_off`]), so that neither the
+    /// container nor the host keeps anything of it. Nothing more is run in
+    /// the container. A look on the host was a child of this program, and
+    /// has been stopped already.
     fn end(&self, container: &str, token: &str) {
         let mut command = Command::new(&self.podman);
         command
-            .arg("exec")
-            .arg(container)
-            .arg(&self.program)
-            .args(["look", "--end", token]);
-        let _ = bounded::run(&mut command, END_LIMIT, 4096);
+            .args(["container", "inspect", "--format", "{{.State.Pid}}"])
+            .arg(container);
+        let Ok(said) = bounded::run(&mut command, END_LIMIT, 64) else {
+            return;
+        };
+        let first = String::from_utf8_lossy(&said.stdout).trim().parse::<u32>();
+        if let (true, Ok(first)) = (said.ok, first) {
+            cut_off::end(first, &self.program, token);
+        }
     }
 }
 

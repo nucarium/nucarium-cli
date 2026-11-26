@@ -747,7 +747,9 @@ impl Rig {
 /// [`Rig::podman_calls`], then runs the program on this machine as it would
 /// run in that container, with the container's config, unless the test has
 /// told the container to do something else ([`Rig::container_does`]).
-/// Anything but `exec` fails as podman does with a command it cannot run.
+/// `podman container inspect` names, as a container's first process, the
+/// process that asked: this machine is every container. Anything else fails
+/// as podman does with a command it cannot run.
 pub fn stand_in_podman(home: &Home) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let dir = home.dir.join("stand-ins");
@@ -756,6 +758,7 @@ pub fn stand_in_podman(home: &Home) -> PathBuf {
     let script = format!(
         "#!/bin/sh\n\
          echo \"$*\" >> '{calls}'\n\
+         if [ \"$1 $2\" = 'container inspect' ]; then echo \"$PPID\"; exit 0; fi\n\
          [ \"$1\" = exec ] || exit 125\n\
          shift\n\
          container=\"$1\"\n\
