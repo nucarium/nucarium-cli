@@ -400,18 +400,6 @@ fn short_name(path: &Path) -> String {
     name.strip_suffix(".git").unwrap_or(&name).to_string()
 }
 
-/// A small file's text. Anything but a plain file is an error, and is not
-/// opened: a pipe a session planted in place of a pointer is never waited
-/// on, and a device never opened. A link is followed, to a plain file only.
-pub(crate) fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
-    use std::io::Read;
-    let looked = paths::look_regular(path, true)?;
-    let file = paths::open_looked(path, true, &looked)?;
-    let mut text = String::new();
-    file.take(max).read_to_string(&mut text)?;
-    Ok(text)
-}
-
 impl Guarded {
     /// `repos` is the nucleus's `.repos`, or nothing for a driver's worktrees.
     pub fn new(repos: Option<PathBuf>, vetting: Vetting) -> Guarded {
@@ -467,6 +455,20 @@ impl Guarded {
         command
     }
 
+    /// The folder a resolved path is held inside, when there is one to
+    /// hold it to: the nucleus's repos, or the one of `within` it is in.
+    fn root_of(&self, path: &Path) -> Option<PathBuf> {
+        match &self.repos {
+            Some(repos) => repos.canonicalize().ok(),
+            None => self
+                .within
+                .as_ref()?
+                .iter()
+                .find(|folder| path.starts_with(folder))
+                .cloned(),
+        }
+    }
+
     fn inside(&self, path: &Path) -> bool {
         let Some(repos) = &self.repos else {
             return self
@@ -515,7 +517,15 @@ impl Guarded {
         if !self.inside(&git_dir) {
             return Err(Reason::Pointer);
         }
-        let common = match read_small(&git_dir.join("commondir"), MAX_POINTER) {
+        // Read from the git folder held open, reached from the folder it is
+        // held to without following a link: one swapped in on the way since
+        // it was resolved is refused, never read through.
+        let held = match self.root_of(&git_dir) {
+            Some(root) => paths::Dir::beneath(&root, &git_dir),
+            None => paths::Dir::open(&git_dir, false),
+        }
+        .map_err(|_| Reason::Pointer)?;
+        let common = match held.read_plain("commondir", MAX_POINTER) {
             Ok(text) => git_dir
                 .join(text.trim_end_matches(['\n', '\r']))
                 .canonicalize()
@@ -536,11 +546,16 @@ impl Guarded {
     /// above it.
     fn pin_worktree(&self, dir: &Path) -> Result<Pinned, Reason> {
         let dot = dir.join(".git");
-        let meta = std::fs::symlink_metadata(&dot).map_err(|_| Reason::Pointer)?;
-        if !meta.is_file() {
+        // The worktree held open, so that the `.git` looked at is the one
+        // read: never through a link, and never a pipe or a device.
+        let held = paths::Dir::open(dir, false).map_err(|_| Reason::Pointer)?;
+        let entry = held.look(".git").map_err(|_| Reason::Pointer)?;
+        if !entry.regular {
             return self.pin_git_dir(&dot);
         }
-        let text = read_small(&dot, MAX_POINTER).map_err(|_| Reason::Pointer)?;
+        let text = held
+            .read_plain(".git", MAX_POINTER)
+            .map_err(|_| Reason::Pointer)?;
         let target = text
             .lines()
             .next()
@@ -768,11 +783,23 @@ impl Git {
     }
 
     /// `git worktree repair` in a bare repo, so that the worktrees it has
-    /// registered point at it again after it moved. Run from inside the
-    /// bare repo itself: repair also repairs the folder it is run from, and
-    /// run from another repository's worktree it would point that one here.
-    pub fn repair_worktrees(&self, bare: &Path) -> Result<()> {
-        let args = ["worktree", "repair"];
+    /// registered point at it again after it moved, naming each of them.
+    /// Run from inside the bare repo itself: repair also repairs the folder
+    /// it is run from, and run from another repository's worktree it would
+    /// point that one here. Git writes a `.git` file into every worktree the
+    /// repo has registered, named or not: the caller has checked them all.
+    /// With none registered there is nothing to repair, and git is not run.
+    pub fn repair_worktrees(&self, bare: &Path, worktrees: &[PathBuf]) -> Result<()> {
+        if worktrees.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["worktree", "repair", "--"];
+        let named: Vec<&str> = worktrees.iter().filter_map(|path| path.to_str()).collect();
+        if named.len() != worktrees.len() {
+            bail!("a worktree's path is not text git can be given");
+        }
+        args.extend(named);
+        let args = args.as_slice();
         let out = match self {
             Git::Plain => {
                 let mut command = Command::new("git");
@@ -780,10 +807,10 @@ impl Git {
                 collect(command.current_dir(bare))?
             }
             Git::Guarded(guarded) => {
-                collect(guarded.prepare(bare, true, &args, None)?.current_dir(bare))?
+                collect(guarded.prepare(bare, true, args, None)?.current_dir(bare))?
             }
         };
-        checked(out, Some(("--git-dir", bare)), &args).map(drop)
+        checked(out, Some(("--git-dir", bare)), args).map(drop)
     }
 
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {

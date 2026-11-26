@@ -78,6 +78,16 @@ pub(crate) fn sharing_nucleus(settings: &Settings, environment: &Environment) ->
         .collect()
 }
 
+/// Whether a container can write this environment's nucleus: it runs in
+/// one, or shares its nucleus with one that does.
+pub(crate) fn contained(settings: &Settings, environment: &Environment) -> bool {
+    environment.container().is_some()
+        || sharing_nucleus(settings, environment)
+            .iter()
+            .filter_map(|name| settings.environment(name))
+            .any(|other| other.container().is_some())
+}
+
 /// One environment per nucleus: where two logins share a nucleus, a job over
 /// it runs once, under the first of them. An environment whose driver owns
 /// its worktrees has no nucleus, and no job ever runs over it.
@@ -162,7 +172,9 @@ pub fn run_job(
         Job::Refresh => {
             // A nucleus made before owner folders moves to them first.
             // One that fails says so, and the repos are fetched as they are.
-            let moved = match dry_run {
+            // Not one a container writes: the move has git repair its
+            // repos' worktrees, which a session can point anywhere.
+            let moved = match dry_run || contained(settings, environment) {
                 true => Vec::new(),
                 false => match workspace.move_to_owner_folders() {
                     Ok(moved) => moved.lines(),

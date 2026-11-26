@@ -656,6 +656,97 @@ fn refresh_moves_a_nucleus_made_before_owner_folders() {
     assert!(flat.is_dir());
 }
 
+/// Register, in `bare`, a worktree whose `gitdir` names a folder outside
+/// every environment, as a session can: what `git worktree repair` would
+/// write a `.git` file into. Returns that folder.
+fn register_outside(rig: &Rig, bare: &Path, id: &str) -> std::path::PathBuf {
+    let victim = rig.home.dir.join("victim");
+    fs::create_dir_all(&victim).unwrap();
+    let entry = bare.join("worktrees").join(id);
+    fs::create_dir_all(&entry).unwrap();
+    fs::write(entry.join("gitdir"), format!("{}/.git\n", victim.display())).unwrap();
+    fs::write(entry.join("commondir"), "../..\n").unwrap();
+    fs::write(entry.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    victim
+}
+
+/// What a refresh said it moved, repaired or left, as one text.
+fn moved_lines(report: &Value) -> String {
+    report["moved"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_repo_with_a_worktree_registered_outside_its_sessions_is_never_repaired() {
+    let rig = Rig::new();
+    let worktree = rig.session("fix-login");
+    // A move that stopped before its repair: the session's worktree still
+    // points at the flat place, which makes the repo one to repair.
+    let flat = rig.flatten();
+    let nested = rig.root.join(".repos/_/web.git");
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::rename(&flat, &nested).unwrap();
+    let victim = register_outside(&rig, &nested, "planted");
+
+    let report = housekeeping(&rig, &["refresh"]);
+    assert!(
+        !victim.join(".git").exists(),
+        "git wrote outside the nucleus"
+    );
+    assert!(fs::read_dir(&victim).unwrap().next().is_none());
+    let said = moved_lines(&report);
+    assert!(
+        said.contains(&format!("left {}", nested.display())) && said.contains("planted"),
+        "{said}"
+    );
+
+    // Without it (the refresh may have pruned it already), the repo is
+    // repaired as before.
+    let _ = fs::remove_dir_all(nested.join("worktrees/planted"));
+    let report = housekeeping(&rig, &["refresh"]);
+    assert!(
+        moved_lines(&report).contains(&format!("repaired the worktrees of {}", nested.display())),
+        "{report}"
+    );
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_flat_repo_with_a_worktree_registered_outside_its_sessions_is_not_moved() {
+    let rig = Rig::new();
+    let worktree = rig.session("fix-login");
+    let flat = rig.flatten();
+    let victim = register_outside(&rig, &flat, "planted");
+    let report = housekeeping(&rig, &["refresh"]);
+    assert!(flat.is_dir());
+    assert!(!rig.root.join(".repos/_/web.git").exists());
+    assert!(!victim.join(".git").exists());
+    let said = moved_lines(&report);
+    assert!(said.contains(&format!("left {}", flat.display())), "{said}");
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_nucleus_a_container_writes_is_left_in_the_flat_layout() {
+    let rig = Rig::new();
+    rig.configure_in_container("");
+    rig.session("fix-login");
+    let flat = rig.flatten();
+    let victim = register_outside(&rig, &flat, "planted");
+    let report = housekeeping(&rig, &["refresh"]);
+    assert!(report["moved"].is_null(), "{report}");
+    assert!(flat.is_dir());
+    assert!(!victim.join(".git").exists());
+}
+
 #[test]
 fn the_daemon_moves_a_nucleus_made_before_owner_folders_when_it_starts() {
     let rig = Rig::new();

@@ -224,13 +224,7 @@ fn commit_id(text: &str) -> bool {
 /// container can write there: the environment's own, resolved. Nothing for
 /// folders only the host writes, which are read as they are.
 fn held_to(settings: &Settings, environment: &Environment) -> Option<Vec<PathBuf>> {
-    let sharing = housekeeping::sharing_nucleus(settings, environment);
-    let contained = environment.container().is_some()
-        || sharing
-            .iter()
-            .filter_map(|name| settings.environment(name))
-            .any(|other| other.container().is_some());
-    contained.then(|| {
+    housekeeping::contained(settings, environment).then(|| {
         environment
             .own_folders()
             .iter()

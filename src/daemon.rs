@@ -1226,10 +1226,14 @@ impl Daemon {
 
 /// Move each nucleus made before owner folders to them, before anything
 /// else reads its repos. One that cannot be moved now is tried again by the
-/// next refresh.
+/// next refresh. A nucleus a container writes is left as it is: the move
+/// has git repair its repos' worktrees, which a session can point anywhere.
 fn move_to_owner_folders(settings: &Settings) {
     for environment in &settings.environments {
-        if environment.driver_owns_worktrees() || !environment.root.join(".repos").is_dir() {
+        if environment.driver_owns_worktrees()
+            || housekeeping::contained(settings, environment)
+            || !environment.root.join(".repos").is_dir()
+        {
             continue;
         }
         let workspace = housekeeping::workspace(settings, environment);

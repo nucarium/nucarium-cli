@@ -236,6 +236,21 @@ fn a_worktree_whose_common_folder_is_outside_the_nucleus_is_refused() {
     assert_refused_worktree(&rig, &marker, "pointer", &value);
 }
 
+#[test]
+fn a_worktree_whose_common_folder_pointer_is_a_link_is_refused_and_not_read() {
+    let rig = Rig::new();
+    let (_, marker) = marker_program(&rig);
+    session_with_work(&rig);
+    // A link in place of the pointer, to a file outside the nucleus that
+    // says just what the pointer said: read through the link it would pass.
+    let commondir = bare(&rig).join("worktrees/web/commondir");
+    let outside = rig.home.dir.join("elsewhere-commondir");
+    fs::copy(&commondir, &outside).unwrap();
+    fs::remove_file(&commondir).unwrap();
+    std::os::unix::fs::symlink(&outside, &commondir).unwrap();
+    assert_refused_worktree(&rig, &marker, "pointer", outside.to_str().unwrap());
+}
+
 /// As [`assert_refused`], for a repo whose own config is clean and one of
 /// whose worktrees points somewhere git must not be let go: the repo is
 /// fetched, and the worktree is neither snapshotted nor counted.

@@ -1298,10 +1298,11 @@ impl Workspace {
         pointer: &Path,
         repos: &'a [(PathBuf, Available)],
     ) -> Option<(&'a PathBuf, &'a Available)> {
-        if !fs::symlink_metadata(pointer).ok()?.is_file() {
-            return None;
-        }
-        let text = git::read_small(pointer, 4096).ok()?;
+        // Read from its folder held open: a regular file, the one looked at,
+        // never through a link and never a pipe or a device.
+        let held = paths::Dir::open(pointer.parent()?, false).ok()?;
+        let name = pointer.file_name()?.to_str()?;
+        let text = held.read_plain(name, 4096).ok()?;
         let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
         let target = PathBuf::from(target).canonicalize().ok()?;
         let worktrees = target.parent()?;

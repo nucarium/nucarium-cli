@@ -8,8 +8,8 @@
 use crate::agent::{self, Agent, Lifecycle};
 use crate::driver;
 use crate::envelope::{unix_ms, Draft, Envelope};
-use crate::git::read_small;
 use crate::github;
+use crate::paths;
 use crate::process;
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
@@ -138,6 +138,21 @@ pub(crate) struct Place {
     pub(crate) repos: Vec<String>,
     pub(crate) branch: Option<String>,
     pub(crate) workspace: Option<String>,
+}
+
+/// A small file's text, as the hook reads the files of its own container
+/// where it runs: a link is followed, by resolving the path first, and what
+/// it resolves to is looked at and then opened without following anything
+/// further, so a pipe or a device a link names is refused and never opened.
+/// A folder on the way swapped for a link meanwhile is not caught: the box
+/// never reads this way. Truncated at `max` bytes.
+fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
+    let path = path.canonicalize()?;
+    let looked = paths::look_regular(&path)?;
+    let file = paths::open_looked(&path, &looked)?;
+    let mut text = String::new();
+    file.take(max).read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// A nucleus session: the manifest names its repos and its branch.
