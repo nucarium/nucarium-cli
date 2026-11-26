@@ -277,7 +277,7 @@ fn links_pipes_and_files_too_big_to_be_records_are_not_read_and_hold_nothing_up(
     // The file that is no record is set aside where no container writes.
     assert_eq!(
         entries(&rig.home.state_dir().join("spools").join(".rejected")),
-        [format!("{broken}.json")]
+        [format!("{broken}@client-a.json")]
     );
     assert_eq!(gate::tick(&rig).state(true).events.rejected, 1);
 }

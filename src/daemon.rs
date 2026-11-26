@@ -88,6 +88,19 @@ struct Pending {
     spool: Spool,
 }
 
+impl Pending {
+    /// Set the event aside as the daemon read it, and remove its file.
+    fn set_aside(&self, event_id: &str) {
+        let record = Record {
+            event: self.envelope.clone(),
+            at_ms: self.at_ms,
+            workspace: None,
+            process: None,
+        };
+        self.spool.reject(event_id, Some(&record));
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatState {
     pub last_ok_at: Option<String>,
@@ -720,7 +733,7 @@ impl Daemon {
                 Err(Unread::Gone) => continue,
                 // Not a record this program wrote.
                 Err(Unread::NotARecord) => {
-                    spool.reject(&id);
+                    spool.reject(&id, None);
                     continue;
                 }
                 // A link, a pipe, something too big: no hook writes one.
@@ -1054,7 +1067,7 @@ impl Daemon {
                         continue;
                     };
                     if refused.contains(id.as_str()) {
-                        pending.spool.reject(id);
+                        pending.set_aside(id);
                     } else {
                         pending.spool.remove(id);
                     }
@@ -1074,7 +1087,7 @@ impl Daemon {
                 if let [only] = ids {
                     log("Watch refused an event; set aside");
                     if let Some(pending) = self.pending.remove(only) {
-                        pending.spool.reject(only);
+                        pending.set_aside(only);
                     }
                     return Ok(());
                 }
