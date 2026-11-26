@@ -66,8 +66,9 @@ impl Codex {
     const COMMAND: &'static str = "nucleated hook";
 
     /// The tool Codex calls to put a question to its owner, in Plan mode
-    /// among others. It asks for no approval, so no `PermissionRequest` runs
-    /// while it waits (codex-rs/core, `request_user_input`).
+    /// among others. Codex 0.172.0 ran no `PermissionRequest` while it
+    /// waited, only this tool's `PreToolUse` and, once it was answered, its
+    /// `PostToolUse`.
     const QUESTION_TOOL: &'static str = "request_user_input";
 
     /// The events to register, each with its time limit in seconds, whether
@@ -167,9 +168,9 @@ impl Agent for Codex {
                 (EventType::SessionEnd, hook.session_id, hook.cwd)
             }
             // The compaction, subagent and model-request events, and any
-            // name Codex adds later. `PostModelRequest` can
-            // say an attempt failed, but an attempt is not a turn and its
-            // `error` is a sentence, so it is not a failed stop.
+            // name Codex adds later. `PostModelRequest` can say an attempt
+            // failed, but an attempt is not a turn and its `error` is a
+            // sentence, so it is not a failed stop.
             _ => return None,
         };
         Some(Lifecycle {
