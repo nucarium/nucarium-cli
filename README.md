@@ -741,11 +741,32 @@ seconds, and needs neither the daemon nor the network: it only writes a file.
 ### Drivers
 
 A driver is a tool you run and steer agents with on the box: T3 Code, Herdr,
-Orca. It calls no hook, so the daemon asks it, on a thread of its own that a
-heartbeat never waits for. An environment with `driver` set is watched this
-way. Each agent the driver lists becomes a session of that environment, under
-the driver's own id for it, and each change in what the agent is doing becomes
-the same lifecycle event a hook would have recorded.
+Orca. It calls no hook, so the daemon has it looked at, on threads of its own
+that a heartbeat never waits for. An environment with `driver` set is watched
+this way. Each agent the driver lists becomes a session of that environment,
+under the driver's own id for it, and each change in what the agent is doing
+becomes the same lifecycle event a hook would have recorded.
+
+The daemon never asks a driver itself, and never opens a file, a socket or a
+folder a driver names. A look is the box's own `nucleated look`, run inside
+the environment's container with one `podman exec` (the recipe mounts the
+folder `nucleated` is in read-only at the same path in every container, so
+the daemon runs it by the path it runs from itself). There it reads the
+hook's config, asks the driver, reads the folders the driver names for repo
+names and branches, and prints one small versioned answer: ids, fixed words,
+numbers, repo names and branches held to Watch's patterns, a session folder's
+name, and numbers made from folders. The daemon holds every field of it to a
+fixed list, pattern or cap, and an answer with one field out of line, more
+than 256 sessions, or more than 1 MiB is no answer. An environment on the host
+has its look run the same way, as a program of the daemon's own, with no
+container.
+
+Each environment's look runs on a thread of its own with its own deadline, so
+one that hangs holds up no other. Inside the container a look ends itself,
+and every program it started, after 4.5 seconds, and says it ran out of time.
+On the host it is over after 5: the daemon stops its `podman exec`, and asks
+the container, by the look's own token, to end whatever of it is still
+running there.
 
 | `driver` | Adapter | Its page |
 |---|---|---|
@@ -760,8 +781,8 @@ What holds for every driver, whatever its adapter:
   driver's answer into a list of named fields and skips every other field
   unread. Nothing skipped is held, logged, written down or sent. What comes
   out of an adapter is an id, what the agent is doing, a short kind for a
-  failure, a time, a counter, and a folder that is used on the box to find a
-  repo's name and a branch and goes no further.
+  failure, a time, a counter, and a folder that is used inside the container
+  to find a repo's name and a branch and goes no further.
 - **Observe only.** An adapter sends its driver the read calls its page names
   and no other. Nothing in the daemon starts, stops or steers an agent, and
   nothing sends a driver a command.
@@ -773,7 +794,9 @@ What holds for every driver, whatever its adapter:
   `unreachable`, `timeout`, `rejected`, `no_token`, `unsupported`, `error` or
   `bad_reply`. `error` is a driver that answered the call with an error of
   its own, or whose program ran and said it failed; what the error says is
-  never read. The word is shown on the box and is not in the heartbeat: to
+  never read. A container that is not running, or a look that could not be
+  started in it, is `absent`; an answer that is not one is `bad_reply`, and
+  one of a newer version `unsupported`. The word is shown on the box and is not in the heartbeat: to
   Watch, a driver that has stopped answering is a live server whose sessions
   have stopped moving. A driver that keeps not answering is asked ever less
   often, up to once a minute.
