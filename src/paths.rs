@@ -105,6 +105,28 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     written.with_context(|| format!("writing {}", path.display()))
 }
 
+/// The text of a small plain file that something else may have written: not
+/// through a link, not a pipe or a device, and not past `max` bytes. Any of
+/// those is an error, and nothing of it is read.
+pub fn read_plain(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
+    if meta.len() > max {
+        return Err(std::io::Error::other("too large"));
+    }
+    let mut text = String::new();
+    file.take(max).read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// The permission bits of a file, where the platform has them.
 pub fn mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]

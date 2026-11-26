@@ -1550,16 +1550,8 @@ pub fn protected_roots(settings: &Settings) -> Vec<PathBuf> {
         .environments
         .iter()
         .filter(|environment| environment.driver_owns_worktrees())
-        .flat_map(|environment| {
-            let more = environment
-                .driver
-                .iter()
-                .flat_map(|driver| driver.dirs.iter());
-            std::iter::once(&environment.root)
-                .chain(more)
-                .map(|path| resolve(path))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|environment| environment.own_folders())
+        .map(|path| resolve(&path))
         .collect()
 }
 

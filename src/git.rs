@@ -361,6 +361,10 @@ pub struct Guarded {
     /// Nothing for the worktrees of a driver that owns them, which belong to
     /// repositories of the owner's choosing; their config is still vetted.
     repos: Option<PathBuf>,
+    /// Without `repos`, the folders every repository's git data must still
+    /// be in, when they are named: those of a driver in a container, which
+    /// is all of the box such a driver's worktrees can be of.
+    within: Option<Vec<PathBuf>>,
     vetting: Vetting,
 }
 
@@ -420,8 +424,21 @@ impl Guarded {
             github: None,
             logs: true,
             repos,
+            within: None,
             vetting,
         }
+    }
+
+    /// Hold the git data of repositories with no `.repos` to these folders.
+    /// A folder that is not there holds nothing.
+    pub fn held_to(mut self, folders: &[PathBuf]) -> Guarded {
+        self.within = Some(
+            folders
+                .iter()
+                .filter_map(|folder| folder.canonicalize().ok())
+                .collect(),
+        );
+        self
     }
 
     /// Log no refusal: the caller fails with it instead.
@@ -456,7 +473,10 @@ impl Guarded {
 
     fn inside(&self, path: &Path) -> bool {
         let Some(repos) = &self.repos else {
-            return true;
+            return self
+                .within
+                .as_ref()
+                .is_none_or(|within| within.iter().any(|folder| path.starts_with(folder)));
         };
         repos
             .canonicalize()

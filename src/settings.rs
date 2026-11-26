@@ -83,6 +83,13 @@ impl Environment {
             .is_some_and(|adapter| adapter.owns_worktrees())
     }
 
+    /// The folders this environment keeps work in: its root, and the
+    /// folders its driver keeps worktrees in.
+    pub fn own_folders(&self) -> Vec<PathBuf> {
+        let more = self.driver.iter().flat_map(|driver| driver.dirs.iter());
+        std::iter::once(&self.root).chain(more).cloned().collect()
+    }
+
     /// The container this environment runs in, named as its unit names it:
     /// the unit `agent-env-<name>.service` runs the container
     /// `agent-env-<name>`, as the recipe makes both. Nothing for an

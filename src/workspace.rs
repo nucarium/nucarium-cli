@@ -32,8 +32,11 @@ mod layout;
 pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
+/// The most of a manifest that is read. A session can write its own, and
+/// one with every repo of a nucleus in it is a few kilobytes.
+const MAX_MANIFEST: u64 = 1024 * 1024;
 /// Where the worktrees a session's subagents make go, inside the session.
-const SUBWORKTREES: &str = ".subworktrees";
+pub(crate) const SUBWORKTREES: &str = ".subworktrees";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -691,7 +694,9 @@ impl Workspace {
                 session.display()
             );
         }
-        let text = fs::read_to_string(&path)?;
+        // Not through a link, and not without end: the session wrote it.
+        let text = paths::read_plain(&path, MAX_MANIFEST)
+            .with_context(|| format!("reading {}", path.display()))?;
         let mut manifest: Manifest =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         // A repo moved to its owner folder since this was written.

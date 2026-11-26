@@ -103,15 +103,28 @@ pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
 /// them, and only their config is held to the allowlist.
 pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Workspace {
     let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
+    let mut guarded = git::Guarded::new(repos, settings.git_vetting);
+    // A driver in a container chooses its worktrees' repositories, but only
+    // among the folders of the environments in that container, which is all
+    // of the box it can see: the box holds them there.
+    if let Some(container) = environment
+        .container()
+        .filter(|_| environment.driver_owns_worktrees())
+    {
+        let folders: Vec<PathBuf> = settings
+            .environments
+            .iter()
+            .filter(|other| other.container() == Some(container))
+            .flat_map(Environment::own_folders)
+            .collect();
+        guarded = guarded.held_to(&folders);
+    }
     Workspace::new(config::for_root(
         &environment.root,
         environment.github_token_file.clone(),
         environment.branch_prefix.clone(),
     ))
-    .guarded(git::Git::Guarded(git::Guarded::new(
-        repos,
-        settings.git_vetting,
-    )))
+    .guarded(git::Git::Guarded(guarded))
 }
 
 /// Where GitHub's answers about merged commits are remembered, for cleanup

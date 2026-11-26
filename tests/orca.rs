@@ -59,7 +59,8 @@ impl Orca {
         let base = rig.home.dir.join(parent);
         let orca = Orca {
             workspaces: base.join("orca").join("workspaces"),
-            projects: base.join("projects"),
+            // In a folder of the container Orca runs in: the login's.
+            projects: rig.root.join(parent).join("projects"),
             cli: rig
                 .home
                 .dir

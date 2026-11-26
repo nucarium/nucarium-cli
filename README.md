@@ -1417,7 +1417,13 @@ there:
   then hands git a worktree's folders as it checked them, so a worktree's
   pointer changed after the check is not followed.
   The worktrees of a driver that owns them belong to repos of the owner's
-  choosing: their config is checked, and where they point is not.
+  choosing: their config is checked, and where they point is not, unless the
+  driver runs in a container. Then they must point inside the folders of the
+  environments in that container.
+- It follows no link in place of `.worktrees` or of a session folder, and
+  reads a session's manifest only up to 1 MiB and never through a link. For
+  an environment in a container, a worktree whose path leads out of the
+  environment's folders is not looked at, and its count is then unknown.
 - It refuses a worktree whose index names a submodule, checked out or not:
   `git add` and `git status` start git again inside one that is checked out,
   where that repository's own config would be read and not checked. A repo
