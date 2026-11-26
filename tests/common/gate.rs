@@ -28,8 +28,9 @@ pub fn mark(field: &str) -> String {
     format!("{MARK} {field} the user typed this")
 }
 
-/// Every field an event may carry. There is no other.
-pub const EVENT_FIELDS: [&str; 14] = [
+/// Every field an event may carry. There is no other. The last two go only
+/// to a Watch that takes `driver_session`.
+pub const EVENT_FIELDS: [&str; 16] = [
     "event_id",
     "env_id",
     "session_id",
@@ -44,6 +45,8 @@ pub const EVENT_FIELDS: [&str; 14] = [
     "unpushed_commits",
     "pull_requests",
     "client_ts",
+    "driver_env",
+    "driver_session",
 ];
 
 /// Every field a heartbeat may carry, at its top, about the machine, about
@@ -103,10 +106,18 @@ pub const WORKTREE_REPO_FIELDS: [&str; 6] = [
 ];
 pub const RESULT_FIELDS: [&str; 4] = ["id", "outcome", "detail", "finished_at"];
 
-/// Every key of every object the box sent is one this file lists, or, about
-/// an environment, a field ahead of the contract that the stand-in it was
-/// sent to had said it takes.
+/// Every key of every object the box sent is one this file lists, and a
+/// field ahead of the contract only when the stand-in it was sent to had
+/// said it takes it.
 pub fn only_listed_fields(mock: &Mock) {
+    let event_fields: Vec<&str> = EVENT_FIELDS
+        .iter()
+        .filter(|field| {
+            !["driver_env", "driver_session"].contains(field)
+                || mock.ahead.contains(&"driver_session")
+        })
+        .copied()
+        .collect();
     let environment_fields: Vec<&str> = ENVIRONMENT_FIELDS
         .iter()
         .chain(
@@ -132,7 +143,7 @@ pub fn only_listed_fields(mock: &Mock) {
         let body = request.json();
         assert_eq!(body.as_object().unwrap().len(), 1);
         for event in body["events"].as_array().unwrap() {
-            listed("an event", event, &EVENT_FIELDS);
+            listed("an event", event, &event_fields);
         }
     }
     for request in mock.to(contract::HEARTBEATS) {
@@ -216,7 +227,7 @@ pub fn watch() -> Mock {
 /// A stand-in for a later Watch, one that takes every field ahead of the
 /// contract and says so in its answer to a heartbeat.
 pub fn watch_ahead() -> Mock {
-    watch_taking(&contract::AHEAD)
+    watch_taking(&contract::ACCEPTS)
 }
 
 /// A stand-in for a Watch that takes the `ahead` fields beside the contract,

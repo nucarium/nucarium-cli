@@ -215,6 +215,12 @@ fn environment_report(
             .map(at_ms),
         now,
     )
+    .with_agent(
+        environment
+            .driver
+            .is_none()
+            .then_some(environment.agent.as_str()),
+    )
     .with_driver(
         environment
             .driver
@@ -342,8 +348,9 @@ pub struct Daemon {
     /// event for any other.
     named: BTreeSet<String>,
     /// The fields ahead of the contract that Watch, in its last answer to a
-    /// heartbeat, said it takes. None until it says so, and none again when
-    /// the token changes: nothing Watch would refuse is sent on a guess.
+    /// heartbeat, said it takes, of a heartbeat and of an event. None until
+    /// it says so, and none again when the token changes: nothing Watch
+    /// would refuse is sent on a guess.
     taken: Taken,
     /// Watch refused a heartbeat that carried such a field. Until this time
     /// none is sent, whatever Watch says it takes.
@@ -536,8 +543,9 @@ impl Daemon {
         self.setup_problems = problems;
     }
 
-    /// The fields ahead of the contract that may go in a heartbeat now: what
-    /// Watch last said it takes, and nothing while a refusal is being sat out.
+    /// The fields ahead of the contract that may go in a heartbeat or an
+    /// event now: what Watch last said it takes, and nothing while a refusal
+    /// is being sat out.
     fn taken_now(&self, now: Instant) -> Taken {
         match self.ahead_held_until {
             Some(until) if now < until => Taken::default(),
@@ -945,10 +953,14 @@ impl Daemon {
         let (Some(client), Some(token)) = (&self.client, &self.token) else {
             return Err(());
         };
-        let envelopes: Vec<&Envelope> = ids
+        // As this Watch takes them: never a claim, and a session's driver
+        // reference only once Watch has said it takes it.
+        let taken = self.taken_now(now);
+        let envelopes: Vec<Envelope> = ids
             .iter()
-            .filter_map(|id| self.pending.get(id).map(|p| &p.envelope))
+            .filter_map(|id| self.pending.get(id).map(|p| p.envelope.as_sent(&taken)))
             .collect();
+        let envelopes: Vec<&Envelope> = envelopes.iter().collect();
         match client.events(token, &envelopes) {
             Ok(ack) => {
                 let refused: BTreeSet<&str> =

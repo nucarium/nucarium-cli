@@ -302,12 +302,12 @@ fn watch_as_it_is_refuses_nothing_from_a_box_with_drivers_and_config_sync() {
     // What stayed behind is said on the box, by name.
     assert_eq!(
         state.heartbeat.withheld,
-        ["config_state", "driver", "driver_ref", "worktrees"]
+        ["agent", "config_state", "driver", "driver_ref", "worktrees"]
     );
     let shown = common::gate::status_shown(&rig);
     assert_eq!(
         shown["watch"]["withheld"],
-        json!(["config_state", "driver", "driver_ref", "worktrees"])
+        json!(["agent", "config_state", "driver", "driver_ref", "worktrees"])
     );
     assert_eq!(shown["environments"][1]["driver"]["link_ref"], "env_01HZX");
     assert_eq!(shown["environments"][0]["config"]["state"], "pending");
@@ -347,12 +347,17 @@ fn a_watch_that_says_it_takes_the_newer_fields_is_sent_them_without_waiting_a_be
     assert_eq!(beats.len(), 2);
     assert_eq!(
         ahead_in(&beats[1]),
-        ["config_state", "driver", "driver_ref"]
+        ["agent", "config_state", "driver", "driver_ref"]
     );
     let said = beats[1].json();
     assert_eq!(said["environments"][0]["config_state"], "pending");
+    // A login's environment names its agent; a driver's names its driver
+    // and no agent.
+    assert_eq!(said["environments"][0]["agent"], "claude-code");
+    assert!(said["environments"][0].get("driver").is_none());
     assert_eq!(said["environments"][1]["driver"], "t3code");
     assert_eq!(said["environments"][1]["driver_ref"], "env_01HZX");
+    assert!(said["environments"][1].get("agent").is_none());
     assert_eq!(daemon.state(true).heartbeat.withheld, Vec::<String>::new());
     assert_eq!(contract::violations(&mock), Vec::<String>::new());
     daemon.tick(start + secs(61));
@@ -409,7 +414,10 @@ fn plan_usage_is_the_last_good_reading_and_goes_only_to_a_watch_that_takes_it() 
     plain.tick(start + Duration::from_millis(500));
     let beats = mock.to(contract::HEARTBEATS);
     assert!(beats.iter().all(|beat| ahead_in(beat).is_empty()));
-    assert_eq!(plain.state(true).heartbeat.withheld, ["usage", "worktrees"]);
+    assert_eq!(
+        plain.state(true).heartbeat.withheld,
+        ["agent", "usage", "worktrees"]
+    );
     assert_eq!(contract::violations(&mock), Vec::<String>::new());
 
     // A Watch that takes it is sent the reading, with the time it was read.
@@ -488,7 +496,7 @@ fn a_watch_that_refuses_a_field_it_said_it_takes_still_hears_from_the_box() {
     assert_eq!(state.heartbeat.last_error, None);
     assert_eq!(
         state.heartbeat.withheld,
-        ["config_state", "driver", "driver_ref", "worktrees"]
+        ["agent", "config_state", "driver", "driver_ref", "worktrees"]
     );
     // The box never went dark, and what waits on its owner left it.
     assert_eq!(mock.to(contract::EVENTS).len(), 1);
@@ -1842,4 +1850,132 @@ fn a_process_found_running_before_a_restart_is_found_gone_after_it() {
         types(&batches(&mock).concat()),
         ["user_prompt_submit", "session_end"]
     );
+}
+
+/// A waiting session that runs inside a driver's session, written to the
+/// spool with its driver reference and the hook's claim.
+fn spool_in_a_driver(rig: &Rig, session: &str) {
+    let now = SystemTime::now();
+    let draft = Draft {
+        env_id: "client-a".into(),
+        session_id: session.into(),
+        driver_env: Some("client-a-t3".into()),
+        driver_session: Some("thread_01HZX".into()),
+        claim: Some(nucleate::envelope::Claim {
+            driver_env: "client-a-t3".into(),
+            key: "thread_01HZX".into(),
+            folders: vec!["0123456789abcdef".into()],
+        }),
+        ..Draft::default()
+    };
+    Spool::new(&rig.spool_dir())
+        .write(&Record {
+            event: Envelope::new(EventType::PermissionPrompt, draft, now).unwrap(),
+            at_ms: unix_ms(now),
+            workspace: None,
+            process: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_claim_never_leaves_the_box_and_a_driver_reference_goes_only_to_a_watch_that_takes_it() {
+    // Watch as it is: the event goes, without the reference and the claim.
+    let rig = Rig::new();
+    let mock = common::gate::watch();
+    rig.sign_in(&mock.url);
+    spool_in_a_driver(&rig, "s1");
+    common::gate::tick(&rig);
+    let sent = batches(&mock).concat();
+    assert_eq!(types(&sent), ["permission_prompt"]);
+    for field in ["claim", "driver_env", "driver_session"] {
+        assert!(sent[0].get(field).is_none(), "{field}: {}", sent[0]);
+    }
+    common::gate::only_listed_fields(&mock);
+
+    // A Watch that takes it is sent the reference, whole, and still no claim.
+    let rig = Rig::new();
+    let mock = common::gate::watch_taking(&["driver_session"]);
+    rig.sign_in(&mock.url);
+    spool_in_a_driver(&rig, "s1");
+    common::gate::tick(&rig);
+    let sent = batches(&mock).concat();
+    assert_eq!(types(&sent), ["permission_prompt"]);
+    assert_eq!(sent[0]["driver_env"], "client-a-t3");
+    assert_eq!(sent[0]["driver_session"], "thread_01HZX");
+    assert!(sent[0].get("claim").is_none(), "{}", sent[0]);
+    common::gate::only_listed_fields(&mock);
+}
+
+#[test]
+fn the_stand_in_holds_the_new_fields_to_the_contract() {
+    let beat = |environment: Value| Request {
+        method: "POST".into(),
+        path: contract::HEARTBEATS.into(),
+        headers: Vec::new(),
+        body: json!({
+            "machine": { "disk_used_pct": 1.0, "load_1m": 0.1, "uptime_s": 10 },
+            "environments": [environment],
+            "client_ts": "2026-11-19T12:00:00.000Z",
+        })
+        .to_string(),
+        nth: 0,
+    };
+    let refused =
+        |request: &Request, ahead: &[&str]| contract::violation_taking(request, ahead).is_some();
+    let login =
+        |agent: &str| beat(json!({ "env_id": "client-a", "server_alive": true, "agent": agent }));
+    // An agent only to a Watch that takes it, and only as a short word.
+    assert!(refused(&login("codex"), &[]));
+    assert!(!refused(&login("codex"), &["agent"]));
+    assert!(!refused(&login(&"a".repeat(32)), &["agent"]));
+    for not_one in [
+        "a".repeat(33),
+        "Codex CLI".into(),
+        "-codex".into(),
+        String::new(),
+    ] {
+        assert!(refused(&login(&not_one), &["agent"]), "{not_one}");
+    }
+    // An event's driver reference is no environment field.
+    assert!(refused(
+        &beat(json!({ "env_id": "client-a", "server_alive": true, "driver_session": "t1" })),
+        &contract::ACCEPTS,
+    ));
+
+    let event = |extra: Value| {
+        let mut event = json!({
+            "event_id": "0193f2a0-0000-7000-8000-000000000000", "env_id": "client-a",
+            "session_id": "s1", "type": "stop", "client_ts": "2026-11-19T12:00:00.000Z",
+        });
+        for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+            event[key] = value;
+        }
+        Request {
+            method: "POST".into(),
+            path: contract::EVENTS.into(),
+            headers: Vec::new(),
+            body: json!({ "events": [event] }).to_string(),
+            nth: 0,
+        }
+    };
+    let both = event(json!({ "driver_env": "client-a-t3", "driver_session": "thread_01HZX:2" }));
+    assert!(!refused(&event(json!({})), &[]));
+    assert!(refused(&both, &[]));
+    assert!(refused(&both, &["agent", "driver"]));
+    assert!(!refused(&both, &["driver_session"]));
+    // Both or neither, each to its pattern.
+    for half in [
+        json!({ "driver_env": "client-a-t3" }),
+        json!({ "driver_session": "thread_01HZX" }),
+        json!({ "driver_env": "Client A", "driver_session": "thread_01HZX" }),
+        json!({ "driver_env": "client-a-t3", "driver_session": "a thread" }),
+        json!({ "driver_env": "client-a-t3", "driver_session": "t".repeat(129) }),
+    ] {
+        assert!(refused(&event(half.clone()), &["driver_session"]), "{half}");
+    }
+    // A claim is refused by every Watch.
+    let claimed =
+        event(json!({ "claim": { "driver_env": "client-a-t3", "key": "k", "folders": [] } }));
+    assert!(refused(&claimed, &contract::ACCEPTS));
 }

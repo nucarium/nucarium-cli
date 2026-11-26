@@ -97,11 +97,14 @@ fn the_setup_stays_on_the_box_until_watch_says_it_takes_it() {
     }
     let state = daemon.state(true);
     assert_eq!(state.heartbeat.last_error, None);
-    assert_eq!(state.heartbeat.withheld, ["setup", "worktrees"]);
+    assert_eq!(state.heartbeat.withheld, ["agent", "setup", "worktrees"]);
 
     // On the box it is shown all the same, and so is its being held back.
     let shown = gate::status_shown(&rig);
-    assert_eq!(shown["watch"]["withheld"], json!(["setup", "worktrees"]));
+    assert_eq!(
+        shown["watch"]["withheld"],
+        json!(["agent", "setup", "worktrees"])
+    );
     let setup = &shown["environments"][0]["setup"];
     assert_eq!(setup["network"], "full");
     assert_eq!(setup["repos"], json!(["your-org/web", "your-org/api"]));
@@ -110,7 +113,7 @@ fn the_setup_stays_on_the_box_until_watch_says_it_takes_it() {
     let text = common::run(rig.nucleated().arg("status"), "");
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(
-        text.contains("not sent, Watch does not take it yet: setup"),
+        text.contains("not sent, Watch does not take it yet: agent, setup"),
         "{text}"
     );
     assert!(

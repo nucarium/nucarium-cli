@@ -6,7 +6,8 @@
 //! not fit is left out, and an envelope whose required fields do not fit is
 //! never made.
 
-use serde::{Deserialize, Serialize};
+use crate::watch::Taken;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A limit reset time is sent only when it lies this far around now: Watch
@@ -20,6 +21,8 @@ pub const MAX_COMMITS: u32 = 100_000;
 pub const MAX_UNCOMMITTED_REPOS: u32 = 32;
 pub const MAX_UNPUSHED_COMMITS: u32 = 100_000;
 pub const MAX_PULL_REQUESTS: usize = 16;
+/// The most folder numbers a claim holds.
+pub const MAX_CLAIM_FOLDERS: usize = 64;
 
 /// What happened to a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +88,73 @@ pub struct Envelope {
     /// says there are none; absent says the box could not find out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<String>>,
+    /// The driver environment, on the same machine, whose session this one
+    /// runs inside. Only beside `driver_session`, and only from the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_env: Option<String>,
+    /// The driver's own id for the session this one runs inside. Only
+    /// beside `driver_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_session: Option<String>,
+    /// What the hook says about a driver's session its agent runs in. It
+    /// stays in the spool and is never sent. One that does not fit is read
+    /// as none, and the record with it is kept.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "claim_that_fits"
+    )]
+    pub claim: Option<Claim>,
     pub client_ts: String,
+}
+
+/// A hook's word that its agent runs inside a driver's session: the driver
+/// environment, the key the driver knows the session by, and the numbers of
+/// the folders the hook's session works in, made with `folder_number`. No
+/// folder's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Claim {
+    pub driver_env: String,
+    pub key: String,
+    pub folders: Vec<String>,
+}
+
+impl Claim {
+    /// An environment key, a session id, and at most [`MAX_CLAIM_FOLDERS`]
+    /// folder numbers, each sixteen lower-case hex digits.
+    pub fn fits(&self) -> bool {
+        valid_env_key(&self.driver_env)
+            && valid_session_id(&self.key)
+            && self.folders.len() <= MAX_CLAIM_FOLDERS
+            && self
+                .folders
+                .iter()
+                .all(|folder| valid_folder_number(folder))
+    }
+}
+
+/// A claim, read without ever failing the record it is part of: what is not
+/// a claim, or does not fit, is none.
+fn claim_that_fits<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Claim>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Claim>(value)
+        .ok()
+        .filter(Claim::fits))
+}
+
+/// Both of a session's driver reference when both fit, and nothing else:
+/// one without the other is none.
+fn driver_pair(
+    driver_env: Option<String>,
+    driver_session: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match (driver_env, driver_session) {
+        (Some(env), Some(session)) if valid_env_key(&env) && valid_session_id(&session) => {
+            (Some(env), Some(session))
+        }
+        _ => (None, None),
+    }
 }
 
 /// What the box knows about an event before it is checked.
@@ -106,6 +175,10 @@ pub struct Draft {
     pub uncommitted_repos: Option<u32>,
     pub unpushed_commits: Option<u32>,
     pub pull_requests: Option<Vec<String>>,
+    /// A session's driver reference: both or neither.
+    pub driver_env: Option<String>,
+    pub driver_session: Option<String>,
+    pub claim: Option<Claim>,
 }
 
 impl Envelope {
@@ -134,6 +207,7 @@ impl Envelope {
             kept.truncate(MAX_PULL_REQUESTS);
             kept
         });
+        let (driver_env, driver_session) = driver_pair(draft.driver_env, draft.driver_session);
         Some(Envelope {
             event_id: uuid7(now),
             env_id: draft.env_id,
@@ -159,8 +233,27 @@ impl Envelope {
                 .unpushed_commits
                 .filter(|n| outcome && *n <= MAX_UNPUSHED_COMMITS),
             pull_requests,
+            driver_env,
+            driver_session,
+            claim: draft.claim.filter(Claim::fits),
             client_ts: rfc3339(now),
         })
+    }
+
+    /// The envelope as it goes to a Watch that takes `taken`: never the
+    /// claim, and the session's driver reference only to a Watch that takes
+    /// `driver_session`, and only whole.
+    pub fn as_sent(&self, taken: &Taken) -> Envelope {
+        let (driver_env, driver_session) = match taken.takes("driver_session") {
+            true => driver_pair(self.driver_env.clone(), self.driver_session.clone()),
+            false => (None, None),
+        };
+        Envelope {
+            driver_env,
+            driver_session,
+            claim: None,
+            ..self.clone()
+        }
     }
 
     /// True when every field still fits the shape Watch accepts. Used on
@@ -230,6 +323,14 @@ pub fn valid_event_id(value: &str) -> bool {
 /// `^[A-Za-z0-9._:-]{1,128}$`
 pub fn valid_session_id(value: &str) -> bool {
     all(value, 1, 128, |c| word(c) || c == b':')
+}
+
+/// `^[0-9a-f]{16}$`: a folder number as `folder_number` makes one.
+pub fn valid_folder_number(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
 /// `^[A-Za-z0-9._-]{1,100}(/[A-Za-z0-9._-]{1,100})?$`
@@ -671,6 +772,149 @@ mod tests {
         // An address on a repo the event does not name costs Watch the batch.
         assert!(!broken(|e| e.repos = Some(vec!["your-org/api".into()])));
         assert!(!broken(|e| e.repos = None));
+    }
+
+    fn in_a_driver(change: impl Fn(&mut Draft)) -> Envelope {
+        let mut draft = Draft {
+            env_id: "client-a".into(),
+            session_id: "s1".into(),
+            driver_env: Some("client-a-t3".into()),
+            driver_session: Some("thread_01HZX:2".into()),
+            claim: Some(Claim {
+                driver_env: "client-a-t3".into(),
+                key: "thread_01HZX".into(),
+                folders: vec!["0123456789abcdef".into(), "fedcba9876543210".into()],
+            }),
+            ..Draft::default()
+        };
+        change(&mut draft);
+        Envelope::new(EventType::Stop, draft, UNIX_EPOCH).unwrap()
+    }
+
+    fn taking(names: &[&str]) -> Taken {
+        Taken::from_names(
+            &names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn a_sessions_driver_reference_is_both_fields_or_neither() {
+        let both = in_a_driver(|_| {});
+        assert_eq!(both.driver_env.as_deref(), Some("client-a-t3"));
+        assert_eq!(both.driver_session.as_deref(), Some("thread_01HZX:2"));
+        assert!(both.is_valid());
+        // One without the other, or one that does not fit, takes both with it.
+        for change in [
+            (|draft: &mut Draft| draft.driver_env = None) as fn(&mut Draft),
+            |draft| draft.driver_session = None,
+            |draft| draft.driver_env = Some("Client A's T3".into()),
+            |draft| draft.driver_env = Some("a".repeat(65)),
+            |draft| draft.driver_session = Some("the thread about the login page".into()),
+            |draft| draft.driver_session = Some("t".repeat(129)),
+        ] {
+            let envelope = in_a_driver(change);
+            assert_eq!(envelope.driver_env, None);
+            assert_eq!(envelope.driver_session, None);
+            assert!(envelope.is_valid());
+        }
+        let none = in_a_driver(|draft| {
+            draft.driver_env = None;
+            draft.driver_session = None;
+        });
+        let written = serde_json::to_value(&none).unwrap();
+        assert!(written.get("driver_env").is_none());
+        assert!(written.get("driver_session").is_none());
+    }
+
+    #[test]
+    fn a_claim_stays_in_the_spool_and_one_that_does_not_fit_is_dropped() {
+        let envelope = in_a_driver(|_| {});
+        assert_eq!(
+            serde_json::to_value(&envelope).unwrap()["claim"],
+            serde_json::json!({
+                "driver_env": "client-a-t3", "key": "thread_01HZX",
+                "folders": ["0123456789abcdef", "fedcba9876543210"],
+            })
+        );
+        let folders = |folders: Vec<String>| {
+            in_a_driver(move |draft| draft.claim.as_mut().unwrap().folders = folders.clone()).claim
+        };
+        assert!(folders(Vec::new()).is_some());
+        assert!(folders(vec!["0123456789abcdef".into(); MAX_CLAIM_FOLDERS]).is_some());
+        for not_one in [
+            vec!["0123456789abcdef".to_string(); MAX_CLAIM_FOLDERS + 1],
+            vec!["0123456789ABCDEF".into()],
+            vec!["0123456789abcde".into()],
+            vec!["0123456789abcdef0".into()],
+            vec!["/home/agent/work".into()],
+        ] {
+            assert_eq!(folders(not_one.clone()), None, "{not_one:?}");
+        }
+        let claimed = |change: fn(&mut Claim)| {
+            in_a_driver(move |draft| change(draft.claim.as_mut().unwrap()))
+        };
+        for change in [
+            (|claim: &mut Claim| claim.driver_env = "Client A".into()) as fn(&mut Claim),
+            |claim| claim.key = "the thread about the login page".into(),
+            |claim| claim.key = String::new(),
+        ] {
+            let envelope = claimed(change);
+            // The record is kept, without its claim.
+            assert_eq!(envelope.claim, None);
+            assert_eq!(envelope.session_id, "s1");
+        }
+    }
+
+    #[test]
+    fn a_claim_read_back_that_does_not_fit_is_read_as_none_and_the_record_kept() {
+        let written = serde_json::to_value(in_a_driver(|_| {})).unwrap();
+        let read = |claim: serde_json::Value| {
+            let mut record = written.clone();
+            record["claim"] = claim;
+            serde_json::from_value::<Envelope>(record).unwrap()
+        };
+        assert!(read(written["claim"].clone()).claim.is_some());
+        for odd in [
+            serde_json::json!("client-a-t3"),
+            serde_json::json!({ "driver_env": "client-a-t3", "key": "k", "folders": ["0123456789abcdef"], "cwd": "/home/agent" }),
+            serde_json::json!({ "driver_env": "client-a-t3", "key": "k" }),
+            serde_json::json!({ "driver_env": "client-a-t3", "key": "k", "folders": ["/home/agent"] }),
+        ] {
+            let envelope = read(odd.clone());
+            assert_eq!(envelope.claim, None, "{odd}");
+            assert!(envelope.is_valid());
+        }
+        // Any other field the envelope does not have still makes it no record.
+        let mut stranger = written.clone();
+        stranger["prompt"] = serde_json::json!("fix the login page");
+        assert!(serde_json::from_value::<Envelope>(stranger).is_err());
+    }
+
+    #[test]
+    fn what_goes_to_watch_never_has_the_claim_and_the_reference_only_when_taken() {
+        let envelope = in_a_driver(|_| {});
+        let sent = |taken: &Taken| serde_json::to_value(envelope.as_sent(taken)).unwrap();
+        for taken in [Taken::default(), taking(&["agent", "driver", "driver_env"])] {
+            let sent = sent(&taken);
+            for field in ["claim", "driver_env", "driver_session"] {
+                assert!(sent.get(field).is_none(), "{field} went to {taken:?}");
+            }
+        }
+        let sent = sent(&taking(&["driver_session"]));
+        assert!(sent.get("claim").is_none());
+        assert_eq!(sent["driver_env"], "client-a-t3");
+        assert_eq!(sent["driver_session"], "thread_01HZX:2");
+        assert_eq!(sent["session_id"], "s1");
+        // Half a reference, however it got there, is never sent.
+        let mut half = envelope.clone();
+        half.driver_session = None;
+        let sent = serde_json::to_value(half.as_sent(&taking(&["driver_session"]))).unwrap();
+        assert!(sent.get("driver_env").is_none());
+        // The record on the box keeps what it had.
+        assert!(envelope.claim.is_some());
     }
 
     #[test]

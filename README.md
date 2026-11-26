@@ -1050,11 +1050,13 @@ runs; the folders are listed all the same, and each heartbeat says
 
 ### Fields Watch has to ask for
 
-Eight fields of a heartbeat are newer than the contract every Watch holds:
-`driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`,
-`setup`, `usage` and `worktrees`, which brings `worktree_action_results` and
-`worktree_actions_allowed` with it. Watch refuses a heartbeat that carries a
-field it does not name, and a refused heartbeat is a box gone dark, with every
+Nine fields of a heartbeat are newer than the contract every Watch holds:
+`agent`, `driver`, `driver_ref`, `config_commit`, `config_modified`,
+`config_state`, `setup`, `usage` and `worktrees`, which brings
+`worktree_action_results` and `worktree_actions_allowed` with it. So are two
+fields of an event, `driver_env` and `driver_session`, which Watch names
+together as `driver_session`. Watch refuses a heartbeat that carries a field
+it does not name, and a refused heartbeat is a box gone dark, with every
 environment on it looking down and no event sent. So the daemon sends none of
 them on a guess.
 
@@ -1092,6 +1094,7 @@ Every payload is built from named fields. This is the whole list.
 | `error_kind` | The hook's `error`, for `StopFailure` only, and only when it is a short kind such as `rate_limit`. |
 | `limit_resets_at` | When the agent says a usage limit resets, for `StopFailure` only: a timestamp, kept only from a minute before to eight days after the event. Claude Code's hook gives none, so none is sent. |
 | `client_ts` | The box's clock. |
+| `driver_env`, `driver_session`, together, to a Watch that names `driver_session` in `accepts` | For a session that runs inside a driver's session on the same box: the driver environment's `name` in the config, and the driver's own id for that session (letters, digits, `.`, `_`, `:` and `-`). |
 | `commits`, with an `outcome` only | How many commits the session made: those on its branch since the commit each worktree started from. A number. |
 | `uncommitted_repos`, `unpushed_commits`, with an `outcome` only | How many of the session's repos hold uncommitted changes, and how many of its commits are on no remote. Numbers. |
 | `pull_requests`, with an `outcome` only | The addresses of the open pull requests whose head is the session's commit, from GitHub. Each is `https://github.com/<owner>/<name>/pull/<number>` on a repo the same event names in `repos`, and nothing else: no title, no query, no fragment. |
@@ -1099,6 +1102,7 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, about the box | `on_battery`, yes or no, from NUT, only with `[ups]` set. `reboot_required`, yes or no, on Debian and Ubuntu, where `/var/run/reboot-required` says so. `uncommitted_repos`, `unpushed_commits` and `last_snapshot_at`: the box's unsaved work with each nucleus counted once, and the time since which every nucleus has had a good snapshot. `paused_until`, a timestamp, only while a maintenance pause is set. |
 | Heartbeat, per environment | `server_restarts`, systemd's running count of restarts of the agent server's unit. `unsaved`: `uncommitted_repos`, `unpushed_commits` and `counted_at`, two numbers and a time. `last_snapshot_at`, when the snapshot job last finished for that nucleus with nothing failed. |
 | Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
+| Heartbeat, per environment not watched through a driver, to a Watch that names the field in `accepts` | `agent`, the environment's `agent` from the config, such as `claude-code` or `codex`. |
 | Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
 | Heartbeat, per Claude Code environment with a good plan usage reading, to a Watch that names the field in `accepts` | `usage`: `read_at`, a timestamp, and `limits`, at most 16, each a `window`, one of two fixed words, a `scope`, a model's name of at most 32 letters, digits, `.`, `+` and `-`, with no space, `used_pct`, a number from 0 to 100, and `resets_at`, a timestamp. |
 | Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |

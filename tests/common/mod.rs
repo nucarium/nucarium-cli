@@ -118,8 +118,9 @@ impl Reply {
 pub struct Mock {
     pub url: String,
     /// The fields ahead of the contract that this stand-in says it takes, and
-    /// so may be sent: names from [`contract::AHEAD`]. None, unless whoever
-    /// started it says otherwise, as for Watch today.
+    /// so may be sent: names from [`contract::AHEAD`] and
+    /// [`contract::EVENT_AHEAD`]. None, unless whoever started it says
+    /// otherwise, as for Watch today.
     pub ahead: &'static [&'static str],
     requests: Arc<Mutex<Vec<Request>>>,
     server: Arc<tiny_http::Server>,
@@ -677,12 +678,11 @@ pub fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 /// through this, so a daemon that sends what Watch would refuse fails here
 /// first.
 ///
-/// Five fields of a heartbeat's environment are ahead of 0.5.0: `driver`,
-/// `driver_ref`, `config_commit`, `config_modified` and `config_state`. Watch
-/// as it is refuses each of them, and so does this, unless a stand-in is
-/// started as a later Watch that names them in `accepts` in its answer to a
-/// heartbeat: [`Mock::ahead`]. A box sends one only to a Watch that has named
-/// it.
+/// Some fields of a heartbeat's environment ([`contract::AHEAD`]) and of an
+/// event ([`contract::EVENT_AHEAD`]) are ahead of 0.5.0. Watch as it is
+/// refuses each of them, and so does this, unless a stand-in is started as a
+/// later Watch that names them in `accepts` in its answer to a heartbeat:
+/// [`Mock::ahead`]. A box sends one only to a Watch that has named it.
 pub mod contract {
     use super::{Mock, Reply, Request};
     use serde_json::{Map, Value};
@@ -734,8 +734,10 @@ pub mod contract {
     }
 
     /// The fields of a heartbeat's environment that are ahead of 0.5.0.
-    /// `worktrees` stands for two: `worktrees` and `worktree_action_results`.
-    pub const AHEAD: [&str; 8] = [
+    /// `worktrees` stands for three: `worktrees`, `worktree_action_results`
+    /// and `worktree_actions_allowed`.
+    pub const AHEAD: [&str; 9] = [
+        "agent",
         "driver",
         "driver_ref",
         "config_commit",
@@ -744,6 +746,24 @@ pub mod contract {
         "setup",
         "usage",
         "worktrees",
+    ];
+
+    /// The fields of an event that are ahead of 0.5.0. `driver_session`
+    /// stands for two, `driver_env` and `driver_session`, sent together.
+    pub const EVENT_AHEAD: [&str; 1] = ["driver_session"];
+
+    /// Every name a Watch that takes all of the above says in `accepts`.
+    pub const ACCEPTS: [&str; 10] = [
+        "agent",
+        "driver",
+        "driver_ref",
+        "config_commit",
+        "config_modified",
+        "config_state",
+        "setup",
+        "usage",
+        "worktrees",
+        "driver_session",
     ];
 
     const NETWORKS: [&str; 3] = ["none", "limited", "full"];
@@ -945,6 +965,12 @@ pub mod contract {
                 "environment",
                 &["env_id", "server_alive"],
                 &optional,
+            )?;
+            field(
+                environment,
+                "environment",
+                "agent",
+                string(|v| v.len() <= 32 && env_key(v)),
             )?;
             field(
                 environment,
@@ -1279,25 +1305,33 @@ pub mod contract {
         "outcome",
     ];
 
-    /// `EventEnvelope`. Every field is held to its shape whatever the `type`.
-    fn envelope(value: &Value) -> Check {
+    /// `EventEnvelope`, as a Watch that also takes the `ahead` fields would
+    /// have it. Every field is held to its shape whatever the `type`.
+    fn envelope(value: &Value, ahead: &[&str]) -> Check {
         let event = object(value, "event")?;
+        let mut optional = vec![
+            "bridge_session_id",
+            "repos",
+            "branch",
+            "error_kind",
+            "limit_resets_at",
+            "commits",
+            "uncommitted_repos",
+            "unpushed_commits",
+            "pull_requests",
+        ];
+        if ahead.contains(&"driver_session") {
+            optional.extend(["driver_env", "driver_session"]);
+        }
         closed(
             event,
             "event",
             &["event_id", "env_id", "session_id", "type", "client_ts"],
-            &[
-                "bridge_session_id",
-                "repos",
-                "branch",
-                "error_kind",
-                "limit_resets_at",
-                "commits",
-                "uncommitted_repos",
-                "unpushed_commits",
-                "pull_requests",
-            ],
+            &optional,
         )?;
+        if event.contains_key("driver_env") != event.contains_key("driver_session") {
+            return Err("event has one of driver_env and driver_session".to_string());
+        }
         let id = |c: char| c.is_ascii_alphanumeric() || "_-".contains(c);
         let session = |value: &str| chars(value, 1, 128, |c| word(c) || c == ':');
         let lower = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c);
@@ -1305,6 +1339,8 @@ pub mod contract {
         field(event, "event", "env_id", string(env_key))?;
         field(event, "event", "session_id", string(session))?;
         field(event, "event", "bridge_session_id", string(session))?;
+        field(event, "event", "driver_env", string(env_key))?;
+        field(event, "event", "driver_session", string(session))?;
         field(event, "event", "type", string(|v| TYPES.contains(&v)))?;
         field(event, "event", "repos", |repos| {
             repos
@@ -1358,13 +1394,19 @@ pub mod contract {
 
     /// `EventsRequest`: one to a hundred envelopes.
     pub fn events(body: &Value) -> Check {
+        events_taking(body, &[])
+    }
+
+    /// `EventsRequest`, as a Watch that also takes the `ahead` fields would
+    /// have it.
+    pub fn events_taking(body: &Value, ahead: &[&str]) -> Check {
         let top = object(body, "events request")?;
         closed(top, "events request", &["events"], &[])?;
         let events = top["events"]
             .as_array()
             .filter(|list| (1..=100).contains(&list.len()))
             .ok_or("events is not a list of 1 to 100")?;
-        events.iter().try_for_each(envelope)
+        events.iter().try_for_each(|event| envelope(event, ahead))
     }
 
     /// What the contract, as 0.5.0 has it, has against a request to an
@@ -1386,7 +1428,7 @@ pub mod contract {
         }
         match serde_json::from_str::<Value>(&request.body) {
             Ok(body) if request.path == HEARTBEATS => heartbeat_taking(&body, ahead).err(),
-            Ok(body) => events(&body).err(),
+            Ok(body) => events_taking(&body, ahead).err(),
             Err(_) => Some(format!("{} was not sent JSON", request.path)),
         }
     }

@@ -177,7 +177,10 @@ fn a_watch_that_takes_worktrees_is_sent_them_and_one_that_does_not_is_not() {
     assert!(heartbeats(&plain)
         .iter()
         .all(|beat| beat["environments"][0].get("worktrees").is_none()));
-    assert_eq!(beats.daemon.state(true).heartbeat.withheld, ["worktrees"]);
+    assert_eq!(
+        beats.daemon.state(true).heartbeat.withheld,
+        ["agent", "worktrees"]
+    );
 
     let taking = common::gate::watch_taking(&["worktrees"]);
     rig.sign_in(&taking.url);
