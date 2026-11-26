@@ -12,10 +12,11 @@
 //! Nothing here chooses what is run. A caller runs only the fixed commands
 //! its own design names.
 
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The most of a program's complaints that is kept for the box's own log.
@@ -49,29 +50,65 @@ pub enum Failure {
     NoAnswer,
 }
 
+/// The children started here that have not been waited for yet, by id. Each
+/// leads a process group of its own. An id leaves this list before its
+/// child is waited for, so an id in it always names this program's child
+/// and never a process that came after it.
+static LIVE: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+fn live() -> std::sync::MutexGuard<'static, BTreeSet<u32>> {
+    LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Start a program with nothing on standard input, its output on a pipe, and
 /// a process group of its own, so that stopping it stops what it started too.
 fn spawn(command: &mut Command, stderr: Stdio) -> Result<Child, Failure> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
-    command
+    let mut started = live();
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(stderr)
         .spawn()
-        .map_err(|_| Failure::Absent)
+        .map_err(|_| Failure::Absent)?;
+    started.insert(child.id());
+    Ok(child)
+}
+
+/// Kill a process group, by the id of the child that leads it.
+fn kill_group(id: u32) {
+    #[cfg(unix)]
+    // SAFETY: `kill` takes no pointers. Only called with the id of a child
+    // that has not been reaped, so it names that child's own process group
+    // and no one else's.
+    unsafe {
+        libc::kill(-(id as libc::pid_t), libc::SIGKILL);
+    }
 }
 
 /// Stop a child and everything in its process group. Only ever called for a
 /// child that has not been waited for, so the id is still this program's.
 fn stop(child: &mut Child) {
-    #[cfg(unix)]
-    // SAFETY: `kill` takes no pointers. The child has not been reaped, so
-    // its id still names its own process group and no one else's.
-    unsafe {
-        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-    }
+    kill_group(child.id());
     let _ = child.kill();
+}
+
+/// Wait for a child that has exited or been stopped, taking it off the list
+/// of live ones first.
+fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
+    live().remove(&child.id());
+    child.wait()
+}
+
+/// Stop every program started here that is still running, and everything in
+/// its process group, at once. For a process that has to end within a time
+/// of its own whatever it is in the middle of: `nucleated look` calls this
+/// when its time is up, before it leaves.
+pub fn stop_all() {
+    for id in live().iter() {
+        kill_group(*id);
+    }
 }
 
 /// A child's pipe, read with one eye on the clock. A read waits for bytes
@@ -143,16 +180,48 @@ impl<R: Read> Read for Timed<R> {
 fn reap(child: &mut Child, late: &AtomicBool, deadline: Instant) -> Result<ExitStatus, Failure> {
     let late = late.load(Ordering::SeqCst);
     loop {
-        match child.try_wait() {
+        match exited(child) {
             Ok(Some(status)) if !late => return Ok(status),
             Ok(None) if !late && Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             _ => {
                 stop(child);
-                let _ = child.wait();
+                let _ = wait(child);
                 return Err(Failure::Late);
             }
+        }
+    }
+}
+
+/// Whether a child has exited, reaping it if it has. The list of live
+/// children is held meanwhile, so a reaped id is off it before anyone else
+/// can read it.
+fn exited(child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
+    let mut started = live();
+    let status = child.try_wait();
+    if !matches!(status, Ok(None)) {
+        started.remove(&child.id());
+    }
+    status
+}
+
+/// Read a pipe up to `max` bytes into `keep`. True when there was more than
+/// `max`: the rest is then left unread, and the caller stops the program, so
+/// an answer that never ends costs no more than `max` bytes and no time.
+fn take_up_to(pipe: impl Read, max: u64, keep: impl FnOnce(&mut dyn Read)) -> bool {
+    let mut limited = pipe.take(max);
+    keep(&mut limited);
+    // What `keep` did not take of the first `max` bytes is read past, unkept.
+    let _ = std::io::copy(&mut limited, &mut std::io::sink());
+    let mut rest = limited.into_inner();
+    let mut one = [0u8; 1];
+    loop {
+        match rest.read(&mut one) {
+            Ok(0) => return false,
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
         }
     }
 }
@@ -184,7 +253,7 @@ pub fn stream<T>(
 }
 
 /// As [`stream`], saying why when nothing comes back. The first of these
-/// that holds is the word: not there, late, failed, too much, no answer.
+/// that holds is the word: not there, too much, late, failed, no answer.
 pub fn try_stream<T>(
     command: &mut Command,
     timeout: Duration,
@@ -196,16 +265,18 @@ pub fn try_stream<T>(
     let late = Arc::new(AtomicBool::new(false));
     let mut parsed = None;
     let over = child.stdout.take().is_none_or(|out| {
-        drain(Timed::new(out, deadline, &late), max, |limited| {
+        take_up_to(Timed::new(out, deadline, &late), max, |limited| {
             parsed = parse(limited)
         })
     });
+    if over {
+        stop(&mut child);
+        let _ = wait(&mut child);
+        return Err(Failure::TooMuch);
+    }
     let status = reap(&mut child, &late, deadline)?;
     if !status.success() {
         return Err(Failure::Failed);
-    }
-    if over {
-        return Err(Failure::TooMuch);
     }
     parsed.ok_or(Failure::NoAnswer)
 }
@@ -238,17 +309,21 @@ pub fn run(command: &mut Command, timeout: Duration, max: u64) -> Result<Capture
     });
     let mut stdout = Vec::new();
     let over = child.stdout.take().is_none_or(|out| {
-        drain(Timed::new(out, deadline, &late), max, |limited| {
+        take_up_to(Timed::new(out, deadline, &late), max, |limited| {
             let _ = limited.read_to_end(&mut stdout);
         })
     });
+    if over {
+        stop(&mut child);
+    }
     let stderr = complaints
         .and_then(|thread| thread.join().ok())
         .unwrap_or_default();
-    let status = reap(&mut child, &late, deadline)?;
     if over {
+        let _ = wait(&mut child);
         return Err(Failure::TooMuch);
     }
+    let status = reap(&mut child, &late, deadline)?;
     Ok(Captured {
         ok: status.success(),
         stdout,
@@ -434,6 +509,76 @@ mod tests {
             try_stream(&mut sh("echo state"), limit, 4096, text).as_deref(),
             Ok("state\n")
         );
+    }
+
+    #[test]
+    fn an_answer_that_never_ends_is_cut_at_its_limit_at_once() {
+        let started = Instant::now();
+        let limit = Duration::from_secs(20);
+        assert_eq!(
+            try_stream(&mut sh("yes state"), limit, 4096, text),
+            Err(Failure::TooMuch)
+        );
+        assert_eq!(
+            run(&mut sh("yes state"), limit, 4096),
+            Err(Failure::TooMuch)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The test below, in a process of its own: stopping everything stops
+    /// every child of the process, and other tests run their own beside it.
+    #[test]
+    fn stand_in_for_a_process_whose_time_is_up() {
+        let Some(dir) = std::env::var_os("NUCLEATE_TEST_STOP_ALL") else {
+            return;
+        };
+        let pid_file = std::path::PathBuf::from(dir).join("pid");
+        let mut command = sh("echo $$ > \"$PID_FILE\"; exec sleep 30");
+        command.env("PID_FILE", &pid_file);
+        let started = Instant::now();
+        let waiting = std::thread::spawn(move || run(&mut command, Duration::from_secs(20), 4096));
+        while std::fs::read_to_string(&pid_file).map_or(true, |pid| pid.trim().is_empty()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "it never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop_all();
+        let heard = waiting.join().unwrap().unwrap();
+        assert!(!heard.ok);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(live().is_empty());
+    }
+
+    #[test]
+    fn everything_still_running_is_stopped_at_once_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bounded::tests::stand_in_for_a_process_whose_time_is_up",
+            ])
+            .env("NUCLEATE_TEST_STOP_ALL", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: `kill` takes no pointers; signal 0 only asks.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "it is still running");
     }
 
     #[test]
