@@ -20,7 +20,7 @@ use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
-use crate::spool::{self, Record, Spool, Unread};
+use crate::spool::{Record, Spool, Unread};
 use crate::watch::{
     ApiError, Client, EnvironmentReport, Heartbeat, MachineHealth, Taken, UnsavedReport,
 };
@@ -392,7 +392,7 @@ impl Daemon {
     pub fn new(settings: Settings, timings: Timings) -> Daemon {
         Daemon {
             settings_stamp: modified(&settings.path),
-            spool: Spool::new(&settings.spool_dir),
+            spool: Spool::shared(&settings.spool_dir, &settings.state_dir),
             sessions: Store::new(&settings.state_dir),
             pause_stamp: modified(&pause::file(&settings.state_dir)),
             notifier: Notifier::new(&settings.state_dir),
@@ -453,7 +453,7 @@ impl Daemon {
         match settings::load_from(&self.settings.path) {
             Ok(settings) => {
                 log("config changed; reloaded");
-                self.spool = Spool::new(&settings.spool_dir);
+                self.spool = Spool::shared(&settings.spool_dir, &settings.state_dir);
                 self.sessions = Store::new(&settings.state_dir);
                 if settings.state_dir != self.settings.state_dir {
                     self.pause_stamp = modified(&pause::file(&settings.state_dir));
@@ -1187,11 +1187,13 @@ impl Daemon {
             heartbeat: self.heartbeat.clone(),
             events: EventsState {
                 pending: self.pending.len(),
-                rejected: self.spool.rejected().len()
-                    + spool::set_aside_from_environments(
-                        &self.settings.state_dir,
-                        self.spool_limit(),
-                    ),
+                // Every folder's refused events are set aside in one place.
+                rejected: self
+                    .spool
+                    .clone()
+                    .capped(self.spool_limit())
+                    .rejected()
+                    .len(),
                 ..self.events.clone()
             },
             environments: self.environments.clone(),

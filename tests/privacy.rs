@@ -490,7 +490,7 @@ fn the_new_fields_hold_a_time_a_number_or_a_short_word_and_never_a_sentence() {
     assert!(mock.to("/v1/events:ingest").is_empty());
     assert!(!mock.everything().contains(MARK));
     assert!(rig.spooled().is_empty());
-    assert_eq!(files_under(&spool.join("rejected")).len(), 1);
+    assert_eq!(files_under(&rig.set_aside_dir()).len(), 1);
     assert!(files_under(&rig.home.state_dir().join("sessions")).is_empty());
 }
 
@@ -852,7 +852,7 @@ fn a_count_a_time_or_an_address_with_words_in_it_is_never_sent() {
     assert!(mock.to(contract::EVENTS).is_empty());
     assert!(!mock.everything().contains(MARK));
     assert!(rig.spooled().is_empty());
-    assert_eq!(files_under(&spool.join("rejected")).len(), 5);
+    assert_eq!(files_under(&rig.set_aside_dir()).len(), 5);
     assert_eq!(contract::violations(&mock), Vec::<String>::new());
 }
 

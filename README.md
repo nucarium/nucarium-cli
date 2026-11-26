@@ -545,9 +545,9 @@ and all mode 600:
 | Path | Holds |
 |---|---|
 | `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. Host environments and the daemon write here. |
-| `spool/rejected/` | Events from `spool/` that Watch refused. Kept for `max_age`, never retried. |
+| `spool/rejected/` | Events from `spool/` that Watch refused, set aside before they went to `spools/.rejected/`. Counted and kept for `max_age`, never retried; nothing new goes here. |
 | `spools/<environment>/<event_id>.json` | The same, from a container environment's hook: each container has its own folder, mounted where `spool/` would be. |
-| `spools/.rejected/` | Events from those folders that Watch refused or that are not records. No container has it mounted. |
+| `spools/.rejected/` | Events from `spool/` and those folders that Watch refused or that are not records. Kept for `max_age`, never retried. No container has it mounted. |
 | `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, when an event for it was last sent, and the agent process its hooks last ran from. `nucleated status` reads these. |
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
@@ -1230,8 +1230,8 @@ spool is replayed in order. Watch deduplicates on `event_id`, so a batch can be
 sent twice safely.
 
 An event Watch refuses (a 4xx other than 401, 408 and 429, or an entry in the
-response's `rejected` list) moves to `spool/rejected/`, or from a container's
-folder to `spools/.rejected/`, and is not retried. If
+response's `rejected` list) moves to `spools/.rejected/`, which no container
+has mounted, and is not retried. If
 Watch rejects the token (401), the daemon keeps the spool, stops sending, and
 `nucleated status` says to run `nucleate login`. Past `max_events` the oldest
 routine events are dropped first and an unsent "needs input" last; events older

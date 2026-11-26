@@ -645,6 +645,12 @@ impl Rig {
         self.home.state_dir().join("spool")
     }
 
+    /// Where the daemon sets refused events aside, from every spool folder:
+    /// a folder no container mounts.
+    pub fn set_aside_dir(&self) -> PathBuf {
+        self.home.state_dir().join("spools").join(".rejected")
+    }
+
     /// Write the daemon's config with `client-a` in its own container, as
     /// the recipe runs a container environment, plus whatever `extra` adds.
     /// An environment in `extra` given [`CLIENT_A_CONTAINER_UNIT`] runs in

@@ -1379,7 +1379,7 @@ fn an_event_watch_refuses_is_set_aside_and_the_rest_are_delivered() {
     sessions.sort();
     assert_eq!(sessions, ["s1", "s2", "s3", "s4", "s5"]);
     assert!(rig.spooled().is_empty());
-    let aside = common::files_under(&rig.spool_dir().join("rejected"));
+    let aside = common::files_under(&rig.set_aside_dir());
     assert_eq!(aside.len(), 1);
     assert!(String::from_utf8_lossy(&aside[0].1).contains("poison"));
     assert_eq!(daemon.state(true).events.rejected, 1);
@@ -1401,10 +1401,7 @@ fn an_event_in_the_responses_rejected_list_is_set_aside() {
     daemon.tick(Instant::now());
     assert_eq!(mock.to("/v1/events:ingest").len(), 1);
     assert!(rig.spooled().is_empty());
-    assert_eq!(
-        common::files_under(&rig.spool_dir().join("rejected")).len(),
-        1
-    );
+    assert_eq!(common::files_under(&rig.set_aside_dir()).len(), 1);
     assert_eq!(daemon.state(true).events.sent, 1);
 }
 

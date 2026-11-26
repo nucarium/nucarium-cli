@@ -12,17 +12,24 @@
 //! the daemon itself, and containers started before their own folder existed
 //! write the shared one, `<state_dir>/spool`. A folder a container writes is
 //! read as hostile: regular files only, never through a link, never more
-//! than [`MAX_FILE`] of one, never more than a set number in one pass.
+//! than [`MAX_FILE`] of one, never more than a set number in one pass. A
+//! file is looked at by its name in the folder held open, before anything
+//! opens it, and is read only if what opens is the file looked at. Refused
+//! events from every folder are set aside in `<state_dir>/spools/.rejected`,
+//! which no container mounts.
 
 use crate::envelope::{valid_env_key, valid_event_id, Envelope};
-use crate::paths;
+use crate::paths::{self, Looked};
 use crate::process::Identity;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The most bytes a spool file may hold. The largest record that fits the
 /// contract is a few kilobytes; anything bigger is no record, and is not read.
@@ -62,37 +69,197 @@ pub fn spools_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("spools")
 }
 
-/// Where events from a container environment's folder are set aside: beside
-/// those folders, in one no container has mounted.
+/// Where refused events are set aside, from every spool folder the daemon
+/// reads: beside the environments' folders, in one no container mounts.
 fn set_aside_dir(state_dir: &Path) -> PathBuf {
     spools_dir(state_dir).join(".rejected")
 }
 
-/// How many events from container environments' folders are set aside.
-pub fn set_aside_from_environments(state_dir: &Path, limit: usize) -> usize {
-    let dir = set_aside_dir(state_dir);
-    match real_dir(&dir) {
-        true => ids_in(&dir, limit).len(),
-        false => 0,
+/// Where the shared spool set refused events aside before they went where
+/// no container writes. Old ones there are still counted and pruned.
+const LEGACY_REJECTED: &str = "rejected";
+
+/// A folder held open, so that what is done in it is done in that very
+/// folder: an entry in it is looked at, opened, moved or removed by its
+/// name in the folder, and no link is followed to get there.
+struct Dir(OwnedFd);
+
+/// What a look at one entry of a [`Dir`] found, without following a link.
+struct Entry {
+    regular: bool,
+    looked: Looked,
+    modified: Option<SystemTime>,
+}
+
+fn c_name(name: &str) -> io::Result<CString> {
+    CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+fn checked(result: libc::c_int) -> io::Result<libc::c_int> {
+    match result {
+        -1 => Err(io::Error::last_os_error()),
+        fd => Ok(fd),
     }
 }
 
-/// True for a folder that is itself a folder, and not a link to one.
-fn real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+impl Dir {
+    /// Open a folder. Without `follow`, a link in its place is refused: the
+    /// folders the daemon makes itself are opened that way. Only the last
+    /// part of the path is the folder's own; those above it are the box's.
+    fn open(path: &Path, follow: bool) -> io::Result<Dir> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        // SAFETY: `name` is a valid C string for the length of the call.
+        let fd = checked(unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | nofollow,
+            )
+        })?;
+        // SAFETY: `open` just returned this descriptor, and nothing else owns it.
+        Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// A folder in this one, never through a link.
+    fn at(&self, name: &str) -> io::Result<Dir> {
+        let name = c_name(name)?;
+        // SAFETY: a descriptor this folder owns, and a valid C string.
+        let fd = checked(unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        })?;
+        // SAFETY: `openat` just returned this descriptor, and nothing else owns it.
+        Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Look at an entry without opening it, and without following a link.
+    fn look(&self, name: &str) -> io::Result<Entry> {
+        let name = c_name(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: a descriptor this folder owns, a valid C string, and room
+        // for one `stat`, which a successful call fills.
+        checked(unsafe {
+            libc::fstatat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        })?;
+        // SAFETY: filled by the successful call above.
+        let stat = unsafe { stat.assume_init() };
+        let modified = u64::try_from(stat.st_mtime)
+            .ok()
+            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+        // `st_dev` and `st_ino` are not the same type on every platform; as
+        // the standard library gives them, they are both `u64`.
+        #[allow(clippy::unnecessary_cast)]
+        Ok(Entry {
+            regular: stat.st_mode & libc::S_IFMT == libc::S_IFREG,
+            looked: Looked {
+                dev: stat.st_dev as u64,
+                ino: stat.st_ino as u64,
+                len: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+            },
+            modified,
+        })
+    }
+
+    /// Open, for reading, the regular file a [`Dir::look`] looked at, and
+    /// refuse it if what opened is not that same file. Never through a
+    /// link, and never waiting on anything.
+    fn open_looked(&self, name: &str, looked: &Looked) -> io::Result<fs::File> {
+        use std::os::unix::fs::MetadataExt;
+        let c = c_name(name)?;
+        // SAFETY: a descriptor this folder owns, and a valid C string.
+        let fd = checked(unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_NOCTTY
+                    | libc::O_CLOEXEC,
+            )
+        })?;
+        // SAFETY: `openat` just returned this descriptor, and nothing else owns it.
+        let file = fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let meta = file.metadata()?;
+        if (meta.dev(), meta.ino()) != (looked.dev, looked.ino) || !meta.is_file() {
+            return Err(io::Error::other("not the file that was looked at"));
+        }
+        Ok(file)
+    }
+
+    /// Remove an entry. A link is removed, never what it names.
+    fn unlink(&self, name: &str) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: a descriptor this folder owns, and a valid C string.
+        checked(unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) }).map(|_| ())
+    }
+
+    /// Move an entry, under the same name, into another held folder.
+    fn move_into(&self, name: &str, into: &Dir) -> io::Result<()> {
+        let name = c_name(name)?;
+        // SAFETY: two descriptors these folders own, and a valid C string.
+        checked(unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                into.0.as_raw_fd(),
+                name.as_ptr(),
+            )
+        })
+        .map(|_| ())
+    }
+
+    /// The names of at most `limit` entries, `.` and `..` aside.
+    fn names(&self, limit: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        // A descriptor of its own for the listing, which closes it.
+        // SAFETY: `fcntl` duplicates a descriptor this folder owns.
+        let Ok(fd) = checked(unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })
+        else {
+            return names;
+        };
+        // SAFETY: `fd` is ours; on success the listing owns it.
+        let listing = unsafe { libc::fdopendir(fd) };
+        if listing.is_null() {
+            // SAFETY: `fdopendir` failed, so `fd` is still ours to close.
+            unsafe { libc::close(fd) };
+            return names;
+        }
+        // SAFETY: `listing` is a valid listing until `closedir` below; each
+        // entry `readdir` returns is valid until the next call.
+        unsafe {
+            libc::rewinddir(listing);
+            while names.len() < limit {
+                let entry = libc::readdir(listing);
+                if entry.is_null() {
+                    break;
+                }
+                let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr());
+                let name = name.to_string_lossy();
+                if name != "." && name != ".." {
+                    names.push(name.into_owned());
+                }
+            }
+            libc::closedir(listing);
+        }
+        names
+    }
 }
 
-/// The event ids of the files in a folder, sorted, from at most `limit` of
-/// its entries.
-fn ids_in(dir: &Path, limit: usize) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
-        .take(limit)
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
+/// The event ids among a folder's entry names, sorted.
+fn event_ids(names: Vec<String>) -> Vec<String> {
+    let mut ids: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| {
             let id = name.strip_suffix(".json")?;
             valid_event_id(id).then(|| id.to_string())
         })
@@ -101,55 +268,62 @@ fn ids_in(dir: &Path, limit: usize) -> Vec<String> {
     ids
 }
 
-/// Open a file for reading only if it is a regular file, and not through a
-/// link: a pipe is opened without waiting for a writer, and then refused
-/// once its type is read from the open file itself.
-fn open_file(path: &Path) -> std::result::Result<fs::File, Unread> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => Unread::Gone,
-            _ => Unread::NotAFile,
-        })?;
-    let meta = file.metadata().map_err(|_| Unread::NotAFile)?;
-    if !meta.is_file() {
-        return Err(Unread::NotAFile);
-    }
-    if meta.len() > MAX_FILE {
-        return Err(Unread::TooLarge);
-    }
-    Ok(file)
+fn file_name(event_id: &str) -> String {
+    format!("{event_id}.json")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spool {
     dir: PathBuf,
-    rejected: PathBuf,
+    /// Where refused events go, in a folder no container mounts. Nothing for
+    /// a hook's spool, which never sets one aside.
+    set_aside: Option<PathBuf>,
+    /// Whether this is the shared spool, whose events set aside in its own
+    /// `rejected` folder before are still counted and pruned there.
+    legacy: bool,
+    /// Whether the folder itself is opened as the config names it, link or
+    /// not: the shared spool's and a hook's. The container whose spool it is
+    /// has it mounted and cannot replace it. An environment's own folder,
+    /// which the daemon makes, is never opened through a link.
+    configured: bool,
     /// The most entries of a folder looked at in one pass.
     limit: usize,
 }
 
 impl Spool {
-    /// The shared spool, or a hook's own: refused events go in its
-    /// `rejected` folder.
+    /// A hook's spool, which it writes events to.
     pub fn new(dir: &Path) -> Spool {
         Spool {
             dir: dir.to_path_buf(),
-            rejected: dir.join("rejected"),
+            set_aside: None,
+            legacy: false,
+            configured: true,
+            limit: usize::MAX,
+        }
+    }
+
+    /// The shared spool, as the daemon reads it. Containers started before
+    /// their own folder existed still write it, so nothing is ever set aside
+    /// inside it: refused events go where no container writes.
+    pub fn shared(dir: &Path, state_dir: &Path) -> Spool {
+        Spool {
+            dir: dir.to_path_buf(),
+            set_aside: Some(set_aside_dir(state_dir)),
+            legacy: true,
+            configured: true,
             limit: usize::MAX,
         }
     }
 
     /// A container environment's own spool folder, as the daemon reads it.
-    /// Nothing is ever set aside inside it: the container could have put a
-    /// link there in place of a folder.
+    /// Nothing is ever set aside inside it: refused events go where no
+    /// container writes.
     pub fn of_environment(state_dir: &Path, environment: &str) -> Option<Spool> {
         valid_env_key(environment).then(|| Spool {
             dir: spools_dir(state_dir).join(environment),
-            rejected: set_aside_dir(state_dir),
+            set_aside: Some(set_aside_dir(state_dir)),
+            legacy: false,
+            configured: false,
             limit: usize::MAX,
         })
     }
@@ -167,7 +341,26 @@ impl Spool {
     }
 
     fn path(&self, event_id: &str) -> PathBuf {
-        self.dir.join(format!("{event_id}.json"))
+        self.dir.join(file_name(event_id))
+    }
+
+    fn own(&self) -> io::Result<Dir> {
+        Dir::open(&self.dir, self.configured)
+    }
+
+    /// The folders refused events are kept in: where they are set aside,
+    /// and, for the shared spool, where they were set aside before. Neither
+    /// is reached through a link.
+    fn kept(&self) -> Vec<Dir> {
+        let set_aside = self
+            .set_aside
+            .as_ref()
+            .and_then(|dir| Dir::open(dir, false).ok());
+        let legacy = self
+            .legacy
+            .then(|| self.own().and_then(|own| own.at(LEGACY_REJECTED)).ok())
+            .flatten();
+        set_aside.into_iter().chain(legacy).collect()
     }
 
     pub fn write(&self, record: &Record) -> Result<PathBuf> {
@@ -178,14 +371,22 @@ impl Spool {
 
     /// The ids of the events waiting, oldest first.
     pub fn pending(&self) -> Vec<String> {
-        ids_in(&self.dir, self.limit)
+        self.own()
+            .map(|own| event_ids(own.names(self.limit)))
+            .unwrap_or_default()
     }
 
+    /// The ids of the events set aside, from every spool folder the daemon
+    /// reads, and those the shared spool set aside before.
     pub fn rejected(&self) -> Vec<String> {
-        match real_dir(&self.rejected) {
-            true => ids_in(&self.rejected, self.limit),
-            false => Vec::new(),
-        }
+        let mut ids: Vec<String> = self
+            .kept()
+            .iter()
+            .flat_map(|dir| event_ids(dir.names(self.limit)))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
     }
 
     /// True once the spool holds `limit` files. Counting stops there, so this
@@ -199,11 +400,40 @@ impl Spool {
         self.take(event_id).ok()
     }
 
-    /// Read one event: a regular file, read without following a link and
-    /// without waiting on a pipe, of no more than [`MAX_FILE`], holding a
-    /// valid record of that very event.
+    /// Read one event: a regular file, looked at before it is opened, so a
+    /// pipe or a device is never opened, and opened only if it is still the
+    /// file looked at; never through a link, of no more than [`MAX_FILE`],
+    /// holding a valid record of that very event.
     pub fn take(&self, event_id: &str) -> std::result::Result<Record, Unread> {
-        let file = open_file(&self.path(event_id))?;
+        let own = self.own().map_err(|_| Unread::Gone)?;
+        let name = file_name(event_id);
+        let entry = own.look(&name).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => Unread::Gone,
+            _ => Unread::NotAFile,
+        })?;
+        Self::read_looked(&own, &name, event_id, &entry)
+    }
+
+    /// Read the file a look found, refusing anything but that very regular
+    /// file.
+    fn read_looked(
+        own: &Dir,
+        name: &str,
+        event_id: &str,
+        entry: &Entry,
+    ) -> std::result::Result<Record, Unread> {
+        if !entry.regular {
+            return Err(Unread::NotAFile);
+        }
+        if entry.looked.len > MAX_FILE {
+            return Err(Unread::TooLarge);
+        }
+        let file = own
+            .open_looked(name, &entry.looked)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => Unread::Gone,
+                _ => Unread::NotAFile,
+            })?;
         let mut text = String::new();
         file.take(MAX_FILE + 1)
             .read_to_string(&mut text)
@@ -220,23 +450,28 @@ impl Spool {
 
     /// Remove an event's file. A link is removed, never what it points at.
     pub fn remove(&self, event_id: &str) {
-        let _ = fs::remove_file(self.path(event_id));
+        if let Ok(own) = self.own() {
+            let _ = own.unlink(&file_name(event_id));
+        }
     }
 
-    /// Set an event aside: Watch refused it, or its file is not a record. A
-    /// `rejected` that is not a folder of its own is not followed: the event
-    /// is removed instead.
+    /// Set an event aside: Watch refused it, or its file is not a record. It
+    /// is moved, by its name in this folder, into the set-aside folder held
+    /// open: a set-aside folder that is not a folder of its own is not
+    /// followed, and the event is removed instead. A hook's spool has
+    /// nowhere to set one aside, and removes it.
     pub fn reject(&self, event_id: &str) {
-        let moved = paths::create_private_dir(&self.rejected)
-            .context("creating the rejected folder")
-            .and_then(|()| match real_dir(&self.rejected) {
-                true => fs::rename(
-                    self.path(event_id),
-                    self.rejected.join(format!("{event_id}.json")),
-                )
-                .context("moving the event"),
-                false => Err(anyhow::anyhow!("the rejected folder is not a folder")),
-            });
+        let name = file_name(event_id);
+        let moved = (|| -> Result<()> {
+            let to = self
+                .set_aside
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("nowhere to set an event aside"))?;
+            paths::create_private_dir(to)?;
+            let into = Dir::open(to, false).context("opening the set-aside folder")?;
+            let own = self.own().context("opening the spool folder")?;
+            own.move_into(&name, &into).context("moving the event")
+        })();
         if moved.is_err() {
             self.remove(event_id);
         }
@@ -246,24 +481,25 @@ impl Spool {
     /// `max_age`. Nothing is followed through a link: a link is as old as
     /// itself, and only it is removed.
     pub fn prune(&self, max_age: Duration, now: SystemTime) {
-        let old = |path: &Path| {
-            fs::symlink_metadata(path)
-                .and_then(|meta| meta.modified())
+        let old = |dir: &Dir, name: &str| {
+            dir.look(name)
                 .ok()
+                .and_then(|entry| entry.modified)
                 .and_then(|modified| now.duration_since(modified).ok())
                 .is_some_and(|age| age > max_age)
         };
-        for id in self.rejected() {
-            let path = self.rejected.join(format!("{id}.json"));
-            if old(&path) {
-                let _ = fs::remove_file(path);
+        for dir in self.kept() {
+            for id in event_ids(dir.names(self.limit)) {
+                let name = file_name(&id);
+                if old(&dir, &name) {
+                    let _ = dir.unlink(&name);
+                }
             }
         }
-        if let Ok(entries) = fs::read_dir(&self.dir) {
-            for entry in entries.take(self.limit).flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".tmp") && old(&entry.path()) {
-                    let _ = fs::remove_file(entry.path());
+        if let Ok(own) = self.own() {
+            for name in own.names(self.limit) {
+                if name.ends_with(".tmp") && old(&own, &name) {
+                    let _ = own.unlink(&name);
                 }
             }
         }
@@ -296,10 +532,11 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     }
 
-    /// A spool, and an event id and the path its file would have.
+    /// The shared spool, as the daemon reads it, and an event id and the
+    /// path its file would have.
     fn planted() -> (tempfile::TempDir, Spool, String, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let spool = Spool::new(&dir.path().join("spool"));
+        let spool = Spool::shared(&dir.path().join("spool"), dir.path());
         fs::create_dir_all(spool.dir()).unwrap();
         let id = record("client-a", SystemTime::now()).event.event_id;
         let path = spool.path(&id);
@@ -397,9 +634,20 @@ mod tests {
         assert_eq!(spool.clone().capped(4).pending().len(), 4);
     }
 
+    /// Every name in a folder, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn a_rejected_folder_that_is_a_link_is_not_followed() {
+    fn the_shared_spool_sets_events_aside_where_no_container_writes() {
         let (dir, spool, _, _) = planted();
+        // A container made the old `rejected` folder a link out of it.
         let elsewhere = dir.path().join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         fs::write(elsewhere.join("keep.json"), "keep").unwrap();
@@ -407,17 +655,138 @@ mod tests {
         let written = record("client-a", SystemTime::now());
         spool.write(&written).unwrap();
         spool.reject(&written.event.event_id);
-        // The event is gone, and nothing went through the link.
         assert!(spool.pending().is_empty());
+        // Set aside beside the environments' folders, and nothing went
+        // through the link.
         assert_eq!(
-            fs::read_dir(&elsewhere).unwrap().count(),
-            1,
-            "an event was moved through a link"
+            entries(&dir.path().join("spools/.rejected")),
+            [format!("{}.json", written.event.event_id)]
         );
-        assert!(spool.rejected().is_empty());
-        // Pruning never reaches through it either.
+        assert_eq!(entries(&elsewhere), ["keep.json"]);
+        assert_eq!(
+            spool.rejected(),
+            std::slice::from_ref(&written.event.event_id)
+        );
+        // Pruning never reaches through the link either.
         spool.prune(Duration::ZERO, SystemTime::now() + Duration::from_secs(60));
-        assert!(elsewhere.join("keep.json").exists());
+        assert_eq!(entries(&elsewhere), ["keep.json"]);
+        assert!(spool.rejected().is_empty());
+    }
+
+    #[test]
+    fn a_link_in_place_of_the_set_aside_folder_is_never_followed() {
+        let (dir, spool, _, _) = planted();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep.json"), "keep").unwrap();
+        fs::create_dir_all(dir.path().join("spools")).unwrap();
+        symlink(&elsewhere, dir.path().join("spools/.rejected")).unwrap();
+        let written = record("client-a", SystemTime::now());
+        spool.write(&written).unwrap();
+        spool.reject(&written.event.event_id);
+        // The event is gone, and nothing was written outside.
+        assert!(spool.pending().is_empty());
+        assert_eq!(entries(&elsewhere), ["keep.json"]);
+        assert!(spool.rejected().is_empty());
+        spool.prune(Duration::ZERO, SystemTime::now() + Duration::from_secs(60));
+        assert_eq!(entries(&elsewhere), ["keep.json"]);
+        // An environment's spool is held to the same folder.
+        let theirs = Spool::of_environment(dir.path(), "client-a").unwrap();
+        let written = record("client-a", SystemTime::now());
+        theirs.write(&written).unwrap();
+        theirs.reject(&written.event.event_id);
+        assert!(theirs.pending().is_empty());
+        assert_eq!(entries(&elsewhere), ["keep.json"]);
+    }
+
+    #[test]
+    fn events_the_shared_spool_set_aside_before_are_counted_and_pruned_where_they_are() {
+        let (dir, spool, _, _) = planted();
+        let legacy = spool.dir().join("rejected");
+        fs::create_dir_all(&legacy).unwrap();
+        let old = record("client-a", SystemTime::now()).event.event_id;
+        fs::write(legacy.join(format!("{old}.json")), "old").unwrap();
+        // A link among them, to a file outside.
+        let target = dir.path().join("target.json");
+        fs::write(&target, "kept").unwrap();
+        let linked = record("client-a", SystemTime::now() + Duration::from_millis(5))
+            .event
+            .event_id;
+        symlink(&target, legacy.join(format!("{linked}.json"))).unwrap();
+        let mut both = vec![old.clone(), linked.clone()];
+        both.sort();
+        assert_eq!(spool.rejected(), both);
+        // Only the shared spool reads them; a hook's spool sets nothing
+        // aside and reads nothing set aside.
+        assert!(Spool::new(spool.dir()).rejected().is_empty());
+        assert!(Spool::of_environment(dir.path(), "client-a")
+            .unwrap()
+            .rejected()
+            .is_empty());
+        spool.prune(Duration::ZERO, SystemTime::now() + Duration::from_secs(60));
+        assert!(spool.rejected().is_empty());
+        assert!(entries(&legacy).is_empty());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+    }
+
+    #[test]
+    fn a_hooks_spool_removes_what_it_would_set_aside() {
+        let (dir, _, _, _) = planted();
+        let spool = Spool::new(&dir.path().join("spool"));
+        let written = record("client-a", SystemTime::now());
+        spool.write(&written).unwrap();
+        spool.reject(&written.event.event_id);
+        assert!(spool.pending().is_empty());
+        assert!(!dir.path().join("spool/rejected").exists());
+        assert!(!dir.path().join("spools").exists());
+    }
+
+    #[test]
+    fn a_pipe_is_refused_by_its_look_before_anything_opens_it() {
+        let (_dir, spool, id, path) = planted();
+        fifo(&path);
+        let own = spool.own().unwrap();
+        let entry = own.look(&file_name(&id)).unwrap();
+        assert!(!entry.regular);
+        let started = Instant::now();
+        assert_eq!(
+            Spool::read_looked(&own, &file_name(&id), &id, &entry),
+            Err(Unread::NotAFile)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_file_swapped_in_between_the_look_and_the_open_is_refused() {
+        let (dir, spool, id, path) = planted();
+        let mut good = record("client-a", SystemTime::now());
+        good.event.event_id = id.clone();
+        let text = serde_json::to_string(&good).unwrap();
+        fs::write(&path, &text).unwrap();
+        let own = spool.own().unwrap();
+        let name = file_name(&id);
+        let looked = own.look(&name).unwrap();
+        // A record just as good, renamed into its place after the look.
+        let other = dir.path().join("spool").join("other");
+        fs::write(&other, &text).unwrap();
+        fs::rename(&other, &path).unwrap();
+        assert_eq!(
+            Spool::read_looked(&own, &name, &id, &looked),
+            Err(Unread::NotAFile)
+        );
+        // A pipe swapped in is refused, without waiting for a writer.
+        fs::remove_file(&path).unwrap();
+        fifo(&path);
+        let started = Instant::now();
+        assert_eq!(
+            Spool::read_looked(&own, &name, &id, &looked),
+            Err(Unread::NotAFile)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Looked at afresh, the file in its place now reads.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, &text).unwrap();
+        assert_eq!(spool.take(&id), Ok(good));
     }
 
     #[test]
@@ -438,7 +807,10 @@ mod tests {
             .join("spools/.rejected")
             .join(format!("{}.json", written.event.event_id))
             .is_file());
-        assert_eq!(set_aside_from_environments(dir.path(), 100), 1);
+        assert_eq!(
+            Spool::shared(&dir.path().join("spool"), dir.path()).rejected(),
+            std::slice::from_ref(&written.event.event_id)
+        );
         // A name that is not an environment's names no folder.
         for not_one in ["", ".rejected", "..", "a/b", "Client A"] {
             assert_eq!(
