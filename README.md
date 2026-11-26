@@ -544,8 +544,10 @@ and all mode 600:
 
 | Path | Holds |
 |---|---|
-| `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. |
-| `spool/rejected/` | Events Watch refused. Kept for `max_age`, never retried. |
+| `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. Host environments and the daemon write here. |
+| `spool/rejected/` | Events from `spool/` that Watch refused. Kept for `max_age`, never retried. |
+| `spools/<environment>/<event_id>.json` | The same, from a container environment's hook: each container has its own folder, mounted where `spool/` would be. |
+| `spools/.rejected/` | Events from those folders that Watch refused or that are not records. No container has it mounted. |
 | `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, when an event for it was last sent, and the agent process its hooks last ran from. `nucleated status` reads these. |
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
@@ -556,7 +558,7 @@ and all mode 600:
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 | `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
-| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The daemon writes it from the claim in the hook's spool record, counted only when that record came from the spool folder of an environment in the driver's own container, and renews it as the hook speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
 | `worktree-actions/` | Watch's actions waiting to run, each with when it reached the box; the result of each that has run, until a heartbeat carrying it is answered; and, in `started.json`, the ids of those started in the last day, each written down before it ran. |
 | `recount` | Left by an action that has run, for the reporter to make its next count at once. |
 | `usage.json` | Per Claude Code environment, its last good plan usage reading: a number made from the config folder's path, for the login it was read for, when it was read, and per limit its window, the model it is for, a percentage and when it resets. No token. |
@@ -776,9 +778,15 @@ What holds for every driver, whatever its adapter:
   have stopped moving. A driver that keeps not answering is asked ever less
   often, up to once a minute.
 - **The hook wins.** An agent that runs inside a driver and also has
-  `nucleated`'s hooks is seen twice. The hook notes which of the driver's
-  sessions it is running in, and for as long as the hook's session lives the
-  driver's view of that agent is not reported. A hook that has stopped
+  `nucleated`'s hooks is seen twice. The hook says in its spool record which
+  of the driver's sessions it is running in, and for as long as the hook's
+  session lives the driver's view of that agent is not reported, and the
+  hook's events carry the driver's reference to that session, for its link.
+  The daemon believes this only from the spool folder of an environment that
+  runs in the same container as the driver: a hook anywhere else cannot see
+  the driver's sessions. The daemon knows an environment's container from its
+  `unit`: `agent-env-<name>.service` runs in the container `agent-env-<name>`,
+  so a driver's environment names its container's unit. A hook that has stopped
   speaking does not win for ever: an agent killed without its `SessionEnd`
   leaves a session that stays open until the daemon sees its process has
   gone, or for ever where it cannot, and must not hide whatever runs in its
@@ -789,7 +797,7 @@ What holds for every driver, whatever its adapter:
   contradicts nothing, and a hook that speaks again wins again.
 
   A hook is believed for what its own session shows, and for nothing more.
-  Its note is a file any program on the box could write, by running
+  Its word is a record any program in that container could write, by running
   `nucleated hook` with a driver's variables set. So it never keeps from you
   a session that waits on you or has failed: when the driver sees either,
   and no hook that speaks for the session shows the same within a minute and
@@ -1181,7 +1189,13 @@ the gate: if one fails, do not release.
 
 ### Spool and replay
 
-The hook writes one file per event. The daemon sends "needs input" events as
+The hook writes one file per event. In a container environment that file is
+in the container's own spool folder, `spools/<environment>/`; elsewhere it is
+in `spool/`. The daemon reads both, and reads each container's folder as
+something the container controls: regular files only, never through a link,
+none larger than 64 KiB, and a record only for that folder's environment. A
+container started before its own folder existed goes on writing `spool/`
+until it restarts. The daemon sends "needs input" events as
 soon as it sees them, and everything else every ten seconds or as soon as 50
 are waiting, at most 100 to a request. A failed send is retried after one
 second, doubling to a ceiling of five minutes, with jitter; after an outage the
@@ -1189,7 +1203,8 @@ spool is replayed in order. Watch deduplicates on `event_id`, so a batch can be
 sent twice safely.
 
 An event Watch refuses (a 4xx other than 401, 408 and 429, or an entry in the
-response's `rejected` list) moves to `spool/rejected/` and is not retried. If
+response's `rejected` list) moves to `spool/rejected/`, or from a container's
+folder to `spools/.rejected/`, and is not retried. If
 Watch rejects the token (401), the daemon keeps the spool, stops sending, and
 `nucleated status` says to run `nucleate login`. Past `max_events` the oldest
 routine events are dropped first and an unsent "needs input" last; events older
