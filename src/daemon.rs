@@ -724,12 +724,17 @@ impl Daemon {
         let mut seen = BTreeSet::new();
         for (id, at) in waiting {
             let (from, spool) = &spools[at];
-            // The same event in a second folder is not a second event.
-            if self.pending.contains_key(&id) || !seen.insert(id.clone()) {
+            // The same event in a second folder is not a second event. An
+            // id counts as seen once a record of it is read: whatever sits
+            // under it in one folder never hides it in another.
+            if self.pending.contains_key(&id) || seen.contains(&id) {
                 continue;
             }
             let mut record = match spool.take(&id) {
-                Ok(record) => record,
+                Ok(record) => {
+                    seen.insert(id.clone());
+                    record
+                }
                 Err(Unread::Gone) => continue,
                 // Not a record this program wrote.
                 Err(Unread::NotARecord) => {

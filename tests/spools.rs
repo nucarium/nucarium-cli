@@ -208,6 +208,32 @@ fn a_record_in_an_environments_folder_for_another_environment_is_dropped() {
 }
 
 #[test]
+fn a_name_planted_in_one_folder_never_hides_the_same_event_in_another() {
+    let rig = Rig::new();
+    rig.configure_in_container("");
+    let mock = gate::watch();
+    rig.sign_in(&mock.url);
+    // The real event, in `client-a`'s own folder.
+    let id = write(
+        &rig.container_spool(),
+        EventType::PermissionPrompt,
+        0,
+        session("client-a", "its-own"),
+    );
+    // In the shared folder, which is read first and which a container
+    // started before its own folder existed still writes: the same id under
+    // the name a set-aside event has, and a folder under its very name.
+    let shared = rig.spool_dir();
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join(format!("{id}@x.json")), "planted").unwrap();
+    std::fs::create_dir(shared.join(format!("{id}.json"))).unwrap();
+    gate::tick(&rig);
+    let told = sent(&mock);
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0]["event_id"], id.as_str());
+}
+
+#[test]
 fn links_pipes_and_files_too_big_to_be_records_are_not_read_and_hold_nothing_up() {
     let rig = Rig::new();
     rig.configure_in_container("");

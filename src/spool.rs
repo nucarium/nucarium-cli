@@ -76,8 +76,23 @@ fn set_aside_dir(state_dir: &Path) -> PathBuf {
 /// no container writes. Old ones there are still counted and pruned.
 const LEGACY_REJECTED: &str = "rejected";
 
-/// The event ids among a folder's entry names, sorted.
+/// The event ids among a spool folder's entry names, sorted: `<id>.json`
+/// with a valid id, and nothing else. A name set aside events go under is
+/// no event waiting, whatever folder it is planted in.
 fn event_ids(names: Vec<String>) -> Vec<String> {
+    let mut ids: Vec<String> = names
+        .into_iter()
+        .filter_map(|name| {
+            let id = name.strip_suffix(".json")?;
+            valid_event_id(id).then(|| id.to_string())
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The event ids among a set-aside folder's entry names, sorted, once each.
+fn set_aside_ids(names: Vec<String>) -> Vec<String> {
     let mut ids: Vec<String> = set_aside_entries(names)
         .into_iter()
         .map(|(_, id)| id)
@@ -226,7 +241,7 @@ impl Spool {
         let mut ids: Vec<String> = self
             .kept()
             .iter()
-            .flat_map(|dir| event_ids(dir.names(self.limit)))
+            .flat_map(|dir| set_aside_ids(dir.names(self.limit)))
             .collect();
         ids.sort();
         ids.dedup();
@@ -476,6 +491,15 @@ mod tests {
         fs::write(&path, serde_json::to_string(&other).unwrap()).unwrap();
         assert_eq!(spool.take(&id), Err(Unread::NotARecord));
         assert_eq!(spool.take(&other.event.event_id), Err(Unread::Gone));
+    }
+
+    #[test]
+    fn only_an_events_own_name_is_an_event_waiting() {
+        let (_dir, spool, id, path) = planted();
+        fs::write(spool.dir().join(format!("{id}@x.json")), "planted").unwrap();
+        assert!(spool.pending().is_empty());
+        fs::write(&path, "").unwrap();
+        assert_eq!(spool.pending(), std::slice::from_ref(&id));
     }
 
     #[test]
