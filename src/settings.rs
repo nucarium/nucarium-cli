@@ -82,6 +82,17 @@ impl Environment {
         self.driver_adapter()
             .is_some_and(|adapter| adapter.owns_worktrees())
     }
+
+    /// The container this environment runs in, named as its unit names it:
+    /// the unit `agent-env-<name>.service` runs the container
+    /// `agent-env-<name>`, as the recipe makes both. Nothing for an
+    /// environment that runs on the host. Two environments with the same
+    /// unit run in the same container: a login's and its driver's.
+    pub fn container(&self) -> Option<&str> {
+        let container = self.unit.strip_suffix(".service")?;
+        let name = container.strip_prefix("agent-env-")?;
+        valid_env_key(name).then_some(container)
+    }
 }
 
 /// What a hand change to a synced file means when a new commit arrives.
@@ -871,6 +882,35 @@ mod tests {
         assert_eq!(settings.environments[1].unit, "ops.service");
         assert_eq!(settings.environments[1].check.as_deref(), Some("true"));
         assert_eq!(settings.housekeeping.cleanup, None);
+    }
+
+    #[test]
+    fn an_environment_runs_in_the_container_its_unit_names_or_on_the_host() {
+        let container = |unit: &str| {
+            let settings = parse(&format!(
+                "[[environment]]\nname = \"client-a\"\nroot = \"/home/agent/client-a\"\n\
+                 unit = \"{unit}\"\ncheck = \"true\"\n"
+            ))
+            .unwrap();
+            settings.environments[0].container().map(str::to_string)
+        };
+        assert_eq!(
+            container("agent-env-client-a.service").as_deref(),
+            Some("agent-env-client-a")
+        );
+        for on_the_host in [
+            "agent-server@client-a.service",
+            "agent-env-client-a",
+            "agent-env-.service",
+            "agent-env-Client A.service",
+            "t3code.service",
+            "my-agent-env-client-a.service",
+        ] {
+            assert_eq!(container(on_the_host), None, "{on_the_host}");
+        }
+        // With no unit, an environment is on the host.
+        let settings = parse("[[environment]]\nname = \"client-a\"\nroot = \"/x\"\n").unwrap();
+        assert_eq!(settings.environments[0].container(), None);
     }
 
     #[test]
