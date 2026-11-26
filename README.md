@@ -100,17 +100,20 @@ A nucleus made by an earlier `nucleate` keeps its clones at
 `.repos/<name>.git`. They are still read, and they move to their owner folders
 the first time `nucleate init`, `nucleate clone`, `nucleate refresh`,
 `nucleated`'s refresh or `nucleated` itself starts. Each move renames the bare
-clone, runs `git worktree repair` inside it so that every worktree registered
-in it points at it again (a session's, a session's `.subworktrees/`, and one a
-driver or a person added), and rewrites the `bare` path in each session's
+clone, points every worktree registered in it at it again (a session's, and a
+session's `.subworktrees/`) by rewriting that worktree's `.git` file as `git
+worktree repair` would, and rewrites the `bare` path in each session's
 manifest. A session at work keeps working: a git command started in it at the
 very moment of the move can fail once. What moved goes to standard error, or
 to `nucleated`'s log. One run at a time moves anything, and running it again
 does nothing.
 
 A repo is left where it is, and the reason said, when the vetting refuses it
-(moving it would mean running git in it), or when the place it would move to
-is taken; such a repo is still listed and used as before. A run that stopped
+(moving it would mean running git in it), when the place it would move to
+is taken, or when it has a worktree registered anywhere but the nucleus's
+`.worktrees/`, which could not be pointed at the new place. Nothing is ever
+written outside `.worktrees/`, whatever a repo's records say. Such a repo is still listed and used as before. A nucleus a
+container writes is not moved at all by `nucleated`. A run that stopped
 part way is finished by the next one, and a manifest that still names the old
 place is read as naming the new one.
 
@@ -544,8 +547,10 @@ and all mode 600:
 
 | Path | Holds |
 |---|---|
-| `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. |
-| `spool/rejected/` | Events Watch refused. Kept for `max_age`, never retried. |
+| `spool/<event_id>.json` | One event waiting to be sent. Written to a temporary name and renamed. Deleted once Watch has it. Host environments and the daemon write here. |
+| `spool/rejected/` | Events from `spool/` that Watch refused, set aside before they went to `spools/.rejected/`. Counted and kept for `max_age`, never retried; nothing new goes here. |
+| `spools/<environment>/<event_id>.json` | The same, from a container environment's hook: each container has its own folder, mounted where `spool/` would be. |
+| `spools/.rejected/` | Events from `spool/` and those folders that Watch refused or that are not records. Kept for `max_age`, never retried. No container has it mounted. |
 | `sessions/<environment>/<session_id>.json` | What the box knows about each session: status, since when, repos, branch, when an event for it was last sent, and the agent process its hooks last ran from. `nucleated status` reads these. |
 | `daemon.json` | The daemon's last heartbeat and what it has sent, and the names of the fields it knows and has not sent because Watch has not said it takes them. |
 | `housekeeping.json` | When each housekeeping job last ran, what it did, and when it last finished with nothing failed. |
@@ -556,7 +561,8 @@ and all mode 600:
 | `pause.json` | The time a maintenance pause ends. Only while one is set. |
 | `notify.json` | What the fallback notifier has posted in the outage in progress. Only during one. |
 | `drivers/<environment>.json` | What the last look at an environment's driver found: one fixed word for whether the driver answered, since when, each session's id, phase and counters, the few things an adapter learned of its driver once and need not ask again, each a name the adapter chose and a number, for a claim in doubt, its key and since when, and, for a session a hook speaks for that waits or has failed while the hook's session does not show it, its id and since when. No title, message or path. |
-| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The hook renews it as it speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `claims/<environment>/<key>/<session_id>.json` | A note that an agent whose own hook reports it is running inside one of that driver's sessions, so the driver's view of it is not reported a second time. The key is the driver's own id for the session, or a number made from a folder's path; never a name a person chose. Inside are the hook's environment and, for where its session works, numbers made from that folder's path and the paths of the folders it is in; never a path. The daemon writes it from the claim in the hook's spool record, counted only when that record came from the spool folder of an environment in the driver's own container, and renews it as the hook speaks. Removed when the hook's session ends, or when the hook has gone quiet and the driver sees the session doing what the hook's session is not (see Drivers). |
+| `claimed/<environment>/<session_id>` | Which of the notes above a hook-reported session holds: the driver's environment and its key. Removed with that note. A driver holds notes on at most 256 of its sessions, and one of its sessions holds at most 8; a claim past either is not noted. |
 | `worktree-actions/` | Watch's actions waiting to run, each with when it reached the box; the result of each that has run, until a heartbeat carrying it is answered; and, in `started.json`, the ids of those started in the last day, each written down before it ran. |
 | `recount` | Left by an action that has run, for the reporter to make its next count at once. |
 | `usage.json` | Per Claude Code environment, its last good plan usage reading: a number made from the config folder's path, for the login it was read for, when it was read, and per limit its window, the model it is for, a percentage and when it resets. No token. |
@@ -739,11 +745,35 @@ seconds, and needs neither the daemon nor the network: it only writes a file.
 ### Drivers
 
 A driver is a tool you run and steer agents with on the box: T3 Code, Herdr,
-Orca. It calls no hook, so the daemon asks it, on a thread of its own that a
-heartbeat never waits for. An environment with `driver` set is watched this
-way. Each agent the driver lists becomes a session of that environment, under
-the driver's own id for it, and each change in what the agent is doing becomes
-the same lifecycle event a hook would have recorded.
+Orca. It calls no hook, so the daemon has it looked at, on threads of its own
+that a heartbeat never waits for. An environment with `driver` set is watched
+this way. Each agent the driver lists becomes a session of that environment,
+under the driver's own id for it, and each change in what the agent is doing
+becomes the same lifecycle event a hook would have recorded.
+
+The daemon never asks a driver itself, and never opens a file, a socket or a
+folder a driver names. A look is the box's own `nucleated look`, run inside
+the environment's container with one `podman exec` (the recipe mounts the
+folder `nucleated` is in read-only at the same path in every container, so
+the daemon runs it by the path it runs from itself). There it reads the
+hook's config, asks the driver, reads the folders the driver names for repo
+names and branches, and prints one small versioned answer: ids, fixed words,
+numbers, repo names and branches held to Watch's patterns, a session folder's
+name, and numbers made from folders. The daemon holds every field of it to a
+fixed list, pattern or cap, and an answer with one field out of line, more
+than 256 sessions, or more than 1 MiB is no answer. An environment on the host
+has its look run the same way, as a program of the daemon's own, with no
+container.
+
+Each environment's look runs on a thread of its own with its own deadline, so
+one that hangs holds up no other. Inside the container a look ends itself,
+and every program it started, after 4.5 seconds, and says it ran out of time.
+On the host it is over after 5, or as soon as its answer runs past 1 MiB:
+the daemon ends from the box whatever of the look is still running in the
+container, by the look's own token, with `SIGKILL`, which nothing in the
+container can block. Its `podman exec` then returns by itself, and the
+engine forgets the exec; one that has not within 3 seconds is stopped.
+Nothing more is run in the container to end a look.
 
 | `driver` | Adapter | Its page |
 |---|---|---|
@@ -758,8 +788,8 @@ What holds for every driver, whatever its adapter:
   driver's answer into a list of named fields and skips every other field
   unread. Nothing skipped is held, logged, written down or sent. What comes
   out of an adapter is an id, what the agent is doing, a short kind for a
-  failure, a time, a counter, and a folder that is used on the box to find a
-  repo's name and a branch and goes no further.
+  failure, a time, a counter, and a folder that is used inside the container
+  to find a repo's name and a branch and goes no further.
 - **Observe only.** An adapter sends its driver the read calls its page names
   and no other. Nothing in the daemon starts, stops or steers an agent, and
   nothing sends a driver a command.
@@ -771,14 +801,22 @@ What holds for every driver, whatever its adapter:
   `unreachable`, `timeout`, `rejected`, `no_token`, `unsupported`, `error` or
   `bad_reply`. `error` is a driver that answered the call with an error of
   its own, or whose program ran and said it failed; what the error says is
-  never read. The word is shown on the box and is not in the heartbeat: to
+  never read. A container that is not running, or a look that could not be
+  started in it, is `absent`; an answer that is not one is `bad_reply`, and
+  one of a newer version `unsupported`. The word is shown on the box and is not in the heartbeat: to
   Watch, a driver that has stopped answering is a live server whose sessions
   have stopped moving. A driver that keeps not answering is asked ever less
   often, up to once a minute.
 - **The hook wins.** An agent that runs inside a driver and also has
-  `nucleated`'s hooks is seen twice. The hook notes which of the driver's
-  sessions it is running in, and for as long as the hook's session lives the
-  driver's view of that agent is not reported. A hook that has stopped
+  `nucleated`'s hooks is seen twice. The hook says in its spool record which
+  of the driver's sessions it is running in, and for as long as the hook's
+  session lives the driver's view of that agent is not reported, and the
+  hook's events carry the driver's reference to that session, for its link.
+  The daemon believes this only from the spool folder of an environment that
+  runs in the same container as the driver: a hook anywhere else cannot see
+  the driver's sessions. The daemon knows an environment's container from its
+  `unit`: `agent-env-<name>.service` runs in the container `agent-env-<name>`,
+  so a driver's environment names its container's unit. A hook that has stopped
   speaking does not win for ever: an agent killed without its `SessionEnd`
   leaves a session that stays open until the daemon sees its process has
   gone, or for ever where it cannot, and must not hide whatever runs in its
@@ -789,7 +827,7 @@ What holds for every driver, whatever its adapter:
   contradicts nothing, and a hook that speaks again wins again.
 
   A hook is believed for what its own session shows, and for nothing more.
-  Its note is a file any program on the box could write, by running
+  Its word is a record any program in that container could write, by running
   `nucleated hook` with a driver's variables set. So it never keeps from you
   a session that waits on you or has failed: when the driver sees either,
   and no hook that speaks for the session shows the same within a minute and
@@ -1050,11 +1088,13 @@ runs; the folders are listed all the same, and each heartbeat says
 
 ### Fields Watch has to ask for
 
-Eight fields of a heartbeat are newer than the contract every Watch holds:
-`driver`, `driver_ref`, `config_commit`, `config_modified`, `config_state`,
-`setup`, `usage` and `worktrees`, which brings `worktree_action_results` and
-`worktree_actions_allowed` with it. Watch refuses a heartbeat that carries a
-field it does not name, and a refused heartbeat is a box gone dark, with every
+Nine fields of a heartbeat are newer than the contract every Watch holds:
+`agent`, `driver`, `driver_ref`, `config_commit`, `config_modified`,
+`config_state`, `setup`, `usage` and `worktrees`, which brings
+`worktree_action_results` and `worktree_actions_allowed` with it. So are two
+fields of an event, `driver_env` and `driver_session`, which Watch names
+together as `driver_session`. Watch refuses a heartbeat that carries a field
+it does not name, and a refused heartbeat is a box gone dark, with every
 environment on it looking down and no event sent. So the daemon sends none of
 them on a guess.
 
@@ -1092,6 +1132,7 @@ Every payload is built from named fields. This is the whole list.
 | `error_kind` | The hook's `error`, for `StopFailure` only, and only when it is a short kind such as `rate_limit`. |
 | `limit_resets_at` | When the agent says a usage limit resets, for `StopFailure` only: a timestamp, kept only from a minute before to eight days after the event. Claude Code's hook gives none, so none is sent. |
 | `client_ts` | The box's clock. |
+| `driver_env`, `driver_session`, together, to a Watch that names `driver_session` in `accepts` | For a session that runs inside a driver's session on the same box: the driver environment's `name` in the config, and the driver's own id for that session (letters, digits, `.`, `_`, `:` and `-`). |
 | `commits`, with an `outcome` only | How many commits the session made: those on its branch since the commit each worktree started from. A number. |
 | `uncommitted_repos`, `unpushed_commits`, with an `outcome` only | How many of the session's repos hold uncommitted changes, and how many of its commits are on no remote. Numbers. |
 | `pull_requests`, with an `outcome` only | The addresses of the open pull requests whose head is the session's commit, from GitHub. Each is `https://github.com/<owner>/<name>/pull/<number>` on a repo the same event names in `repos`, and nothing else: no title, no query, no fragment. |
@@ -1099,6 +1140,7 @@ Every payload is built from named fields. This is the whole list.
 | Heartbeat, about the box | `on_battery`, yes or no, from NUT, only with `[ups]` set. `reboot_required`, yes or no, on Debian and Ubuntu, where `/var/run/reboot-required` says so. `uncommitted_repos`, `unpushed_commits` and `last_snapshot_at`: the box's unsaved work with each nucleus counted once, and the time since which every nucleus has had a good snapshot. `paused_until`, a timestamp, only while a maintenance pause is set. |
 | Heartbeat, per environment | `server_restarts`, systemd's running count of restarts of the agent server's unit. `unsaved`: `uncommitted_repos`, `unpushed_commits` and `counted_at`, two numbers and a time. `last_snapshot_at`, when the snapshot job last finished for that nucleus with nothing failed. |
 | Heartbeat, per environment, when the agent's adapter can read it | `agent_version`, a short version string, and `login_expires_at`, a timestamp. For Claude Code neither is sent. |
+| Heartbeat, per environment not watched through a driver, to a Watch that names the field in `accepts` | `agent`, the environment's `agent` from the config, such as `claude-code` or `codex`. |
 | Heartbeat, per environment watched through a driver, to a Watch that names the field in `accepts` | `driver`, the driver's name from the config: `t3code`, `herdr-core`, `herdr-tui` or `orca`. `driver_ref`, the driver's own id for its installation, only for a driver whose links need one and only when it is an id (letters, digits, `.`, `_`, `:` and `-`). |
 | Heartbeat, per Claude Code environment with a good plan usage reading, to a Watch that names the field in `accepts` | `usage`: `read_at`, a timestamp, and `limits`, at most 16, each a `window`, one of two fixed words, a `scope`, a model's name of at most 32 letters, digits, `.`, `+` and `-`, with no space, `used_pct`, a number from 0 to 100, and `resets_at`, a timestamp. |
 | Heartbeat, per environment, with `[config_sync]` set, to a Watch that names the field in `accepts` | `config_commit`, a git commit id in hex. `config_modified`, yes or no. `config_state`, one of six fixed words. |
@@ -1177,7 +1219,13 @@ the gate: if one fails, do not release.
 
 ### Spool and replay
 
-The hook writes one file per event. The daemon sends "needs input" events as
+The hook writes one file per event. In a container environment that file is
+in the container's own spool folder, `spools/<environment>/`; elsewhere it is
+in `spool/`. The daemon reads both, and reads each container's folder as
+something the container controls: regular files only, never through a link,
+none larger than 64 KiB, and a record only for that folder's environment. A
+container started before its own folder existed goes on writing `spool/`
+until it restarts. The daemon sends "needs input" events as
 soon as it sees them, and everything else every ten seconds or as soon as 50
 are waiting, at most 100 to a request. A failed send is retried after one
 second, doubling to a ceiling of five minutes, with jitter; after an outage the
@@ -1185,7 +1233,8 @@ spool is replayed in order. Watch deduplicates on `event_id`, so a batch can be
 sent twice safely.
 
 An event Watch refuses (a 4xx other than 401, 408 and 429, or an entry in the
-response's `rejected` list) moves to `spool/rejected/` and is not retried. If
+response's `rejected` list) moves to `spools/.rejected/`, which no container
+has mounted, and is not retried. If
 Watch rejects the token (401), the daemon keeps the spool, stops sending, and
 `nucleated status` says to run `nucleate login`. Past `max_events` the oldest
 routine events are dropped first and an unsent "needs input" last; events older
@@ -1371,7 +1420,13 @@ there:
   then hands git a worktree's folders as it checked them, so a worktree's
   pointer changed after the check is not followed.
   The worktrees of a driver that owns them belong to repos of the owner's
-  choosing: their config is checked, and where they point is not.
+  choosing: their config is checked, and where they point is not, unless the
+  driver runs in a container. Then they must point inside the folders of the
+  environments in that container.
+- It follows no link in place of `.worktrees` or of a session folder, and
+  reads a session's manifest only up to 1 MiB and never through a link. For
+  an environment in a container, a worktree whose path leads out of the
+  environment's folders is not looked at, and its count is then unknown.
 - It refuses a worktree whose index names a submodule, checked out or not:
   `git add` and `git status` start git again inside one that is checked out,
   where that repository's own config would be read and not checked. A repo

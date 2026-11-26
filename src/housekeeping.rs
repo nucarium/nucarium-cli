@@ -78,6 +78,16 @@ pub(crate) fn sharing_nucleus(settings: &Settings, environment: &Environment) ->
         .collect()
 }
 
+/// Whether a container can write this environment's nucleus: it runs in
+/// one, or shares its nucleus with one that does.
+pub(crate) fn contained(settings: &Settings, environment: &Environment) -> bool {
+    environment.container().is_some()
+        || sharing_nucleus(settings, environment)
+            .iter()
+            .filter_map(|name| settings.environment(name))
+            .any(|other| other.container().is_some())
+}
+
 /// One environment per nucleus: where two logins share a nucleus, a job over
 /// it runs once, under the first of them. An environment whose driver owns
 /// its worktrees has no nucleus, and no job ever runs over it.
@@ -103,15 +113,28 @@ pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
 /// them, and only their config is held to the allowlist.
 pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Workspace {
     let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
+    let mut guarded = git::Guarded::new(repos, settings.git_vetting);
+    // A driver in a container chooses its worktrees' repositories, but only
+    // among the folders of the environments in that container, which is all
+    // of the box it can see: the box holds them there.
+    if let Some(container) = environment
+        .container()
+        .filter(|_| environment.driver_owns_worktrees())
+    {
+        let folders: Vec<PathBuf> = settings
+            .environments
+            .iter()
+            .filter(|other| other.container() == Some(container))
+            .flat_map(Environment::own_folders)
+            .collect();
+        guarded = guarded.held_to(&folders);
+    }
     Workspace::new(config::for_root(
         &environment.root,
         environment.github_token_file.clone(),
         environment.branch_prefix.clone(),
     ))
-    .guarded(git::Git::Guarded(git::Guarded::new(
-        repos,
-        settings.git_vetting,
-    )))
+    .guarded(git::Git::Guarded(guarded))
 }
 
 /// Where GitHub's answers about merged commits are remembered, for cleanup
@@ -149,7 +172,9 @@ pub fn run_job(
         Job::Refresh => {
             // A nucleus made before owner folders moves to them first.
             // One that fails says so, and the repos are fetched as they are.
-            let moved = match dry_run {
+            // Not one a container writes: the move has git repair its
+            // repos' worktrees, which a session can point anywhere.
+            let moved = match dry_run || contained(settings, environment) {
                 true => Vec::new(),
                 false => match workspace.move_to_owner_folders() {
                     Ok(moved) => moved.lines(),

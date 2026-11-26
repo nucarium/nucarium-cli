@@ -67,7 +67,7 @@ impl Call {
 /// A socket is connected to within this long.
 const CONNECT: Duration = Duration::from_secs(2);
 /// Once connected, the call is written and its answer read within this long.
-/// Both together stay inside [`super::LOOK_LIMIT`].
+/// Both together take no longer than [`super::ASK_LIMIT`].
 const ANSWER: Duration = Duration::from_secs(2);
 /// An answer is one line no longer than this. A box's terminals fit many
 /// times over; what does not fit is not an answer.

@@ -1,6 +1,7 @@
 //! Thin wrappers around the `git` command line, and the guarded way
 //! `nucleate` and the daemon run it.
 
+use crate::paths;
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -361,6 +362,10 @@ pub struct Guarded {
     /// Nothing for the worktrees of a driver that owns them, which belong to
     /// repositories of the owner's choosing; their config is still vetted.
     repos: Option<PathBuf>,
+    /// Without `repos`, the folders every repository's git data must still
+    /// be in, when they are named: those of a driver in a container, which
+    /// is all of the box such a driver's worktrees can be of.
+    within: Option<Vec<PathBuf>>,
     vetting: Vetting,
 }
 
@@ -395,23 +400,6 @@ fn short_name(path: &Path) -> String {
     name.strip_suffix(".git").unwrap_or(&name).to_string()
 }
 
-/// A small file's text. Anything but a plain file is an error: opening a
-/// pipe a session planted in place of a pointer must not wait for a writer.
-pub(crate) fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a plain file"));
-    }
-    let mut text = String::new();
-    file.take(max).read_to_string(&mut text)?;
-    Ok(text)
-}
-
 impl Guarded {
     /// `repos` is the nucleus's `.repos`, or nothing for a driver's worktrees.
     pub fn new(repos: Option<PathBuf>, vetting: Vetting) -> Guarded {
@@ -420,8 +408,21 @@ impl Guarded {
             github: None,
             logs: true,
             repos,
+            within: None,
             vetting,
         }
+    }
+
+    /// Hold the git data of repositories with no `.repos` to these folders.
+    /// A folder that is not there holds nothing.
+    pub fn held_to(mut self, folders: &[PathBuf]) -> Guarded {
+        self.within = Some(
+            folders
+                .iter()
+                .filter_map(|folder| folder.canonicalize().ok())
+                .collect(),
+        );
+        self
     }
 
     /// Log no refusal: the caller fails with it instead.
@@ -454,9 +455,26 @@ impl Guarded {
         command
     }
 
+    /// The folder a resolved path is held inside, when there is one to
+    /// hold it to: the nucleus's repos, or the one of `within` it is in.
+    fn root_of(&self, path: &Path) -> Option<PathBuf> {
+        match &self.repos {
+            Some(repos) => repos.canonicalize().ok(),
+            None => self
+                .within
+                .as_ref()?
+                .iter()
+                .find(|folder| path.starts_with(folder))
+                .cloned(),
+        }
+    }
+
     fn inside(&self, path: &Path) -> bool {
         let Some(repos) = &self.repos else {
-            return true;
+            return self
+                .within
+                .as_ref()
+                .is_none_or(|within| within.iter().any(|folder| path.starts_with(folder)));
         };
         repos
             .canonicalize()
@@ -499,7 +517,15 @@ impl Guarded {
         if !self.inside(&git_dir) {
             return Err(Reason::Pointer);
         }
-        let common = match read_small(&git_dir.join("commondir"), MAX_POINTER) {
+        // Read from the git folder held open, reached from the folder it is
+        // held to without following a link: one swapped in on the way since
+        // it was resolved is refused, never read through.
+        let held = match self.root_of(&git_dir) {
+            Some(root) => paths::Dir::beneath(&root, &git_dir),
+            None => paths::Dir::open(&git_dir, false),
+        }
+        .map_err(|_| Reason::Pointer)?;
+        let common = match held.read_plain("commondir", MAX_POINTER) {
             Ok(text) => git_dir
                 .join(text.trim_end_matches(['\n', '\r']))
                 .canonicalize()
@@ -520,11 +546,16 @@ impl Guarded {
     /// above it.
     fn pin_worktree(&self, dir: &Path) -> Result<Pinned, Reason> {
         let dot = dir.join(".git");
-        let meta = std::fs::symlink_metadata(&dot).map_err(|_| Reason::Pointer)?;
-        if !meta.is_file() {
+        // The worktree held open, so that the `.git` looked at is the one
+        // read: never through a link, and never a pipe or a device.
+        let held = paths::Dir::open(dir, false).map_err(|_| Reason::Pointer)?;
+        let entry = held.look(".git").map_err(|_| Reason::Pointer)?;
+        if !entry.regular {
             return self.pin_git_dir(&dot);
         }
-        let text = read_small(&dot, MAX_POINTER).map_err(|_| Reason::Pointer)?;
+        let text = held
+            .read_plain(".git", MAX_POINTER)
+            .map_err(|_| Reason::Pointer)?;
         let target = text
             .lines()
             .next()
@@ -749,25 +780,6 @@ impl Git {
             Git::Plain => bare(dir, args),
             Git::Guarded(_) => checked(self.try_bare(dir, args)?, Some(("--git-dir", dir)), args),
         }
-    }
-
-    /// `git worktree repair` in a bare repo, so that the worktrees it has
-    /// registered point at it again after it moved. Run from inside the
-    /// bare repo itself: repair also repairs the folder it is run from, and
-    /// run from another repository's worktree it would point that one here.
-    pub fn repair_worktrees(&self, bare: &Path) -> Result<()> {
-        let args = ["worktree", "repair"];
-        let out = match self {
-            Git::Plain => {
-                let mut command = Command::new("git");
-                command.arg("--git-dir").arg(bare).args(args);
-                collect(command.current_dir(bare))?
-            }
-            Git::Guarded(guarded) => {
-                collect(guarded.prepare(bare, true, &args, None)?.current_dir(bare))?
-            }
-        };
-        checked(out, Some(("--git-dir", bare)), &args).map(drop)
     }
 
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {

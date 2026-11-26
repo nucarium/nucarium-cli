@@ -54,8 +54,8 @@ const PROTOCOL_TEXT: &str = "2";
 /// The version of `server-runtime.json` this adapter reads
 /// (apps/server/src/serverRuntimeState.ts).
 const RUNTIME_VERSION: u64 = 1;
-/// A look, both requests together, is given up after this long: inside
-/// [`super::LOOK_LIMIT`] with room to spare.
+/// A look, both requests together, is given up after this long: no longer
+/// than [`super::ASK_LIMIT`].
 const BUDGET: Duration = Duration::from_secs(4);
 const CONNECT: Duration = Duration::from_secs(1);
 /// A runtime file or a token longer than this is not one.

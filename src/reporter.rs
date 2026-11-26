@@ -24,7 +24,7 @@ use crate::housekeeping;
 use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
-use crate::workspace::{RepoInfo, Workspace};
+use crate::workspace::{RepoInfo, Workspace, SUBWORKTREES};
 use crate::worktrees::{self, Worktree};
 use crate::{driver, git, github, paths};
 use serde::{Deserialize, Serialize};
@@ -220,6 +220,28 @@ fn commit_id(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
+/// The folders the box holds what it reads for an environment to, when a
+/// container can write there: the environment's own, resolved. Nothing for
+/// folders only the host writes, which are read as they are.
+fn held_to(settings: &Settings, environment: &Environment) -> Option<Vec<PathBuf>> {
+    housekeeping::contained(settings, environment).then(|| {
+        environment
+            .own_folders()
+            .iter()
+            .filter_map(|folder| folder.canonicalize().ok())
+            .collect()
+    })
+}
+
+/// Whether `path` is in one of the folders a read is `held` to. A path that
+/// cannot be resolved is in none of them.
+fn inside(held: Option<&[PathBuf]>, path: &Path) -> bool {
+    held.is_none_or(|folders| {
+        path.canonicalize()
+            .is_ok_and(|path| folders.iter().any(|folder| path.starts_with(folder)))
+    })
+}
+
 /// How many commits a session made in one repo: those on its branch since
 /// the commit its worktree started from.
 fn commits_made(workspace: &Workspace, info: &RepoInfo) -> Option<u32> {
@@ -323,8 +345,16 @@ impl Reporter {
             .workspace(settings, environment)
             .leaving_alone(driver::protected_roots(settings));
         let git = workspace.git();
+        let held = held_to(settings, environment);
         let counted = (|| -> Option<()> {
             for item in workspace.available().ok()? {
+                // A container writes where its repos' worktrees are said to
+                // be: one said to be outside its folders is not looked at,
+                // and the count is not known without it.
+                if !inside(held.as_deref(), &item.bare) {
+                    tally.left_out = true;
+                    continue;
+                }
                 if tally.refuses(git, git.vet_bare(&item.bare)) {
                     continue;
                 }
@@ -334,6 +364,10 @@ impl Reporter {
                     // repos is counted here, the nucleus's own or not:
                     // counting only reads.
                     if !worktree.is_dir() || workspace.under_a_driver(&worktree) {
+                        continue;
+                    }
+                    if !inside(held.as_deref(), &worktree) {
+                        tally.left_out = true;
                         continue;
                     }
                     let refused = git.vet_tree(&worktree).map(|refused| git::Refused {
@@ -379,8 +413,15 @@ impl Reporter {
         }
         let workspace = self.workspace(settings, environment);
         let git = workspace.git();
+        let held = held_to(settings, environment);
         let counted = (|| -> Option<()> {
             for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
+                // In a container, a worktree is in the driver's own folders,
+                // not at the end of a link out of them.
+                if !inside(held.as_deref(), worktree) {
+                    tally.left_out = true;
+                    continue;
+                }
                 if tally.refuses(git, git.vet_tree(worktree)) {
                     continue;
                 }
@@ -503,24 +544,41 @@ impl Reporter {
         })?;
         let sessions = environment.root.join(".worktrees");
         // A nucleus that is not there, on a disk that is not mounted say,
-        // tells nothing about what a session in it holds.
-        if !sessions.is_dir() {
-            return None;
-        }
+        // tells nothing about what a session in it holds. Nor does a link
+        // in the place of its sessions' folder, or of one session's: what
+        // it leads to is not this nucleus's. Each is held open, never
+        // through a link, and the manifest read from the session's folder
+        // held, so a link swapped in meanwhile is not followed either.
+        let held = paths::Dir::open(&sessions, false).ok()?;
         let folder = sessions.join(name);
-        if !folder.exists() {
-            // The session's folder is gone, and with it anything that
-            // existed only there. What else it left is no longer knowable.
-            draft.uncommitted_repos = Some(0);
-            draft.unpushed_commits = Some(0);
-            return Some(draft);
-        }
-        let manifest = Workspace::load_manifest(&folder).ok()?;
+        let session = match held.at(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The session's folder is gone, and with it anything that
+                // existed only there. What else it left is no longer
+                // knowable.
+                draft.uncommitted_repos = Some(0);
+                draft.unpushed_commits = Some(0);
+                return Some(draft);
+            }
+            Ok(session) => session,
+            Err(_) => return None,
+        };
+        let manifest = Workspace::load_manifest_in(&session, &folder).ok()?;
         let workspace = self.workspace(settings, environment);
+        // Git runs only in the worktrees the folder really holds: each a
+        // folder directly in it, of the repo its manifest names, which has
+        // it registered there. The session wrote the manifest.
+        let held: Vec<RepoInfo> = workspace
+            .session_worktrees(&folder)
+            .ok()?
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with(SUBWORKTREES))
+            .map(|(_, info)| info)
+            .collect();
         let mut commits = Some(0u32);
         let mut unsaved = Some((0u32, 0u32));
         let mut pulls = Some(Vec::new());
-        for info in manifest.repos.values().filter(|info| info.path.is_dir()) {
+        for info in held.iter().filter(|info| info.path.is_dir()) {
             let made = commits_made(&workspace, info);
             commits = commits
                 .zip(made)

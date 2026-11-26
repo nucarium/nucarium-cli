@@ -32,8 +32,11 @@ mod layout;
 pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
+/// The most of a manifest that is read. A session can write its own, and
+/// one with every repo of a nucleus in it is a few kilobytes.
+const MAX_MANIFEST: u64 = 1024 * 1024;
 /// Where the worktrees a session's subagents make go, inside the session.
-const SUBWORKTREES: &str = ".subworktrees";
+pub(crate) const SUBWORKTREES: &str = ".subworktrees";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -691,9 +694,26 @@ impl Workspace {
                 session.display()
             );
         }
-        let text = fs::read_to_string(&path)?;
+        // Not through a link, and not without end: the session wrote it.
+        let text = paths::read_plain(&path, MAX_MANIFEST)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Self::parse_manifest(&text, &path)
+    }
+
+    /// The manifest of the session folder `held` open, which is `session`:
+    /// read from that very folder, so a link swapped in for the folder
+    /// since it was opened is not followed.
+    pub fn load_manifest_in(held: &paths::Dir, session: &Path) -> Result<Manifest> {
+        let path = session.join(MANIFEST);
+        let text = held
+            .read_plain(MANIFEST, MAX_MANIFEST)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Self::parse_manifest(&text, &path)
+    }
+
+    fn parse_manifest(text: &str, path: &Path) -> Result<Manifest> {
         let mut manifest: Manifest =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
         // A repo moved to its owner folder since this was written.
         layout::relocate_all(&mut manifest);
         Ok(manifest)
@@ -1293,10 +1313,11 @@ impl Workspace {
         pointer: &Path,
         repos: &'a [(PathBuf, Available)],
     ) -> Option<(&'a PathBuf, &'a Available)> {
-        if !fs::symlink_metadata(pointer).ok()?.is_file() {
-            return None;
-        }
-        let text = git::read_small(pointer, 4096).ok()?;
+        // Read from its folder held open: a regular file, the one looked at,
+        // never through a link and never a pipe or a device.
+        let held = paths::Dir::open(pointer.parent()?, false).ok()?;
+        let name = pointer.file_name()?.to_str()?;
+        let text = held.read_plain(name, 4096).ok()?;
         let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
         let target = PathBuf::from(target).canonicalize().ok()?;
         let worktrees = target.parent()?;

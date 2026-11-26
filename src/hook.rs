@@ -9,11 +9,11 @@ use crate::agent::{self, Agent, Lifecycle};
 use crate::driver;
 use crate::envelope::{unix_ms, Draft, Envelope};
 use crate::github;
+use crate::paths;
 use crate::process;
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
 use crate::workspace::Manifest;
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -123,6 +123,14 @@ fn located<'a>(
     })
 }
 
+/// The most of a session folder's manifest that is read.
+const MAX_MANIFEST: u64 = 64 * 1024;
+/// The most of a pointer git keeps in a file of its own (`.git`, `HEAD`,
+/// `commondir`) that is read.
+const MAX_POINTER: u64 = 4096;
+/// The most of a repository's git config that is read for its remote.
+const MAX_GIT_CONFIG: u64 = 256 * 1024;
+
 /// Where a session is working: its repos, its branch, and its nucleus session
 /// folder if it has one.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -132,6 +140,21 @@ pub(crate) struct Place {
     pub(crate) workspace: Option<String>,
 }
 
+/// A small file's text, as the hook reads the files of its own container
+/// where it runs: a link is followed, by resolving the path first, and what
+/// it resolves to is looked at and then opened without following anything
+/// further, so a pipe or a device a link names is refused and never opened.
+/// A folder on the way swapped for a link meanwhile is not caught: the box
+/// never reads this way. Truncated at `max` bytes.
+fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
+    let path = path.canonicalize()?;
+    let looked = paths::look_regular(&path)?;
+    let file = paths::open_looked(&path, &looked)?;
+    let mut text = String::new();
+    file.take(max).read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// A nucleus session: the manifest names its repos and its branch.
 fn nucleus_place(root: &Path, cwd: &Path) -> Option<Place> {
     let sessions = root.canonicalize().ok()?.join(".worktrees");
@@ -139,7 +162,8 @@ fn nucleus_place(root: &Path, cwd: &Path) -> Option<Place> {
         .ancestors()
         .find(|dir| dir.parent() == Some(sessions.as_path()))?;
     let manifest: Manifest =
-        serde_json::from_str(&fs::read_to_string(session.join(".workspace.json")).ok()?).ok()?;
+        serde_json::from_str(&read_small(&session.join(".workspace.json"), MAX_MANIFEST).ok()?)
+            .ok()?;
     Some(Place {
         repos: manifest
             .repos
@@ -183,7 +207,9 @@ fn repository_folder(common: &Path) -> Option<String> {
 }
 
 /// Any other checkout: read the branch and the remote from git's own files,
-/// without running git, so this cannot hang.
+/// without running git, so this cannot hang. Each is read only if it is a
+/// plain file, and only so much of it: a pipe planted in place of one is not
+/// waited on, and a link to a device that never ends is not read.
 ///
 /// A repository on GitHub is named as GitHub names it. Any other is named by
 /// the folder it lives in. For a linked worktree that is the folder of the
@@ -197,10 +223,10 @@ fn checkout_place(cwd: &Path) -> Option<Place> {
         dot_git
     } else {
         // A linked worktree: `.git` is a file pointing at its git folder.
-        let pointer = fs::read_to_string(&dot_git).ok()?;
+        let pointer = read_small(&dot_git, MAX_POINTER).ok()?;
         top.join(pointer.trim().strip_prefix("gitdir:")?.trim())
     };
-    let branch = fs::read_to_string(git_dir.join("HEAD"))
+    let branch = read_small(&git_dir.join("HEAD"), MAX_POINTER)
         .ok()
         .and_then(|head| {
             head.trim()
@@ -208,11 +234,11 @@ fn checkout_place(cwd: &Path) -> Option<Place> {
                 .map(str::to_string)
         });
     // A linked worktree's git folder names the repository's own.
-    let (common, linked) = match fs::read_to_string(git_dir.join("commondir")) {
+    let (common, linked) = match read_small(&git_dir.join("commondir"), MAX_POINTER) {
         Ok(relative) => (git_dir.join(relative.trim()), true),
         Err(_) => (git_dir, false),
     };
-    let label = fs::read_to_string(common.join("config"))
+    let label = read_small(&common.join("config"), MAX_GIT_CONFIG)
         .ok()
         .and_then(|config| origin_url(&config))
         .and_then(|url| github::slug(&url))
@@ -296,6 +322,16 @@ pub fn record_as(
         branch: place.branch,
         error_kind,
         limit_resets_at,
+        // If this agent runs inside a driver's session, the driver lists it
+        // too. The record says so, and the daemon has the driver's adapter
+        // stand aside: the hook wins.
+        claim: driver::hook_claim(
+            settings,
+            environment,
+            adapter.name(),
+            cwd.as_deref(),
+            &|name| std::env::var(name).ok(),
+        ),
         // What a session left behind is the reporter's to say, not a hook's.
         ..Draft::default()
     };
@@ -310,23 +346,13 @@ pub fn record_as(
     if spool.holds_at_least(settings.spool_max_events.saturating_mul(2)) {
         return None;
     }
-    let written = spool.write(&record).ok()?;
-    // If this agent runs inside a driver's session, the driver lists it too.
-    // Say so, and the driver's adapter stands aside: the hook wins.
-    driver::note_claims(
-        settings,
-        &record.event.env_id,
-        adapter.name(),
-        &record.event.session_id,
-        cwd.as_deref(),
-        &|name| std::env::var(name).ok(),
-    );
-    Some(written)
+    spool.write(&record).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// A repository with one commit and no GitHub remote, and a linked
     /// worktree of it in a folder named for a task.
@@ -395,6 +421,40 @@ mod tests {
         let own = checkout_place(&dir.path().join("web")).unwrap();
         assert_eq!(own.repos, ["web"]);
         assert_eq!(own.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_pipe_or_a_device_planted_in_a_checkout_is_never_waited_on_or_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = linked(dir.path(), "web", false);
+        let started = std::time::Instant::now();
+        // `.git` as a pipe nobody writes to.
+        let piped = dir.path().join("piped");
+        fs::create_dir_all(&piped).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(piped.join(".git"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(checkout_place(&piped), None);
+        // A worktree whose HEAD is a link to a device that never ends.
+        let pointer = read_small(&worktree.join(".git"), MAX_POINTER).unwrap();
+        let git_dir = PathBuf::from(pointer.trim().strip_prefix("gitdir:").unwrap().trim());
+        fs::remove_file(git_dir.join("HEAD")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", git_dir.join("HEAD")).unwrap();
+        let place = checkout_place(&worktree).unwrap();
+        assert_eq!(place.branch, None);
+        assert_eq!(place.repos, ["web"]);
+        // Its repository's config as a pipe too.
+        let config = dir.path().join("web").join(".git").join("config");
+        fs::remove_file(&config).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&config)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(checkout_place(&worktree).unwrap().branch, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

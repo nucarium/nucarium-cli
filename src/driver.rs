@@ -1,10 +1,19 @@
 //! The seam between a driver and the event envelope.
 //!
 //! A driver is a tool people use to run and steer agents on the box: T3
-//! Code, Herdr, Orca. It calls no hook, so the daemon asks it, on a thread of
+//! Code, Herdr, Orca. It calls no hook, so the daemon asks it, on threads of
 //! its own beside housekeeping and the reporter. Each driver has one adapter,
 //! in a file of its own under `src/driver/`, and that file holds everything
 //! that knows how the driver is asked and what its answer looks like.
+//!
+//! The host never asks a driver, and never opens a file, a socket or a
+//! folder a driver names. A look is the box's own `nucleated`, run inside the
+//! environment's container through one `podman exec` with a deadline of its
+//! own ([`inside`]). There the adapter asks its driver and the folders it
+//! names are read, as a hook in that container would read them; what comes
+//! back is a small versioned answer of ids, fixed words, numbers, repo names
+//! and branches ([`answer`]), which the host holds field by field to fixed
+//! lists, patterns and caps before it believes any of it.
 //!
 //! An adapter does one thing: it takes one look at its driver and says which
 //! sessions it saw and what each is doing, in the words below. Everything
@@ -19,8 +28,8 @@
 //!   no driver offers a way to leave it out. An adapter reads its answer
 //!   through [`crate::allowlist`] into structs that name only the fields its
 //!   design lists. What comes out of an adapter is an id, a phase, a short
-//!   kind, a time, a counter and a folder; the folder is used on the box to
-//!   find a repo name and a branch, and is never stored or sent.
+//!   kind, a time, a counter and a folder; the folder is used inside the
+//!   container to find a repo name and a branch, and never leaves it.
 //! - **Observe only.** An adapter sends its driver only the read calls its
 //!   design names, and a test of its own asserts the exact calls made.
 //!   Nothing here starts, stops, steers or sends a command to anything.
@@ -29,7 +38,8 @@
 //!   session, and no change to whether the environment's server is alive,
 //!   which is asked of its supervisor and never of the driver.
 
-use crate::envelope::{unix_ms, valid_session_id, Draft, Envelope, EventType};
+use crate::bounded::{self, Failure};
+use crate::envelope::{self, unix_ms, valid_env_key, valid_session_id, Draft, Envelope, EventType};
 use crate::housekeeping;
 use crate::paths;
 use crate::sessions::{Status, Store, ACTIVITY_BEAT};
@@ -39,16 +49,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+pub mod answer;
+pub mod cut_off;
 pub mod herdr_core;
 pub mod herdr_tui;
+pub mod inside;
 pub mod orca;
 pub mod t3code;
 
-/// An adapter's look returns within this long, whatever its driver does.
+use answer::{Answer, Seen};
+
+/// A look is over within this long on the host, whatever the driver or the
+/// container does: `podman exec`, the look inside it, and its answer.
 pub const LOOK_LIMIT: Duration = Duration::from_secs(5);
+/// Inside the container, a look ends itself and everything it started
+/// within this long, so that it is over before the host gives up on it.
+pub const INNER_LIMIT: Duration = Duration::from_millis(4500);
+/// An adapter's own calls to its driver are given up after this long, inside
+/// [`INNER_LIMIT`] with room for reading the folders it names.
+pub const ASK_LIMIT: Duration = Duration::from_secs(4);
+/// How long the host gives the container engine to say which process is a
+/// container's first, to end a look it gave up on.
+const END_LIMIT: Duration = Duration::from_secs(2);
+/// How long `podman exec` is then given to return by itself, as it does once
+/// the look has ended, before it is stopped.
+const END_GRACE: Duration = Duration::from_secs(3);
 /// A session a complete look does not list is ended once this many looks in
 /// a row have not listed it. One look can catch a driver between two states.
 pub const MISSING_LOOKS: u8 = 2;
@@ -76,7 +106,14 @@ const CLAIM_QUIET: Duration = Duration::from_secs(120);
 const CLAIM_UNHEARD: Duration = Duration::from_secs(90);
 /// A claim names at most this many folders: where its hook's session works,
 /// and the folders that one is in.
-const CLAIM_FOLDERS: usize = 64;
+const CLAIM_FOLDERS: usize = envelope::MAX_CLAIM_FOLDERS;
+/// A driver environment holds claims on at most this many of its sessions,
+/// as many as one look can report.
+const CLAIMED_KEYS: usize = answer::MAX_SESSIONS;
+/// At most this many hook-reported sessions hold a claim on one of a
+/// driver's sessions at once. A claim beyond either limit is not noted: the
+/// claims are the box's own, but a container chooses how many it makes.
+const CLAIMS_PER_KEY: usize = 8;
 
 /// What a driver's agent is doing, in the daemon's words. An adapter maps
 /// its driver's documented state words to these and says nothing for a word
@@ -127,8 +164,9 @@ pub struct Observed {
     /// With [`Phase::Failed`] on a usage limit, when the driver says the
     /// limit resets. A time the adapter parsed from a documented field.
     pub limit_resets_at: Option<SystemTime>,
-    /// The folder the session works in. Used on the box, as a hook's `cwd`
-    /// is, to find the session's repos and branch. Never stored, never sent.
+    /// The folder the session works in. Read inside the container, as a
+    /// hook's `cwd` is, to find the session's repos and branch, and never
+    /// handed to the host.
     pub cwd: Option<PathBuf>,
     /// A number that only grows while the agent is doing things: a count of
     /// items, or a time of last activity in milliseconds. While the session
@@ -185,10 +223,10 @@ pub struct Look {
     /// and are never sent.
     pub facts: BTreeMap<&'static str, u64>,
     /// For a driver that owns its worktrees: the folder of every git
-    /// worktree its answer listed, with an agent in it or not. Compared on
-    /// the box with what [`Driver::worktrees`] finds, so that the count of
-    /// unsaved work is never sent as a number while it leaves one of them
-    /// out. Never stored, never sent: only how many are left out is kept.
+    /// worktree its answer listed, with an agent in it or not. Compared
+    /// inside the container with what [`Driver::worktrees`] finds, so that
+    /// the count of unsaved work is never sent as a number while it leaves
+    /// one of them out. Only how many are left out reaches the host.
     pub worktrees: Vec<PathBuf>,
 }
 
@@ -286,9 +324,11 @@ pub trait Driver: Sync {
     }
 
     /// One look at the driver's agents: only the read calls the adapter's
-    /// design names, within [`LOOK_LIMIT`], touching nothing beyond the box.
+    /// design names, within [`ASK_LIMIT`], touching nothing beyond the box.
+    /// Runs inside the environment's container, in `nucleated look`.
     /// `previous` is what the last look left, for an adapter that asks its
-    /// driver something once and not at every look.
+    /// driver something once and not at every look: its condition, when it
+    /// last found the driver, its link reference and its facts.
     ///
     /// An `Err` is "could not know". The daemon then changes nothing.
     fn observe(
@@ -562,105 +602,174 @@ fn folder_numbers(folder: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Whether a claim was made from where the driver says its session works.
-/// A driver that names no folder is taken at the claim's word. One that
-/// names a folder is agreed with by a hook whose session works in that
-/// folder or inside it, or in a folder above it that is still within the
-/// driver environment's own root: a driver may name the folder of whatever
-/// its agent is running at the moment. A claim that names no folder, or
-/// another, is some other session's.
-fn same_place(environment: &Environment, folder: Option<&Path>, numbers: &[String]) -> bool {
-    let Some(folder) = folder else {
-        return true;
-    };
-    let Some(hooks) = numbers.first() else {
-        return false;
-    };
-    let folder = resolved(folder);
-    if numbers.contains(&folder_number(&folder)) {
-        return true;
-    }
-    let root = resolved(&environment.root);
-    folder
-        .ancestors()
-        .skip(1)
-        .take(CLAIM_FOLDERS)
-        .take_while(|above| above.starts_with(&root))
-        .any(|above| folder_number(above) == *hooks)
-}
-
-/// Note that a hook-reported session is running inside one of a driver's
-/// sessions. Called from the hook entry point: one small file, written when
-/// it is not already there and again once it is [`CLAIM_RENEW`] old. A claim
-/// is only as good as its hook's last word. `folder` is where the hook's
-/// session works; the claim keeps numbers made from it and never its name.
-pub fn claim(
-    state_dir: &Path,
-    driver_environment: &str,
-    key: &str,
-    environment: &str,
-    session_id: &str,
-    folder: Option<&Path>,
-) {
-    if !valid_key(key) || !valid_session_id(session_id) {
+/// Note, in the daemon's own state, that a hook-reported session is running
+/// inside one of a driver's sessions: one small file, written when it is not
+/// already there and again once it is [`CLAIM_RENEW`] old, so a claim is
+/// only as good as its hook's last word. The daemon calls this for a claim
+/// it read in a hook's spool record and counted ([`claim_counts`]). The
+/// claim keeps numbers made from where the hook's session works and never
+/// that folder's name. Beside it goes the session's note of which claim it
+/// holds ([`claim_index`]). A new claim past [`CLAIMED_KEYS`] or
+/// [`CLAIMS_PER_KEY`] is not noted.
+pub fn note_claim(state_dir: &Path, claim: &envelope::Claim, environment: &str, session_id: &str) {
+    let fits = claim.fits() && valid_key(&claim.key);
+    if !fits || !valid_env_key(environment) || !valid_session_id(session_id) {
         return;
     }
-    let path = claims_dir(state_dir, driver_environment)
-        .join(key)
-        .join(format!("{session_id}.json"));
+    let driver = claims_dir(state_dir, &claim.driver_env);
+    let path = driver.join(&claim.key).join(format!("{session_id}.json"));
     let mut note = environment.to_string();
-    if let Some(folder) = folder {
+    if !claim.folders.is_empty() {
         note.push('\n');
-        note.push_str(&folder_numbers(folder).join(" "));
+        note.push_str(&claim.folders.join(" "));
     }
-    let renewed = fs::metadata(&path)
-        .and_then(|meta| meta.modified())
-        .ok()
+    let meta = fs::symlink_metadata(&path).ok();
+    if meta.is_none() && !room_for(&driver, &claim.key) {
+        return;
+    }
+    let renewed = meta
+        .and_then(|meta| meta.modified().ok())
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .is_some_and(|age| age < CLAIM_RENEW);
-    if renewed && fs::read_to_string(&path).is_ok_and(|held| held == note) {
-        return;
+    if !renewed || fs::read_to_string(&path).ok().as_deref() != Some(note.as_str()) {
+        let _ = paths::write_private(&path, note.as_bytes());
     }
-    let _ = paths::write_private(&path, note.as_bytes());
+    let index = claim_index(state_dir, environment, session_id);
+    let names = index_note(&claim.driver_env, &claim.key);
+    if fs::read_to_string(&index).ok().as_deref() != Some(names.as_str()) {
+        let _ = paths::write_private(&index, names.as_bytes());
+    }
 }
 
-/// Ask every configured driver whether a hook's agent is one of its own,
-/// and note each claim. The hook entry point calls this for every event it
-/// records.
-pub fn note_claims(
+/// Whether a new claim on `key` fits under [`CLAIMED_KEYS`] and
+/// [`CLAIMS_PER_KEY`]. It reads one folder, and only as far as its limit,
+/// however many entries that folder has.
+fn room_for(driver: &Path, key: &str) -> bool {
+    let under = |dir: &Path, limit: usize| {
+        fs::read_dir(dir).map_or(0, |entries| entries.take(limit).count()) < limit
+    };
+    let folder = driver.join(key);
+    if folder.is_dir() {
+        under(&folder, CLAIMS_PER_KEY)
+    } else {
+        under(driver, CLAIMED_KEYS)
+    }
+}
+
+/// Where the daemon notes which claim a hook-reported session holds, so that
+/// finding it is one small read however many claims there are.
+fn claim_index(state_dir: &Path, environment: &str, session_id: &str) -> PathBuf {
+    state_dir.join("claimed").join(environment).join(session_id)
+}
+
+fn index_note(driver_environment: &str, key: &str) -> String {
+    format!("{driver_environment}\n{key}")
+}
+
+/// Remove a session's note of its claim if it still names `names`: a later
+/// claim the session made elsewhere is left standing.
+fn forget_index(index: &Path, names: &str) {
+    if fs::read_to_string(index).is_ok_and(|held| held == names) {
+        let _ = fs::remove_file(index);
+    }
+}
+
+/// Ask the drivers in the hook's own container whether its agent is one of
+/// theirs, and say which, for the hook's spool record: the first driver
+/// environment there whose adapter claims it, the key, and numbers made from
+/// where the hook's session works. `own` is the environment the hook
+/// records for. A driver in another container cannot be running this agent,
+/// and an environment on the host has no claim the daemon would count. The
+/// hook entry point calls this for every event it records.
+pub fn hook_claim(
     settings: &Settings,
-    environment: &str,
+    own: &Environment,
     agent: &str,
-    session_id: &str,
     cwd: Option<&Path>,
     var: &dyn Fn(&str) -> Option<String>,
-) {
-    for candidate in &settings.environments {
-        let Some(adapter) = candidate.driver_adapter() else {
-            continue;
-        };
+) -> Option<envelope::Claim> {
+    let container = own.container()?;
+    settings.environments.iter().find_map(|candidate| {
+        if candidate.container() != Some(container) {
+            return None;
+        }
+        let adapter = candidate.driver_adapter()?;
         let hook = HookProcess {
             environment: candidate,
             agent,
             cwd,
             var,
         };
-        if let Some(key) = adapter.claims(&hook) {
-            claim(
-                &settings.state_dir,
-                &candidate.name,
-                &key,
-                environment,
-                session_id,
-                cwd,
-            );
-        }
+        let key = adapter.claims(&hook).filter(|key| valid_key(key))?;
+        Some(envelope::Claim {
+            driver_env: candidate.name.clone(),
+            key,
+            folders: cwd.map(folder_numbers).unwrap_or_default(),
+        })
+    })
+}
+
+/// Whether the daemon counts a claim it read in a spool record. Only one
+/// read from the spool folder of the environment `from`, the record's own,
+/// that runs in the same container as the driver environment the claim
+/// names: that container's hooks are the only ones that can see its
+/// driver's sessions. Never one from the shared folder, from an environment
+/// on the host, or naming an environment with no driver.
+pub fn claim_counts(
+    settings: &Settings,
+    from: Option<&Environment>,
+    claim: &envelope::Claim,
+) -> bool {
+    let Some(from) = from else {
+        return false;
+    };
+    let Some(driver) = settings.environment(&claim.driver_env) else {
+        return false;
+    };
+    claim.fits()
+        && driver.driver_adapter().is_some()
+        && from.container().is_some()
+        && from.container() == driver.container()
+}
+
+/// The driver environment and key of a claim the daemon counted for a
+/// hook-reported session, while it stands: until the hook's session ends,
+/// or the claim lapses (see [`claims_stand`]). The session's events carry
+/// them to Watch as its driver reference.
+pub fn standing_claim(
+    settings: &Settings,
+    environment: &str,
+    session_id: &str,
+) -> Option<(String, String)> {
+    if !valid_env_key(environment) || !valid_session_id(session_id) {
+        return None;
     }
+    let index = claim_index(&settings.state_dir, environment, session_id);
+    let names = fs::read_to_string(&index).ok()?;
+    let (driver_env, key) = names.split_once('\n')?;
+    let file = claims_dir(&settings.state_dir, driver_env)
+        .join(key)
+        .join(format!("{session_id}.json"));
+    let stands = settings
+        .environment(driver_env)
+        .is_some_and(|driver| driver.driver_adapter().is_some())
+        && valid_key(key)
+        && fs::read_to_string(file)
+            .is_ok_and(|note| note.lines().next().map(str::trim) == Some(environment));
+    if !stands {
+        let _ = fs::remove_file(&index);
+        return None;
+    }
+    Some((driver_env.to_string(), key.to_string()))
 }
 
 /// One live hook-reported session's claim on a driver's session.
 struct Claim {
     file: PathBuf,
+    /// The session's note of which claim it holds, and what that note says
+    /// while it is this one: see [`claim_index`].
+    index: PathBuf,
+    names: String,
     /// The hook has spoken from inside the driver's session within
     /// [`CLAIM_QUIET`].
     fresh: bool,
@@ -698,10 +807,12 @@ fn claimed(
             };
             let note = fs::read_to_string(claim.path()).unwrap_or_default();
             let mut lines = note.lines();
-            let session = lines.next().and_then(|environment| {
-                settings.environment(environment.trim())?;
-                Some(store.load(environment.trim(), session_id))
-            });
+            let environment = lines.next().unwrap_or_default().trim().to_string();
+            let session = settings
+                .environment(&environment)
+                .map(|_| store.load(&environment, session_id));
+            let index = claim_index(&settings.state_dir, &environment, session_id);
+            let names = index_note(driver_environment, &name);
             // The file is the box's own, and something else may have
             // written to it: a number is sixteen digits or it is nothing.
             let folders: Vec<String> = lines
@@ -731,12 +842,17 @@ fn claimed(
             match status {
                 Some(status) => live.push(Claim {
                     file: claim.path(),
+                    index,
+                    names,
                     fresh: age.is_none_or(|age| age < CLAIM_QUIET),
                     status,
                     folders,
                 }),
                 None => {
                     let _ = fs::remove_file(claim.path());
+                    if valid_env_key(&environment) && valid_session_id(session_id) {
+                        forget_index(&index, &names);
+                    }
                 }
             }
         }
@@ -793,6 +909,7 @@ fn claims_stand(
     }
     for claim in held {
         let _ = fs::remove_file(&claim.file);
+        forget_index(&claim.index, &claim.names);
     }
     doubts.remove(key);
     false
@@ -851,19 +968,20 @@ fn log(line: &str) {
 /// environment's driver, writing the lifecycle events the difference
 /// amounts to. Returns how many were written.
 ///
-/// A failed look changes the condition word and nothing else. A session is
+/// `result` is a look's answer as the host took it ([`Answer::check`]). A
+/// failed look changes the condition word and nothing else. A session is
 /// reported under the driver's own id for it; a session a live hook has
 /// claimed is not reported, and is ended if it was. A claim does not outlive
 /// its hook's silence for ever: see [`claims_stand`]. It counts only when it
 /// was made from where the driver says the session works: see
-/// [`same_place`]. And it never hides a session that waits on its owner or
-/// has failed unless the hook's own session shows the same: see
+/// [`Seen::same_place`]. And it never hides a session that waits on its
+/// owner or has failed unless the hook's own session shows the same: see
 /// [`CLAIM_UNHEARD`].
 pub fn apply(
     settings: &Settings,
     environment: &Environment,
     memory: &mut Memory,
-    result: Result<Look, Condition>,
+    result: Result<Answer, Condition>,
     now: SystemTime,
 ) -> usize {
     let now_ms = unix_ms(now);
@@ -894,9 +1012,9 @@ pub fn apply(
         .facts
         .iter()
         .filter(|(name, _)| valid_key(name))
-        .map(|(name, value)| (name.to_string(), *value))
+        .map(|(name, value)| (name.clone(), *value))
         .collect();
-    memory.uncounted_worktrees = uncounted(settings, environment, &look.worktrees);
+    memory.uncounted_worktrees = look.uncounted_worktrees;
 
     let spool = Spool::new(&settings.spool_dir);
     // A spool nobody is emptying is not allowed to fill the disk. What was
@@ -909,7 +1027,7 @@ pub fn apply(
     let store = Store::new(&settings.state_dir);
     // What each session a hook has reported under this id, and not ended,
     // is doing.
-    let hook_reports = |observed: &Observed, id: &str| -> Vec<Option<Status>> {
+    let hook_reports = |observed: &Seen, id: &str| -> Vec<Option<Status>> {
         if !valid_session_id(id) {
             return Vec::new();
         }
@@ -928,11 +1046,13 @@ pub fn apply(
     let beat = ACTIVITY_BEAT.as_millis() as u64;
     let mut written = 0u64;
     let mut seen = BTreeSet::new();
-    let emit = |observed: &Observed, kinds: &[EventType], written: &mut u64| {
+    let emit = |observed: &Seen, kinds: &[EventType], written: &mut u64| {
         if kinds.is_empty() {
             return;
         }
-        let place = crate::hook::place(environment, observed.cwd.as_deref());
+        let limit_resets_at = observed
+            .limit_resets_at_ms
+            .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
         for kind in kinds {
             // Event ids sort by the millisecond they were made in, and a
             // session's events are applied in that order.
@@ -940,17 +1060,17 @@ pub fn apply(
             let draft = Draft {
                 env_id: environment.name.clone(),
                 session_id: observed.id.clone(),
-                repos: place.repos.clone(),
-                branch: place.branch.clone(),
+                repos: observed.repos.clone(),
+                branch: observed.branch.clone(),
                 error_kind: observed.error_kind.clone(),
-                limit_resets_at: observed.limit_resets_at,
+                limit_resets_at,
                 ..Draft::default()
             };
             if let Some(event) = Envelope::new(*kind, draft, at) {
                 let record = Record {
                     event,
                     at_ms: unix_ms(at),
-                    workspace: place.workspace.clone(),
+                    workspace: observed.workspace.clone(),
                     process: None,
                 };
                 if spool.write(&record).is_ok() {
@@ -981,9 +1101,7 @@ pub fn apply(
                     .get(key)
                     .into_iter()
                     .flatten()
-                    .filter(|claim| {
-                        same_place(environment, observed.cwd.as_deref(), &claim.folders)
-                    })
+                    .filter(|claim| observed.same_place(&claim.folders))
                     .map(|claim| claim.status),
             );
         }
@@ -1120,8 +1238,7 @@ pub fn apply(
             known.missing = known.missing.saturating_add(1);
             if known.missing >= MISSING_LOOKS {
                 if !known.silent {
-                    let ended = Observed::new(id.clone(), Some(Phase::Ended));
-                    emit(&ended, &[EventType::SessionEnd], &mut written);
+                    emit(&Seen::bare(&id), &[EventType::SessionEnd], &mut written);
                 }
                 memory.sessions.remove(&id);
             }
@@ -1132,27 +1249,210 @@ pub fn apply(
     written as usize
 }
 
+/// How the host has a look taken: the box's own `nucleated`, and `podman`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runner {
+    /// The box's own `nucleated`, by its full path. The recipe mounts the
+    /// folder it is in read-only at the same path in every container, and a
+    /// container's own `PATH` is never asked for it.
+    pub program: PathBuf,
+    /// The container engine's command-line program.
+    pub podman: PathBuf,
+}
+
+impl Runner {
+    /// This program and the box's `podman`: what the daemon uses.
+    pub fn of_this_box() -> Option<Runner> {
+        let program = std::env::current_exe().ok()?;
+        // A program replaced on disk while it runs is named with this after
+        // its path; the path is where the new one is.
+        let text = program.to_string_lossy();
+        let program = match text.strip_suffix(" (deleted)") {
+            Some(path) => PathBuf::from(path),
+            None => program,
+        };
+        Some(Runner {
+            program,
+            podman: PathBuf::from("podman"),
+        })
+    }
+
+    /// The command for one look at `environment`: inside its container
+    /// through one `podman exec` of the box's own `nucleated`, or, for an
+    /// environment on the host, that program itself with the daemon's
+    /// config. The arguments are the look's own fixed ones, the
+    /// environment's config name, numbers, and what the last look left.
+    fn command(&self, settings: &Settings, environment: &Environment, args: &[String]) -> Command {
+        match environment.container() {
+            Some(container) => {
+                let mut command = Command::new(&self.podman);
+                command
+                    .arg("exec")
+                    .arg(container)
+                    .arg(&self.program)
+                    .args(args);
+                command
+            }
+            None => {
+                let mut command = Command::new(&self.program);
+                command.args(args).env("NUCLEATED_CONFIG", &settings.path);
+                command
+            }
+        }
+    }
+
+    /// Take one look at `environment`'s driver and hold its answer to what
+    /// the host takes. "Could not know" is one of the fixed words.
+    fn ask(
+        &self,
+        settings: &Settings,
+        environment: &Environment,
+        driver: &str,
+        memory: &Memory,
+        now: SystemTime,
+    ) -> Result<Answer, Condition> {
+        let token = token(now);
+        // As much of the last look as an adapter may use: words and numbers.
+        let previous = Memory {
+            driver: driver.to_string(),
+            condition: memory.condition,
+            good_at_ms: memory.good_at_ms,
+            link_ref: memory.link_ref.clone(),
+            facts: memory.facts.clone(),
+            ..Memory::default()
+        };
+        let args = [
+            "look".to_string(),
+            "--env".to_string(),
+            environment.name.clone(),
+            "--within".to_string(),
+            INNER_LIMIT.as_millis().to_string(),
+            "--now".to_string(),
+            unix_ms(now).to_string(),
+            "--token".to_string(),
+            token.clone(),
+            "--previous".to_string(),
+            serde_json::to_string(&previous).unwrap_or_default(),
+        ];
+        let mut command = self.command(settings, environment, &args);
+        let read = |out: &mut dyn std::io::Read| answer::read(out);
+        let heard = match environment.container() {
+            Some(container) => {
+                // A look given up on is over for the host at once. What is
+                // left of it in the container is ended from the box, and
+                // `podman exec` then returns by itself, which is what lets
+                // the engine forget the exec.
+                let (runner, container) = (self.clone(), container.to_string());
+                let ending = bounded::Ending {
+                    end: Box::new(move || runner.end(&container, &token)),
+                    grace: END_GRACE,
+                };
+                bounded::try_stream_ending(
+                    &mut command,
+                    LOOK_LIMIT,
+                    answer::MAX_ANSWER,
+                    read,
+                    ending,
+                )
+            }
+            None => bounded::try_stream(&mut command, LOOK_LIMIT, answer::MAX_ANSWER, read),
+        };
+        match heard {
+            Ok(answer) => answer.check(driver),
+            Err(Failure::Late) => Err(Condition::Timeout),
+            // No `podman`, no container running, or nothing that could be
+            // started in it: the driver is not there to be asked.
+            Err(Failure::Absent | Failure::Failed) => Err(Condition::Absent),
+            Err(Failure::TooMuch | Failure::NoAnswer) => Err(Condition::BadReply),
+        }
+    }
+
+    /// The host gave up on a look in `container`, late or for printing too
+    /// much. Whatever of it is still running there is ended from the box,
+    /// where the container cannot hold it (see [`cut_off`]), so that neither
+    /// the container nor the host keeps anything of it. Nothing more is run
+    /// in the container.
+    fn end(&self, container: &str, token: &str) {
+        let mut command = Command::new(&self.podman);
+        command
+            .args(["container", "inspect", "--format", "{{.State.Pid}}"])
+            .arg(container);
+        let Ok(said) = bounded::run(&mut command, END_LIMIT, 64) else {
+            return;
+        };
+        let first = String::from_utf8_lossy(&said.stdout).trim().parse::<u32>();
+        if let (true, Ok(first)) = (said.ok, first) {
+            cut_off::end(first, &self.program, token);
+        }
+    }
+}
+
+/// A look's token, so that one look can be told from another inside a
+/// container: sixteen lower-case hex digits.
+fn token(now: SystemTime) -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        let nanos = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        bytes = (nanos ^ (u64::from(std::process::id()) << 32)).to_be_bytes();
+    }
+    format!("{:016x}", u64::from_be_bytes(bytes))
+}
+
 /// Take one look at an environment's driver and apply it. Returns what is
 /// now remembered, or nothing for an environment with no driver.
 pub fn look(settings: &Settings, environment: &Environment, now: SystemTime) -> Option<Memory> {
+    match Runner::of_this_box() {
+        Some(runner) => look_with(&runner, settings, environment, now),
+        None => {
+            // This program cannot say where it is: there is nothing to run.
+            let adapter = environment.driver_adapter()?;
+            let mut memory = remembered(settings, environment, adapter.name());
+            apply(
+                settings,
+                environment,
+                &mut memory,
+                Err(Condition::Absent),
+                now,
+            );
+            keep(settings, environment, &memory);
+            Some(memory)
+        }
+    }
+}
+
+/// As [`look`], with the programs `runner` names.
+pub fn look_with(
+    runner: &Runner,
+    settings: &Settings,
+    environment: &Environment,
+    now: SystemTime,
+) -> Option<Memory> {
     let adapter = environment.driver_adapter()?;
-    let mut memory = read_memory(&settings.state_dir, &environment.name)
-        // Another driver's memory says nothing about this one's sessions.
-        .filter(|memory| memory.driver == adapter.name())
-        .unwrap_or_else(|| Memory::new(adapter.name()));
-    // An adapter that panics has not looked. It costs this look and no more.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        adapter.observe(environment, &memory, now)
-    }))
-    .unwrap_or(Err(Condition::BadReply));
+    let mut memory = remembered(settings, environment, adapter.name());
+    let result = runner.ask(settings, environment, adapter.name(), &memory, now);
     apply(settings, environment, &mut memory, result, now);
-    if let Ok(text) = serde_json::to_string(&memory) {
+    keep(settings, environment, &memory);
+    Some(memory)
+}
+
+/// What the last look at this environment's driver left, or a fresh start.
+fn remembered(settings: &Settings, environment: &Environment, driver: &str) -> Memory {
+    read_memory(&settings.state_dir, &environment.name)
+        // Another driver's memory says nothing about this one's sessions.
+        .filter(|memory| memory.driver == driver)
+        .unwrap_or_else(|| Memory::new(driver))
+}
+
+fn keep(settings: &Settings, environment: &Environment, memory: &Memory) {
+    if let Ok(text) = serde_json::to_string(memory) {
         let _ = paths::write_private(
             &memory_file(&settings.state_dir, &environment.name),
             text.as_bytes(),
         );
     }
-    Some(memory)
 }
 
 /// How long to wait after a look: the environment's own interval after a
@@ -1167,47 +1467,79 @@ fn next_wait(every: Duration, failures: u32) -> Duration {
         .min(ceiling)
 }
 
-/// The driver thread: a few seconds after start, then once a second, look at
-/// each driver that is due. The config is read afresh each time, as
-/// housekeeping reads it. A slow driver delays only the other drivers, by at
-/// most [`LOOK_LIMIT`], and never a heartbeat or a hook.
+/// When an environment's next look is due, and whether one is under way.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    next: Instant,
+    failures: u32,
+    busy: bool,
+}
+
+/// The driver thread: a few seconds after start, then once a second, start
+/// a look at each driver that is due and has none under way. Each look runs
+/// on a thread of its own with its own deadline, so a driver that does not
+/// answer holds up no other environment's look, no heartbeat and no hook.
+/// The config is read afresh each time, as housekeeping reads it.
 pub fn run_schedule(config: &Path, stop: &AtomicBool) {
     if housekeeping::wait(stop, Duration::from_secs(5)) {
         return;
     }
-    let mut due: BTreeMap<String, (Instant, u32)> = BTreeMap::new();
+    let runner = Runner::of_this_box();
+    let slots: Arc<Mutex<BTreeMap<String, Slot>>> = Arc::new(Mutex::new(BTreeMap::new()));
     loop {
         if let Ok(settings) = settings::load_from(config) {
+            let settings = Arc::new(settings);
+            let mut table = lock(&slots);
             for environment in &settings.environments {
                 let Some(every) = environment.driver.as_ref().and_then(|driver| driver.poll) else {
                     continue;
                 };
-                let (next, failures) = due
-                    .get(&environment.name)
-                    .copied()
-                    .unwrap_or((Instant::now(), 0));
-                if Instant::now() < next {
+                let now = Instant::now();
+                let slot = table.entry(environment.name.clone()).or_insert(Slot {
+                    next: now,
+                    failures: 0,
+                    busy: false,
+                });
+                if slot.busy || now < slot.next {
                     continue;
                 }
-                let good = look(&settings, environment, SystemTime::now())
-                    .is_some_and(|memory| memory.condition == Condition::Ok);
-                let failures = if good { 0 } else { failures.saturating_add(1) };
-                due.insert(
-                    environment.name.clone(),
-                    (Instant::now() + next_wait(every, failures), failures),
-                );
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
+                slot.busy = true;
+                let (settings, environment) = (settings.clone(), environment.clone());
+                let (runner, slots) = (runner.clone(), slots.clone());
+                std::thread::spawn(move || {
+                    let looked = match &runner {
+                        Some(runner) => {
+                            look_with(runner, &settings, &environment, SystemTime::now())
+                        }
+                        None => look(&settings, &environment, SystemTime::now()),
+                    };
+                    let good = looked.is_some_and(|memory| memory.condition == Condition::Ok);
+                    let mut table = lock(&slots);
+                    if let Some(slot) = table.get_mut(&environment.name) {
+                        slot.failures = if good {
+                            0
+                        } else {
+                            slot.failures.saturating_add(1)
+                        };
+                        slot.next = Instant::now() + next_wait(every, slot.failures);
+                        slot.busy = false;
+                    }
+                });
             }
-            due.retain(|name, _| settings.environment(name).is_some());
+            table.retain(|name, slot| slot.busy || settings.environment(name).is_some());
         }
         // With no driver to ask, there is nothing to be on time for.
-        let pause = if due.is_empty() { 15 } else { 1 };
+        let pause = if lock(&slots).is_empty() { 15 } else { 1 };
         if housekeeping::wait(stop, Duration::from_secs(pause)) {
             return;
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The folders that belong to drivers that own their worktrees. Nothing in
@@ -1218,16 +1550,8 @@ pub fn protected_roots(settings: &Settings) -> Vec<PathBuf> {
         .environments
         .iter()
         .filter(|environment| environment.driver_owns_worktrees())
-        .flat_map(|environment| {
-            let more = environment
-                .driver
-                .iter()
-                .flat_map(|driver| driver.dirs.iter());
-            std::iter::once(&environment.root)
-                .chain(more)
-                .map(|path| resolve(path))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|environment| environment.own_folders())
+        .map(|path| resolve(&path))
         .collect()
 }
 
@@ -1268,6 +1592,37 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(1_795_089_600 + seconds)
     }
 
+    /// The daemon counting a claim a hook made from `folder`.
+    fn claim(
+        state_dir: &Path,
+        driver_environment: &str,
+        key: &str,
+        environment: &str,
+        session_id: &str,
+        folder: Option<&Path>,
+    ) {
+        let claim = envelope::Claim {
+            driver_env: driver_environment.into(),
+            key: key.into(),
+            folders: folder.map(folder_numbers).unwrap_or_default(),
+        };
+        note_claim(state_dir, &claim, environment, session_id);
+    }
+
+    /// Apply a look as the host takes it: settled into an answer, as inside
+    /// the container, then held to what the host accepts.
+    fn applied(
+        settings: &Settings,
+        environment: &Environment,
+        memory: &mut Memory,
+        result: Result<Look, Condition>,
+        now: SystemTime,
+    ) -> usize {
+        let driver = environment.driver_adapter().unwrap().name();
+        let answer = answer::settle(settings, environment, driver, result).check(driver);
+        apply(settings, environment, memory, answer, now)
+    }
+
     fn seen(id: &str, phase: Phase) -> Observed {
         Observed::new(id, Some(phase))
     }
@@ -1289,7 +1644,7 @@ mod tests {
         now: SystemTime,
     ) -> Vec<(String, String)> {
         let environment = settings.environment("t3").unwrap();
-        apply(settings, environment, memory, result, now);
+        applied(settings, environment, memory, result, now);
         let spool = Spool::new(&settings.spool_dir);
         spool
             .pending()
@@ -1414,7 +1769,7 @@ mod tests {
         let (_dir, settings) = rig();
         let mut memory = Memory::new("t3code");
         let environment = settings.environment("t3").unwrap();
-        apply(
+        applied(
             &settings,
             environment,
             &mut memory,
@@ -1445,7 +1800,7 @@ mod tests {
             limit_resets_at: Some(at(3_600)),
             ..seen("s1", phase)
         };
-        apply(
+        applied(
             &settings,
             environment,
             &mut memory,
@@ -2190,14 +2545,18 @@ mod tests {
         from(None);
         assert_eq!(look(&placed), events(&[]));
         // The agent's own hook, from a folder inside the thread's, is.
-        note_claims(
-            &settings,
-            "client-a",
+        let boxed = in_one_container(&settings);
+        let claimed = hook_claim(
+            &boxed,
+            boxed.environment("client-a").unwrap(),
             "claude-code",
-            "hook-session",
             Some(&inside),
             &|_| Some("thread-7".to_string()),
-        );
+        )
+        .unwrap();
+        assert_eq!(claimed.driver_env, "t3");
+        assert_eq!(claimed.key, "thread-7");
+        note_claim(&settings.state_dir, &claimed, "client-a", "hook-session");
         assert_eq!(look(&placed), events(&[("thread-7", "session_end")]));
         // So is one from above it that is still inside the driver's root:
         // a driver may place a session by what its agent is running.
@@ -2245,6 +2604,193 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_counts_only_from_inside_the_drivers_container() {
+        let (_dir, mut settings) = rig();
+        let claim = envelope::Claim {
+            driver_env: "t3".into(),
+            key: "thread-7".into(),
+            folders: Vec::new(),
+        };
+        let counts = |settings: &Settings, from: Option<&str>, claim: &envelope::Claim| {
+            claim_counts(
+                settings,
+                from.and_then(|name| settings.environment(name)),
+                claim,
+            )
+        };
+        // On the host, no environment runs in a container.
+        assert!(!counts(&settings, Some("client-a"), &claim));
+        for environment in &mut settings.environments {
+            environment.unit = "agent-env-client-a.service".into();
+        }
+        assert!(counts(&settings, Some("client-a"), &claim));
+        assert!(counts(&settings, Some("t3"), &claim));
+        // From the shared folder, which says nothing of where it came from.
+        assert!(!counts(&settings, None, &claim));
+        // Naming an environment that has no driver, or that is not there.
+        for driver_env in ["client-a", "client-z"] {
+            let other = envelope::Claim {
+                driver_env: driver_env.into(),
+                ..claim.clone()
+            };
+            assert!(!counts(&settings, Some("client-a"), &other), "{driver_env}");
+        }
+        // The driver in a container of its own.
+        let t3 = settings.environments.iter_mut().find(|e| e.name == "t3");
+        t3.unwrap().unit = "agent-env-t3.service".into();
+        assert!(!counts(&settings, Some("client-a"), &claim));
+    }
+
+    #[test]
+    fn a_standing_claim_is_found_by_its_session_until_it_is_gone() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-7".to_string()))
+        );
+        // Another session, or the same id in another environment, has none.
+        assert_eq!(standing_claim(&settings, "client-a", "s2"), None);
+        assert_eq!(standing_claim(&settings, "t3", "s1"), None);
+        fs::remove_dir_all(state.join("claims")).unwrap();
+        assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
+    }
+
+    #[test]
+    fn a_session_that_claims_again_elsewhere_is_found_by_its_latest_claim() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        claim(state, "t3", "thread-8", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-8".to_string()))
+        );
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s1"),
+            Some(("t3".to_string(), "thread-7".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_driver_holds_claims_on_no_more_sessions_than_a_look_reports() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        for n in 0..answer::MAX_SESSIONS + 10 {
+            claim(
+                state,
+                "t3",
+                &format!("thread-{n}"),
+                "client-a",
+                &format!("s{n}"),
+                None,
+            );
+        }
+        assert_eq!(
+            files_under(&claims_dir(state, "t3")).len(),
+            answer::MAX_SESSIONS
+        );
+        let past = answer::MAX_SESSIONS + 5;
+        assert_eq!(
+            standing_claim(&settings, "client-a", &format!("s{past}")),
+            None
+        );
+        // A session that holds a claim goes on renewing it.
+        claim(state, "t3", "thread-0", "client-a", "s0", None);
+        assert_eq!(
+            standing_claim(&settings, "client-a", "s0"),
+            Some(("t3".to_string(), "thread-0".to_string()))
+        );
+    }
+
+    #[test]
+    fn one_driver_session_holds_a_few_claims_and_no_more() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        for n in 0..100 {
+            claim(state, "t3", "thread-7", "client-a", &format!("s{n}"), None);
+        }
+        assert_eq!(files_under(&claims_dir(state, "t3")).len(), 8);
+        assert_eq!(standing_claim(&settings, "client-a", "s50"), None);
+    }
+
+    #[test]
+    fn a_claim_forgotten_with_its_ended_session_leaves_no_note_behind() {
+        let (_dir, settings) = rig();
+        let state = &settings.state_dir;
+        claim(state, "t3", "thread-7", "client-a", "s1", None);
+        assert!(!files_under(&state.join("claimed")).is_empty());
+        // Long past the grace, with no session the daemon ever applied.
+        let held = claimed(&settings, "t3", SystemTime::now() + 2 * CLAIM_GRACE);
+        assert!(held.is_empty());
+        assert!(files_under(&claims_dir(state, "t3")).is_empty());
+        assert!(files_under(&state.join("claimed")).is_empty());
+    }
+
+    /// `settings` with every environment in `client-a`'s container.
+    fn in_one_container(settings: &Settings) -> Settings {
+        let mut settings = settings.clone();
+        for environment in &mut settings.environments {
+            environment.unit = "agent-env-client-a.service".into();
+        }
+        settings
+    }
+
+    #[test]
+    fn a_hook_says_which_drivers_session_it_runs_in_by_numbers_and_never_a_folder() {
+        let (dir, settings) = rig();
+        let settings = in_one_container(&settings);
+        let own = settings.environment("client-a").unwrap();
+        let inside = dir.path().join("work").join("SENTINEL named for a task");
+        fs::create_dir_all(&inside).unwrap();
+        let thread = |name: &str| (name == "T3CODE_THREAD_ID").then(|| "thread-7".to_string());
+        let claimed = hook_claim(&settings, own, "claude-code", Some(&inside), &thread).unwrap();
+        assert_eq!(claimed.driver_env, "t3");
+        assert_eq!(claimed.key, "thread-7");
+        assert_eq!(claimed.folders, folder_numbers(&inside));
+        assert!(claimed.fits());
+        assert!(!serde_json::to_string(&claimed)
+            .unwrap()
+            .contains("SENTINEL"));
+        // No folder, no numbers; no driver's variable, no claim.
+        assert!(hook_claim(&settings, own, "claude-code", None, &thread)
+            .unwrap()
+            .folders
+            .is_empty());
+        assert_eq!(
+            hook_claim(&settings, own, "claude-code", Some(&inside), &|_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hook_asks_only_the_drivers_in_its_own_container() {
+        let (_dir, settings) = rig();
+        let thread = |name: &str| (name == "T3CODE_THREAD_ID").then(|| "thread-7".to_string());
+        let claim = |settings: &Settings| {
+            let own = settings.environment("client-a").unwrap();
+            hook_claim(settings, own, "claude-code", None, &thread)
+        };
+        // On the host, no claim the daemon would count is made.
+        assert_eq!(claim(&settings), None);
+        // T3 Code in its own container cannot be running this hook's agent.
+        let mut apart = in_one_container(&settings);
+        let t3 = apart.environments.iter_mut().find(|e| e.name == "t3");
+        t3.unwrap().unit = "agent-env-t3.service".into();
+        assert_eq!(claim(&apart), None);
+        // A second T3 Code, listed later, in the hook's own container, is
+        // the one asked.
+        let mut second = apart.environments[0].clone();
+        second.name = "t3-beside".into();
+        second.unit = "agent-env-client-a.service".into();
+        apart.environments.push(second);
+        assert_eq!(claim(&apart).unwrap().driver_env, "t3-beside");
+    }
+
+    #[test]
     fn a_claim_is_a_key_and_two_ids_and_nothing_that_could_be_a_path() {
         let (_dir, settings) = rig();
         let state = &settings.state_dir;
@@ -2255,13 +2801,21 @@ mod tests {
         assert!(files_under(state).is_empty());
         claim(state, "t3", "t7", "client-a", "s1", None);
         claim(state, "t3", "t7", "client-a", "s1", None);
-        assert_eq!(files_under(state).len(), 1);
+        let sorted = |mut files: Vec<PathBuf>| {
+            files.sort();
+            files
+        };
+        let one = [
+            state.join("claimed/client-a/s1"),
+            claims_dir(state, "t3").join("t7/s1.json"),
+        ];
+        assert_eq!(sorted(files_under(state)), one);
         // A claim for an environment the config does not have stands for
         // nothing, and is cleared away.
         claim(state, "t3", "t8", "gone", "s2", None);
         let held = claimed(&settings, "t3", SystemTime::now());
         assert_eq!(held.into_keys().collect::<Vec<_>>(), ["t7"]);
-        assert_eq!(files_under(state).len(), 1);
+        assert_eq!(sorted(files_under(state)), one);
     }
 
     #[test]
@@ -2394,7 +2948,7 @@ mod tests {
             fs::write(settings.spool_dir.join(name), "{}").unwrap();
         }
         let environment = settings.environment("t3").unwrap();
-        let wrote = apply(
+        let wrote = applied(
             &settings,
             environment,
             &mut memory,

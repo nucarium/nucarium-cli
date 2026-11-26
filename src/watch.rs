@@ -421,7 +421,8 @@ fn json_len<T: Serialize>(value: &T) -> usize {
 /// `worktrees` stands for three fields, `worktrees`,
 /// `worktree_action_results` and `worktree_actions_allowed`: a Watch that
 /// takes one takes all three.
-pub const AHEAD: [&str; 8] = [
+pub const AHEAD: [&str; 9] = [
+    "agent",
     "driver",
     "driver_ref",
     "config_commit",
@@ -432,18 +433,27 @@ pub const AHEAD: [&str; 8] = [
     "worktrees",
 ];
 
-/// Which of the [`AHEAD`] fields a Watch has said it takes. None, until it
-/// says so.
+/// The fields of an event that are ahead of the contract every Watch holds,
+/// named in the same `accepts` as [`AHEAD`]. `driver_session` stands for two
+/// fields, `driver_env` and `driver_session`, which go together or not at
+/// all. Watch refuses a batch for one field it does not name, so neither is
+/// sent until it has said it takes them.
+pub const EVENT_AHEAD: [&str; 1] = ["driver_session"];
+
+/// Which of the [`AHEAD`] and [`EVENT_AHEAD`] fields a Watch has said it
+/// takes. None, until it says so.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Taken(BTreeSet<&'static str>);
 
 impl Taken {
-    /// What Watch named. A name that is not one of [`AHEAD`] is a field this
-    /// program does not have, and is passed over.
+    /// What Watch named. A name that is not one of [`AHEAD`] or
+    /// [`EVENT_AHEAD`] is a field this program does not have, and is passed
+    /// over.
     pub fn from_names(names: &[String]) -> Taken {
         Taken(
             AHEAD
                 .into_iter()
+                .chain(EVENT_AHEAD)
                 .filter(|field| names.iter().any(|name| name == field))
                 .collect(),
         )
@@ -471,6 +481,11 @@ pub struct EnvironmentReport {
     pub last_snapshot_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unsaved: Option<UnsavedReport>,
+    /// The agent the environment's login runs: its config name, one of a
+    /// fixed few. Only for an environment with no driver, which is not one
+    /// login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The driver the environment is watched through: its config name, one
     /// of a fixed few. It tells Watch which link template opens a session
     /// there, and that its sessions come from a state source that may report
@@ -526,6 +541,7 @@ impl EnvironmentReport {
                 .map(rfc3339),
             last_snapshot_at: None,
             unsaved: None,
+            agent: None,
             driver: None,
             driver_ref: None,
             config_commit: None,
@@ -537,6 +553,15 @@ impl EnvironmentReport {
             worktree_action_results: None,
             worktree_actions_allowed: None,
         }
+    }
+
+    /// Name the agent an environment's login runs. A name that is not a
+    /// short lower-case word is left out.
+    pub fn with_agent(mut self, name: Option<&str>) -> Self {
+        self.agent = name
+            .filter(|name| name.len() <= 32 && valid_env_key(name))
+            .map(str::to_string);
+        self
     }
 
     /// Name the driver an environment is watched through, and the driver's
@@ -611,6 +636,9 @@ impl EnvironmentReport {
     /// only means something beside one that is left out is left out too.
     pub fn only(&self, taken: &Taken) -> EnvironmentReport {
         let mut report = self.clone();
+        if !taken.takes("agent") {
+            report.agent = None;
+        }
         if !taken.takes("driver") {
             report.driver = None;
         }
@@ -643,6 +671,7 @@ impl EnvironmentReport {
     /// The [`AHEAD`] fields this report carries.
     fn ahead(&self) -> impl Iterator<Item = &'static str> {
         [
+            self.agent.is_some(),
             self.driver.is_some(),
             self.driver_ref.is_some(),
             self.config_commit.is_some(),
@@ -769,8 +798,8 @@ impl Heartbeat {
 pub struct HeartbeatAck {
     #[serde(default)]
     pub heartbeat_interval_s: Option<u64>,
-    /// The [`AHEAD`] fields this Watch takes, by name. A Watch that says
-    /// nothing takes none of them.
+    /// The [`AHEAD`] and [`EVENT_AHEAD`] fields this Watch takes, by name. A
+    /// Watch that says nothing takes none of them.
     #[serde(default, deserialize_with = "names")]
     pub accepts: Vec<String>,
     /// What Watch asks the box to do with its session folders. An older
@@ -1470,7 +1499,10 @@ mod tests {
                 }]),
                 false,
             );
-        let said = Heartbeat::new(MachineHealth::default(), vec![report], now);
+        // A login's environment beside it, which names its agent.
+        let login = EnvironmentReport::new("client-a", true, None, None, now)
+            .with_agent(Some("claude-code"));
+        let said = Heartbeat::new(MachineHealth::default(), vec![report, login], now);
         assert_eq!(said.ahead().into_iter().collect::<Vec<_>>(), {
             let mut all = AHEAD.to_vec();
             all.sort_unstable();
@@ -1536,8 +1568,52 @@ mod tests {
                 "worktree_actions_allowed": false,
             })
         );
+        // The agent goes only to a Watch that takes it.
+        let login = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            serde_json::to_value(said.only(&Taken::from_names(&names))).unwrap()["environments"][1]
+                .clone()
+        };
+        assert_eq!(
+            login(&["agent"]),
+            json!({ "env_id": "client-a", "server_alive": true, "agent": "claude-code" })
+        );
+        assert_eq!(
+            login(&["driver", "driver_session"]),
+            json!({ "env_id": "client-a", "server_alive": true })
+        );
+        assert!(sent(&["agent"]).get("agent").is_none());
         // A name this program has no field for unlocks nothing.
         assert_eq!(sent(&["server_restarts", "prompt"]), sent(&[]));
+    }
+
+    #[test]
+    fn an_agent_goes_out_as_a_short_lower_case_name_or_not_at_all() {
+        let now = at(1_795_089_600_000);
+        let report = |name: Option<&str>| {
+            EnvironmentReport::new("client-a", true, None, None, now)
+                .with_agent(name)
+                .agent
+        };
+        assert_eq!(report(Some("claude-code")).as_deref(), Some("claude-code"));
+        assert_eq!(report(Some("codex")).as_deref(), Some("codex"));
+        let longest = "a".repeat(32);
+        assert_eq!(report(Some(&longest)), Some(longest.clone()));
+        for not_one in [
+            "a".repeat(33),
+            "Claude Code".to_string(),
+            "codex, the one from the terminal".to_string(),
+            "-codex".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(report(Some(&not_one)), None, "{not_one}");
+        }
+        assert_eq!(report(None), None);
+        assert_eq!(
+            serde_json::to_value(EnvironmentReport::new("client-a", true, None, None, now))
+                .unwrap(),
+            json!({ "env_id": "client-a", "server_alive": true })
+        );
     }
 
     #[test]
@@ -1598,6 +1674,12 @@ mod tests {
         let taken = Taken::from_names(&later.accepts);
         assert!(taken.takes("driver") && taken.takes("driver_ref"));
         assert!(!taken.takes("config_state"));
+        // The same list names an event's fields as well as an environment's.
+        let events = ack(json!({ "accepts": ["agent", "driver_session", "driver_env"] }));
+        let taken = Taken::from_names(&events.accepts);
+        assert!(taken.takes("agent") && taken.takes("driver_session"));
+        // `driver_env` goes with `driver_session`, and is not a name of its own.
+        assert!(!taken.takes("driver_env"));
         // An answer that is otherwise good is never lost to this one field.
         for odd in [json!("driver"), json!({ "driver": true }), json!([1, null])] {
             let odd = ack(json!({ "heartbeat_interval_s": 300, "accepts": odd }));

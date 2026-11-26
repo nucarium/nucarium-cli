@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use nucleate::driver::inside;
 use nucleate::envelope::rfc3339;
 use nucleate::settings::{self, Settings};
 use nucleate::{agent, config, config_sync, daemon, hook, housekeeping, pause, status};
@@ -33,6 +34,25 @@ enum Command {
         /// else claude-code.
         #[arg(long, value_name = "NAME")]
         agent: Option<String>,
+    },
+    /// One look at an environment's driver, from inside its container: what
+    /// the daemon runs there through `podman exec`. Prints one answer.
+    #[command(hide = true)]
+    Look {
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+        /// How long the look may take, in milliseconds.
+        #[arg(long, value_name = "MS")]
+        within: Option<u64>,
+        /// The daemon's clock, in Unix milliseconds.
+        #[arg(long, value_name = "MS")]
+        now: Option<u64>,
+        /// Tells this look from another, so that the daemon can end it.
+        #[arg(long)]
+        token: Option<String>,
+        /// What the last look left, as the daemon keeps it.
+        #[arg(long, value_name = "JSON")]
+        previous: Option<String>,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -233,7 +253,9 @@ fn show_status(settings: &Settings, json: bool) -> Result<()> {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
-        Command::Hook { .. } => unreachable!("handled before anything can fail"),
+        Command::Hook { .. } | Command::Look { .. } => {
+            unreachable!("handled before anything can fail")
+        }
         Command::Run => daemon::run(stop_flag())?,
         Command::Status { json, watch } => {
             if !watch {
@@ -350,6 +372,23 @@ fn main() -> ExitCode {
     // it, the agent's session sees success.
     if let Command::Hook { event, env, agent } = &cli.command {
         hook::run(event, env.as_deref(), agent.as_deref());
+        return ExitCode::SUCCESS;
+    }
+    // So does a look: it always prints one answer and leaves with success.
+    if let Command::Look {
+        env,
+        within,
+        now,
+        token: _,
+        previous,
+    } = &cli.command
+    {
+        inside::run(&inside::Asked {
+            env: env.as_deref(),
+            within_ms: *within,
+            now_ms: *now,
+            previous: previous.as_deref(),
+        });
         return ExitCode::SUCCESS;
     }
     match run(cli) {
