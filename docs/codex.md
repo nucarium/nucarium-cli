@@ -50,9 +50,9 @@ release, check that release's payload fields against the fixtures.
 top-level key is `hooks`, because Codex refuses a hooks file with a key it
 does not know.
 
-**Box-wide, pinned on.** This is what was run. Write the output of
-`nucleated hooks print --agent codex` to `/etc/codex/hooks.json`, as root,
-and pin hooks on in `/etc/codex/requirements.toml`:
+**Box-wide, pinned on.** Write the output of `nucleated hooks print
+--agent codex` to `/etc/codex/hooks.json`, as root, and pin hooks on in
+`/etc/codex/requirements.toml`:
 
 ```toml
 [features]
@@ -105,18 +105,20 @@ apart only by the first two. A hook that cannot be placed records nothing.
 
 ## What is read, and what each event becomes
 
-From every hook's standard input the adapter reads `session_id` and `cwd`.
-From `SessionStart` it also reads `source`, and from `PreToolUse`
-`tool_name`. It reads nothing else: the parser names those keys and skips
-every other value without keeping it. The event is the one named on the
+From every hook's standard input the adapter reads `session_id` and `cwd`,
+and whether `transcript_path` is null. From `SessionStart` it also reads
+`source`, and from `PreToolUse` `tool_name`. It reads nothing else: the
+parser names those keys and skips every other value without keeping it. The event is the one named on the
 command line, not the payload's `hook_event_name`.
 
 `session_id` is sent. `cwd` is used on the box to find the session's repos
 and branch and is never sent. `source` and `tool_name` are each compared
-with one word and dropped.
+with one word and dropped. A `transcript_path` that is not null is skipped
+unread.
 
 | Codex event | Reported as |
 |---|---|
+| Any event whose `transcript_path` is null | nothing |
 | `SessionStart` | `session_start`, unless `source` is `compact`: then nothing |
 | `UserPromptSubmit` | `user_prompt_submit` |
 | `PreToolUse` for `request_user_input` | `input_prompt`: a question to the owner |
@@ -152,8 +154,8 @@ registered an earlier file, print it again and replace it.
 A payload that is cut short, empty, not JSON, not an object, or has no
 `session_id` records nothing, and the hook still exits 0 without printing.
 
-Fields beside those that are skipped unread: `transcript_path`,
-`agent_transcript_path`, `prompt`, `last_assistant_message`, `tool_name`
+Fields beside those that are skipped unread: `transcript_path` (but
+whether it is null), `agent_transcript_path`, `prompt`, `last_assistant_message`, `tool_name`
 (but on `PreToolUse`), `tool_use_id`, `tool_input`, `tool_response`, `model`,
 `turn_id`, `permission_mode`, `agent_id`, `agent_type`, `stop_hook_active`,
 `reason`, `trigger`, and on the model-request events `status`, `error`,
@@ -186,12 +188,10 @@ by a signal runs no `SessionEnd`.
 
 **The title session.** On a server, with the vendor's model, a session's
 first prompt starts a second, hidden session that writes the task's title.
-It has its own session id and ends about a minute after its `Stop`. It shows
-as a session of its own. Its hooks carry `transcript_path: null` and
-`permission_mode: bypassPermissions`, and so do those of every session
-Codex keeps no transcript for, `codex exec --ephemeral` among them (Codex's
-source at `rust-v0.172.0`). No field names the title session, so the
-adapter does not drop it.
+It never shows. Its hooks carry `transcript_path: null`, and nothing from a
+hook with a null `transcript_path` is recorded. Codex sends the same for
+`codex exec --ephemeral` (Codex's source at `rust-v0.172.0`), so an
+ephemeral `exec` never shows either.
 
 ## What Codex never reports
 

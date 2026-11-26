@@ -5,7 +5,9 @@
 //! file. Codex's hooks carry a session id and a working folder beside the
 //! prompt, the last message and the tool input and output. Only the first two
 //! are read, on `SessionStart` the short word that says why it started, and
-//! on `PreToolUse` the tool's name, compared with one name and dropped.
+//! on `PreToolUse` the tool's name, compared with one name and dropped. Of
+//! `transcript_path` only whether it is null is read: Codex's hidden title
+//! session has no transcript, and is not reported.
 //!
 //! What Codex gives no hook for is not reported: a turn that fails, a usage
 //! limit and when it resets, an MCP server asking the owner something, when a
@@ -37,15 +39,29 @@ struct Common {
     session_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
 }
 
-/// `SessionStart`, the one hook a third field is read from.
+/// `SessionStart`, the one hook `source` is read from.
 #[derive(Deserialize)]
 struct SessionStart {
     #[serde(default, deserialize_with = "short_string")]
     session_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
     /// `startup`, `resume`, `clear`, `compact` or `fork`.
     #[serde(default, deserialize_with = "short_string")]
     source: Option<String>,
@@ -58,8 +74,28 @@ struct PreToolUse {
     session_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
     #[serde(default, deserialize_with = "short_string")]
     tool_name: Option<String>,
+}
+
+/// Whether a field is null, without reading what it holds when it is not.
+/// For a `bool`, with `#[serde(default, deserialize_with = "no_transcript")]`:
+/// a field that is not there is `false`.
+///
+/// Codex sends `transcript_path: null` for a session it keeps no transcript
+/// for (codex-rs/hooks/src/schema.rs at `rust-v0.172.0`). That is the hidden
+/// session a hosted session's first prompt starts to write the task's title,
+/// and `codex exec --ephemeral`, which runs to its end without asking anyone
+/// anything. Neither is a session to show.
+fn no_transcript<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Option::<serde::de::IgnoredAny>::deserialize(deserializer).map(|value| value.is_none())
 }
 
 impl Codex {
@@ -119,7 +155,7 @@ impl Agent for Codex {
             .map(|c| c.to_ascii_lowercase())
             .collect();
         let common = |payload: &mut dyn Read| read_object::<Common>(payload);
-        let (kind, session_id, cwd) = match event.as_str() {
+        let (kind, session_id, cwd, no_transcript) = match event.as_str() {
             "sessionstart" => {
                 let hook: SessionStart = read_object(payload)?;
                 // A compaction restarts the session's context, not the
@@ -127,11 +163,21 @@ impl Agent for Codex {
                 if hook.source.as_deref() == Some("compact") {
                     return None;
                 }
-                (EventType::SessionStart, hook.session_id, hook.cwd)
+                (
+                    EventType::SessionStart,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             "userpromptsubmit" => {
                 let hook = common(payload)?;
-                (EventType::UserPromptSubmit, hook.session_id, hook.cwd)
+                (
+                    EventType::UserPromptSubmit,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // Codex is about to put a question to its owner. Any other tool
             // says nothing about the session: a hooks file registered with no
@@ -141,19 +187,34 @@ impl Agent for Codex {
                 if hook.tool_name.as_deref() != Some(Self::QUESTION_TOOL) {
                     return None;
                 }
-                (EventType::InputPrompt, hook.session_id, hook.cwd)
+                (
+                    EventType::InputPrompt,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // A tool ran, so the agent is working: this is how a session
             // leaves "needs input" after an approval is given or a question
             // is answered.
             "posttooluse" => {
                 let hook = common(payload)?;
-                (EventType::Activity, hook.session_id, hook.cwd)
+                (
+                    EventType::Activity,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // Codex is about to ask for an approval.
             "permissionrequest" => {
                 let hook = common(payload)?;
-                (EventType::PermissionPrompt, hook.session_id, hook.cwd)
+                (
+                    EventType::PermissionPrompt,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // A turn that finished, or one the owner cut short. Either way
             // the agent is idle. Codex runs no `Stop` for an interrupted
@@ -161,11 +222,21 @@ impl Agent for Codex {
             // were still working.
             "stop" | "interrupt" => {
                 let hook = common(payload)?;
-                (EventType::Stop, hook.session_id, hook.cwd)
+                (
+                    EventType::Stop,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             "sessionend" => {
                 let hook = common(payload)?;
-                (EventType::SessionEnd, hook.session_id, hook.cwd)
+                (
+                    EventType::SessionEnd,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // The compaction, subagent and model-request events, and any
             // name Codex adds later. `PostModelRequest` can say an attempt
@@ -173,6 +244,10 @@ impl Agent for Codex {
             // sentence, so it is not a failed stop.
             _ => return None,
         };
+        // The title session, or an ephemeral `exec`: not a session to show.
+        if no_transcript {
+            return None;
+        }
         Some(Lifecycle {
             event: kind,
             session_id: session_id?,
@@ -338,6 +413,50 @@ mod tests {
             "",
         ] {
             assert_eq!(kind(event, base()), None, "{event}");
+        }
+    }
+
+    #[test]
+    fn a_session_codex_keeps_no_transcript_for_is_never_reported() {
+        let untranscribed = |event: &str| {
+            let mut payload = if event == "PreToolUse" {
+                question()
+            } else {
+                base()
+            };
+            payload["transcript_path"] = Value::Null;
+            payload["permission_mode"] = json!("bypassPermissions");
+            payload
+        };
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+            "Interrupt",
+            "SessionEnd",
+        ] {
+            assert_eq!(kind(event, untranscribed(event)), None, "{event}");
+            // A transcript of any shape, or none named at all, is a session.
+            let named = if event == "PreToolUse" {
+                question()
+            } else {
+                base()
+            };
+            assert!(kind(event, named.clone()).is_some(), "{event}");
+            for path in [
+                json!("/home/agent/.codex/sessions/rollout.jsonl"),
+                json!(""),
+                json!({ "path": "/x" }),
+                json!(["/x"]),
+                json!(false),
+            ] {
+                let mut payload = named.clone();
+                payload["transcript_path"] = path.clone();
+                assert!(kind(event, payload).is_some(), "{event}: {path}");
+            }
         }
     }
 

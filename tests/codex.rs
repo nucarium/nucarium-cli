@@ -1236,7 +1236,6 @@ fn no_content_from_what_codex_sent_reaches_the_spool_the_local_state_or_the_wire
     let mock = gate::watch_taking(&["agent"]);
     rig.sign_in(&mock.url);
     let main = |kind: &str| (RUN_SESSION.to_string(), kind.to_string());
-    let title = |kind: &str| (TITLE_SESSION.to_string(), kind.to_string());
     let each = |session: &str, kinds: &[&str]| -> Vec<(String, String)> {
         kinds
             .iter()
@@ -1266,19 +1265,14 @@ fn no_content_from_what_codex_sent_reaches_the_spool_the_local_state_or_the_wire
                 &["session_start", "user_prompt_submit", "session_end"],
             ),
         ),
-        // The title session is recorded as a session of its own: nothing in
-        // its hooks tells it from an ephemeral one.
+        // Codex's hidden title session records nothing.
         (
             "hosted-approval-refused",
             vec![
                 main("session_start"),
                 main("user_prompt_submit"),
-                title("session_start"),
-                title("user_prompt_submit"),
                 main("permission_prompt"),
-                title("stop"),
                 main("stop"),
-                title("session_end"),
             ],
         ),
         (
@@ -1405,8 +1399,12 @@ fn each_recorded_codex_run_leaves_its_session_where_codex_left_it() {
     let run = recorded("hosted-approval-refused", &cwd);
     let at = play(&run, 0, &is("PermissionRequest"));
     assert_eq!(status(RUN_SESSION), Some(Status::NeedsInput));
-    play(&run, at, &is("Interrupt"));
+    let at = play(&run, at, &is("Interrupt"));
     assert_eq!(status(RUN_SESSION), Some(Status::Idle));
+    // The title session beside it, run to its end, never shows.
+    play(&run, at, &|_, _| false);
+    assert_eq!(status(TITLE_SESSION), None);
+    assert!(!mock.everything().contains(TITLE_SESSION));
 
     // A decline that lets the turn go on: needs input until Stop.
     let session = "00000000-0000-7000-8000-000000000006";
