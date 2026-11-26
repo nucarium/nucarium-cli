@@ -2,9 +2,13 @@
 //!
 //! The gate's shared pieces are in `common::gate`. This file holds a stand-in
 //! for Codex's hook engine, built from what Codex's own source says a hooks
-//! file and a hook payload are, and the adapter's fixture: a payload for
+//! file and a hook payload are, and the adapter's fixtures: a payload for
 //! every Codex hook event with the sentinel in every field that carries
-//! content.
+//! content, and under `tests/fixtures/codex/` the payloads Codex 0.172.0 sent
+//! in the spike, scrubbed, with the sentinel written into every field that
+//! can carry content. The four events that never fired, and the
+//! `SessionStart` sources that never came, are written there from Codex's
+//! generated hook schemas at that version.
 //!
 //! If the gate test here fails, content can leave the box. Do not release.
 
@@ -41,6 +45,9 @@ const EVENTS: [&str; 14] = [
 /// What `SessionStart` may say started it.
 const SOURCES: [&str; 5] = ["startup", "resume", "clear", "compact", "fork"];
 
+/// The tool Codex calls to put a question to its owner.
+const QUESTION: &str = "request_user_input";
+
 /// A box whose one environment runs Codex.
 fn rig() -> Rig {
     let rig = Rig::new();
@@ -73,11 +80,9 @@ fn payload(event: &str, session: &str, cwd: &Path, source: &str) -> Value {
                     "content": gate::mark("tool_input.content: the file's content"),
                     "edits": [{ "old": gate::mark("tool_input.edits.old"), "new": [gate::mark("tool_input.edits.new")] }],
                 }),
-                "tool_response" => json!({
-                    "stdout": gate::mark("tool_response.stdout"),
-                    "stderr": gate::mark("tool_response.stderr"),
-                    "files": [{ "path": format!("/x/{MARK}_tool_response_path"), "content": gate::mark("tool_response.files.content") }],
-                }),
+                // A string in every payload Codex sent: a command's output, or
+                // a question's answers as JSON.
+                "tool_response" => json!(gate::mark("tool_response: the command's output")),
                 "agent_transcript_path" => {
                     json!(format!(
                         "/home/agent/.codex/sessions/{MARK}_agent_transcript_path.jsonl"
@@ -153,6 +158,13 @@ fn payload(event: &str, session: &str, cwd: &Path, source: &str) -> Value {
         ]),
         _ => {}
     }
+    payload
+}
+
+/// `PreToolUse` or `PostToolUse` around a question to the owner.
+fn question(event: &str, session: &str, cwd: &Path) -> Value {
+    let mut payload = payload(event, session, cwd, "startup");
+    payload["tool_name"] = json!(QUESTION);
     payload
 }
 
@@ -242,6 +254,9 @@ impl Codex {
                 for key in group.as_object().unwrap().keys() {
                     assert!(["matcher", "hooks"].contains(&key.as_str()), "{key}");
                 }
+                if let Some(matcher) = group.get("matcher") {
+                    assert!(matcher.is_string(), "a matcher is a string");
+                }
                 for handler in group["hooks"].as_array().expect("handlers") {
                     assert_eq!(handler["type"], "command");
                     assert!(handler["command"].is_string());
@@ -312,11 +327,15 @@ impl Codex {
         run(&mut shell, &payload.to_string())
     }
 
-    /// A lifecycle event happens: every command registered for it runs. A
-    /// hook may never fail, print or complain. Returns how many ran.
+    /// A lifecycle event happens: every command registered for it, in a
+    /// group whose matcher lets it through, runs. A hook may never fail,
+    /// print or complain. Returns how many ran.
     fn fire_with(&self, event: &str, cwd: &Path, payload: &Value) -> usize {
         let mut ran = 0;
         for group in self.hooks[event].as_array().into_iter().flatten() {
+            if !matched(event, group, payload) {
+                continue;
+            }
             for handler in group["hooks"].as_array().unwrap() {
                 let out = self.command(handler["command"].as_str().unwrap(), cwd, payload);
                 assert_eq!(out.status.code(), Some(0), "the hook failed for {event}");
@@ -331,6 +350,35 @@ impl Codex {
     fn fire(&self, event: &str, session: &str, cwd: &Path) -> usize {
         self.fire_with(event, cwd, &payload(event, session, cwd, "startup"))
     }
+}
+
+/// Whether a matcher group runs for this payload, as Codex decides it: no
+/// matcher, an empty one or `*` runs for everything; one made of letters,
+/// digits, `_` and `|` is a list of exact names; and the events that take no
+/// matcher ignore one (codex-rs/hooks/src/engine/matcher.rs and
+/// codex-rs/hooks/src/events/common.rs at rust-v0.172.0). The stand-in knows
+/// what a tool event is matched on, and refuses what it does not know.
+fn matched(event: &str, group: &Value, payload: &Value) -> bool {
+    let Some(pattern) = group.get("matcher").and_then(Value::as_str) else {
+        return true;
+    };
+    let input = match event {
+        "PreToolUse" | "PermissionRequest" | "PostToolUse" => payload["tool_name"].as_str(),
+        "UserPromptSubmit" | "Stop" | "Interrupt" | "PreModelRequest" | "PostModelRequest" => {
+            return true
+        }
+        other => panic!("the stand-in does not know what Codex matches {other} on"),
+    };
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+    assert!(
+        pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '|'),
+        "the stand-in matches names, not patterns: {pattern}"
+    );
+    input.is_some_and(|input| pattern.split('|').any(|name| name == input))
 }
 
 fn kinds(rig: &Rig) -> Vec<String> {
@@ -428,6 +476,23 @@ fn a_codex_session_is_followed_from_its_start_to_its_end() {
     gate::tick(&rig);
     assert_eq!(status_of(&rig, "client-a"), Some(Status::Idle));
 
+    // A third turn puts a question to the owner. No approval is asked for,
+    // so only the question tool's PreToolUse says the session is waiting.
+    codex.fire("UserPromptSubmit", SESSION, &cwd);
+    assert_eq!(
+        codex.fire_with("PreToolUse", &cwd, &question("PreToolUse", SESSION, &cwd)),
+        1
+    );
+    gate::tick(&rig);
+    assert_eq!(status_of(&rig, "client-a"), Some(Status::NeedsInput));
+    // Answered: the tool's PostToolUse, and the turn finishes.
+    codex.fire_with("PostToolUse", &cwd, &question("PostToolUse", SESSION, &cwd));
+    gate::tick(&rig);
+    assert_eq!(status_of(&rig, "client-a"), Some(Status::Working));
+    codex.fire("Stop", SESSION, &cwd);
+    gate::tick(&rig);
+    assert_eq!(status_of(&rig, "client-a"), Some(Status::Idle));
+
     // And it is closed.
     codex.fire("SessionEnd", SESSION, &cwd);
     gate::tick(&rig);
@@ -445,11 +510,15 @@ fn a_codex_session_is_followed_from_its_start_to_its_end() {
         sorted,
         [
             "activity",
+            "activity",
+            "input_prompt",
             "permission_prompt",
             "session_end",
             "session_start",
             "stop",
             "stop",
+            "stop",
+            "user_prompt_submit",
             "user_prompt_submit",
             "user_prompt_submit",
         ],
@@ -558,6 +627,20 @@ fn the_hooks_file_registers_only_the_events_the_adapter_reads() {
             "UserPromptSubmit",
         ]
     );
+    // `PreToolUse` runs for the question tool alone: a command, an edit or
+    // an MCP tool starts no process at all.
+    for tool in ["Bash", "apply_patch", "mcp__docs__request_user_input"] {
+        let mut payload = payload("PreToolUse", SESSION, &cwd, "startup");
+        payload["tool_name"] = json!(tool);
+        assert_eq!(codex.fire_with("PreToolUse", &cwd, &payload), 0, "{tool}");
+    }
+    let before = rig.spooled().len();
+    assert_eq!(
+        codex.fire_with("PreToolUse", &cwd, &question("PreToolUse", SESSION, &cwd)),
+        1
+    );
+    assert_eq!(rig.spooled().len(), before + 1);
+    assert_eq!(kinds(&rig).last().unwrap(), "input_prompt");
     // With no environment named, the agent still is: a hook that names no
     // agent is Claude Code's.
     let out = run(
@@ -835,6 +918,14 @@ fn no_content_from_a_codex_hook_reaches_the_spool_the_local_state_or_the_wire() 
         hook(&codex, event, &cwd, &payload(event, SESSION, &cwd, source));
         hook(&codex, event, &cwd, &stuffed(event, &cwd, source));
     }
+    // The question to the owner, the one tool whose name is compared, with
+    // everything else on top.
+    for event in ["PreToolUse", "PostToolUse"] {
+        hook(&codex, event, &cwd, &question(event, SESSION, &cwd));
+        let mut asked = stuffed(event, &cwd, "startup");
+        asked["tool_name"] = json!(QUESTION);
+        hook(&codex, event, &cwd, &asked);
+    }
 
     let spooled = rig.spooled();
     assert!(
@@ -879,6 +970,7 @@ fn no_content_from_a_codex_hook_reaches_the_spool_the_local_state_or_the_wire() 
         types.into_iter().collect::<Vec<_>>(),
         [
             "activity",
+            "input_prompt",
             "permission_prompt",
             "session_end",
             "session_start",
