@@ -55,6 +55,8 @@ pub enum Failure {
 /// child is waited for, so an id in it always names this program's child
 /// and never a process that came after it.
 static LIVE: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+/// Set by [`stop_all`]: from then on nothing more is started.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 fn live() -> std::sync::MutexGuard<'static, BTreeSet<u32>> {
     LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -66,6 +68,11 @@ fn spawn(command: &mut Command, stderr: Stdio) -> Result<Child, Failure> {
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(command, 0);
     let mut started = live();
+    // A process whose time is up starts nothing more, even in the moment
+    // before it leaves.
+    if STOPPED.load(Ordering::SeqCst) {
+        return Err(Failure::Absent);
+    }
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -102,11 +109,13 @@ fn wait(child: &mut Child) -> std::io::Result<ExitStatus> {
 }
 
 /// Stop every program started here that is still running, and everything in
-/// its process group, at once. For a process that has to end within a time
-/// of its own whatever it is in the middle of: `nucleated look` calls this
-/// when its time is up, before it leaves.
+/// its process group, at once, and start none from then on. For a process
+/// that has to end within a time of its own whatever it is in the middle of:
+/// `nucleated look` calls this when its time is up, before it leaves.
 pub fn stop_all() {
-    for id in live().iter() {
+    let started = live();
+    STOPPED.store(true, Ordering::SeqCst);
+    for id in started.iter() {
         kill_group(*id);
     }
 }
@@ -554,6 +563,11 @@ mod tests {
         assert!(!heard.ok);
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(live().is_empty());
+        // And nothing more is started afterwards.
+        assert_eq!(
+            run(&mut sh("echo late"), Duration::from_secs(5), 4096),
+            Err(Failure::Absent)
+        );
     }
 
     #[test]
