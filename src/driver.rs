@@ -1267,7 +1267,12 @@ impl Runner {
         match heard {
             Ok(answer) => answer.check(driver),
             Err(Failure::Late) => {
-                self.end(environment, &token);
+                // On a thread of its own: the look is over for the host now,
+                // and ending it in the container takes a moment more.
+                if let Some(container) = environment.container() {
+                    let (runner, container) = (self.clone(), container.to_string());
+                    std::thread::spawn(move || runner.end(&container, &token));
+                }
                 Err(Condition::Timeout)
             }
             // No `podman`, no container running, or nothing that could be
@@ -1278,13 +1283,10 @@ impl Runner {
     }
 
     /// The host gave up on a look before it ended itself. Whatever of it is
-    /// still running in the container is ended there, so that neither the
-    /// container nor the host keeps anything of it. On the host the look was
-    /// a child of this program, and has been stopped already.
-    fn end(&self, environment: &Environment, token: &str) {
-        let Some(container) = environment.container() else {
-            return;
-        };
+    /// still running in `container` is ended there, so that neither the
+    /// container nor the host keeps anything of it. A look on the host was a
+    /// child of this program, and has been stopped already.
+    fn end(&self, container: &str, token: &str) {
         let mut command = Command::new(&self.podman);
         command
             .arg("exec")
