@@ -6,15 +6,15 @@
 
 ```toml
 [[environment]]
-name = "codex-client-a"
+name = "client-a"
 root = "/home/agent/client-a"
 agent = "codex"
 # That login's CODEX_HOME.
 config_dir = "/home/agent/.codex-client-a"
-# unit = "codex-server@codex-client-a.service"
+# unit = "codex-server@client-a.service"
 ```
 
-`nucleated hooks print --env codex-client-a` prints the hooks file to
+`nucleated hooks print --env client-a` prints the hooks file to
 register, and every command in it names `--agent codex`. To a Watch that
 takes the field, the environment's heartbeat names its agent, `codex`.
 
