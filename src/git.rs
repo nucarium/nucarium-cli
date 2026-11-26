@@ -782,37 +782,6 @@ impl Git {
         }
     }
 
-    /// `git worktree repair` in a bare repo, so that the worktrees it has
-    /// registered point at it again after it moved, naming each of them.
-    /// Run from inside the bare repo itself: repair also repairs the folder
-    /// it is run from, and run from another repository's worktree it would
-    /// point that one here. Git writes a `.git` file into every worktree the
-    /// repo has registered, named or not: the caller has checked them all.
-    /// With none registered there is nothing to repair, and git is not run.
-    pub fn repair_worktrees(&self, bare: &Path, worktrees: &[PathBuf]) -> Result<()> {
-        if worktrees.is_empty() {
-            return Ok(());
-        }
-        let mut args = vec!["worktree", "repair", "--"];
-        let named: Vec<&str> = worktrees.iter().filter_map(|path| path.to_str()).collect();
-        if named.len() != worktrees.len() {
-            bail!("a worktree's path is not text git can be given");
-        }
-        args.extend(named);
-        let args = args.as_slice();
-        let out = match self {
-            Git::Plain => {
-                let mut command = Command::new("git");
-                command.arg("--git-dir").arg(bare).args(args);
-                collect(command.current_dir(bare))?
-            }
-            Git::Guarded(guarded) => {
-                collect(guarded.prepare(bare, true, args, None)?.current_dir(bare))?
-            }
-        };
-        checked(out, Some(("--git-dir", bare)), args).map(drop)
-    }
-
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_tree(dir, args),

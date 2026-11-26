@@ -124,12 +124,14 @@ pub(crate) fn relocated(bare: &Path, label: &str) -> Option<PathBuf> {
 const MAX_WORKTREES: usize = 10_000;
 
 /// The worktree a pointer read from a repo's `worktrees/<id>/gitdir` names,
-/// resolved, if it is a folder in `sessions` (resolved) and the pointer
-/// names its `.git`: what git would write to when it repairs it. Nothing for
-/// a pointer anywhere else, through a link out of `sessions` included.
+/// resolved, if the pointer is absolute, names that worktree's `.git`, and
+/// the worktree is a folder in `sessions` (resolved). Nothing for a pointer
+/// anywhere else, through a link out of `sessions` included, and nothing
+/// for a relative one: git reads that from `worktrees/<id>`, and this would
+/// not.
 fn in_sessions(pointer: &str, sessions: &Path) -> Option<PathBuf> {
     let pointer = Path::new(pointer.trim_end_matches(['\n', '\r']));
-    if pointer.file_name()? != ".git" {
+    if !pointer.is_absolute() || pointer.file_name()? != ".git" {
         return None;
     }
     let worktree = pointer.parent()?.canonicalize().ok()?;
@@ -156,34 +158,80 @@ fn registered(root: &Path, bare: &Path) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// The worktrees git may repair for `bare`: every worktree it has
-/// registered, each a folder in the nucleus's `sessions`. `git worktree
-/// repair` writes a `.git` file into every worktree a repo has registered,
-/// wherever its `gitdir` says it is, and a session can write those: so a
-/// repo with one registered anywhere else is not repaired at all.
-fn repairable(root: &Path, bare: &Path, sessions: &Path) -> Result<Vec<PathBuf>, String> {
+/// Each worktree `bare` has registered, with the folder in the nucleus's
+/// `sessions` it is, or why it is none of them.
+fn placed(root: &Path, bare: &Path, sessions: &Path) -> Vec<(String, Result<PathBuf, String>)> {
     let registered = registered(root, bare);
-    if registered.is_empty() {
-        return Ok(Vec::new());
-    }
     if registered.len() >= MAX_WORKTREES {
-        return Err("it has more worktrees than are looked at; repair it by hand".to_string());
+        return vec![(
+            String::new(),
+            Err("it has more worktrees than are looked at".to_string()),
+        )];
     }
-    let sessions = sessions
+    let sessions = sessions.canonicalize().ok();
+    registered
+        .into_iter()
+        .map(|(id, pointer)| {
+            let worktree = sessions
+                .as_deref()
+                .zip(pointer.as_deref())
+                .and_then(|(sessions, pointer)| in_sessions(pointer, sessions))
+                .ok_or_else(|| format!("worktree {id} is not one of this nucleus's sessions"));
+            (id, worktree)
+        })
+        .collect()
+}
+
+/// Whether every worktree `bare` has registered is a folder in the
+/// nucleus's `sessions`, which a move needs: a worktree anywhere else could
+/// not be pointed at its new place, and would be left broken.
+fn all_in_sessions(root: &Path, bare: &Path, sessions: &Path) -> Result<(), String> {
+    match placed(root, bare, sessions)
+        .into_iter()
+        .find_map(|(_, placed)| placed.err())
+    {
+        Some(why) => Err(format!("{why}; move it by hand")),
+        None => Ok(()),
+    }
+}
+
+/// Point each worktree `bare` has registered in the nucleus's `sessions` at
+/// it again, as `git worktree repair` would, without running git: its
+/// `.git` file is written anew, in the worktree's folder held open, reached
+/// from `sessions` one folder at a time and never through a link. Nothing
+/// is written anywhere else, whatever a repo's records say: a session can
+/// write those, and could have git write into any folder on the box.
+fn point_back(root: &Path, bare: &Path, sessions: &Path) -> Result<(), String> {
+    let common = bare
         .canonicalize()
-        .map_err(|_| "it has worktrees and the nucleus has no sessions folder".to_string())?;
-    let mut worktrees = Vec::new();
-    for (id, pointer) in registered {
-        match pointer.as_deref().and_then(|p| in_sessions(p, &sessions)) {
-            Some(worktree) => worktrees.push(worktree),
-            None => {
-                return Err(format!(
-                    "worktree {id} is not one of this nucleus's sessions; repair it by hand"
-                ))
+        .map_err(|error| format!("resolving {}: {error}", bare.display()))?;
+    let held_to = sessions
+        .canonicalize()
+        .map_err(|error| format!("resolving {}: {error}", sessions.display()))?;
+    let mut left = Vec::new();
+    for (id, placed) in placed(root, bare, sessions) {
+        let pointed = placed.and_then(|worktree| {
+            let held = Dir::beneath(&held_to, &worktree)
+                .map_err(|error| format!("worktree {id}: {error}"))?;
+            // Only a `.git` file is replaced, or one that is missing: never
+            // a folder, a link, or anything else in its place.
+            match held.look(".git") {
+                Ok(entry) if entry.regular => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(format!("worktree {id}: its .git is not a file")),
             }
+            let pointer = format!("gitdir: {}\n", common.join("worktrees").join(&id).display());
+            held.replace(".git", pointer.as_bytes())
+                .map_err(|error| format!("worktree {id}: {error}"))
+        });
+        if let Err(why) = pointed {
+            left.push(why);
         }
     }
-    Ok(worktrees)
+    match left.is_empty() {
+        true => Ok(()),
+        false => Err(left.join("; ")),
+    }
 }
 
 /// True when a worktree registered in `bare` still points at the place the
@@ -354,12 +402,7 @@ impl Workspace {
             if moved.repaired.contains(&bare) || !needs_repair(&root, &bare, &self.sessions_dir) {
                 continue;
             }
-            let repaired = repairable(&root, &bare, &self.sessions_dir).and_then(|worktrees| {
-                self.git
-                    .repair_worktrees(&bare, &worktrees)
-                    .map_err(|error| format!("{error:#}"))
-            });
-            match repaired {
+            match point_back(&root, &bare, &self.sessions_dir) {
                 Ok(()) => moved.repaired.push(bare),
                 Err(why) => moved.left.push((bare, why)),
             }
@@ -415,15 +458,15 @@ impl Workspace {
                 taken.path().display()
             ));
         }
-        // Its worktrees are pointed at it again after the move, so none may
-        // be anywhere git should not write.
-        let worktrees = repairable(&self.nucleus_root(), from, &self.sessions_dir)?;
+        // Its worktrees are pointed at it again after the move, which only
+        // a worktree in the nucleus's sessions can be.
+        let root = self.nucleus_root();
+        all_in_sessions(&root, from, &self.sessions_dir)?;
         fs::create_dir_all(&owner)
             .map_err(|error| format!("creating {}: {error}", owner.display()))?;
         fs::rename(from, &to).map_err(|error| format!("moving to {}: {error}", to.display()))?;
-        self.git
-            .repair_worktrees(&to, &worktrees)
-            .map_err(|error| format!("moved to {}, but {error:#}", to.display()))?;
+        point_back(&root, &to, &self.sessions_dir)
+            .map_err(|why| format!("moved to {}, but {why}", to.display()))?;
         Ok(to)
     }
 }
@@ -446,7 +489,32 @@ pub(crate) fn relocate_all(manifest: &mut Manifest) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{label, owner_of, valid_owner, NO_OWNER};
+    use super::{in_sessions, label, owner_of, valid_owner, NO_OWNER};
+    use std::fs;
+
+    #[test]
+    fn only_an_absolute_pointer_to_a_sessions_worktree_is_one_to_point_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().canonicalize().unwrap().join(".worktrees");
+        let worktree = sessions.join("s1/web");
+        fs::create_dir_all(&worktree).unwrap();
+        let pointer = format!("{}/.git\n", worktree.display());
+        assert_eq!(in_sessions(&pointer, &sessions), Some(worktree.clone()));
+        // Relative, git reads it from the repo's records, not from here.
+        assert_eq!(in_sessions("s1/web/.git", &sessions), None);
+        assert_eq!(in_sessions("./.git", &sessions), None);
+        // Not a worktree's `.git`, the sessions folder itself, or outside.
+        let other = format!("{}/HEAD", worktree.display());
+        assert_eq!(in_sessions(&other, &sessions), None);
+        let itself = format!("{}/.git", sessions.display());
+        assert_eq!(in_sessions(&itself, &sessions), None);
+        let outside = format!("{}/.git", dir.path().display());
+        assert_eq!(in_sessions(&outside, &sessions), None);
+        // Nor through a link out of it.
+        std::os::unix::fs::symlink(dir.path(), sessions.join("out")).unwrap();
+        let through = format!("{}/.git", sessions.join("out").display());
+        assert_eq!(in_sessions(&through, &sessions), None);
+    }
 
     #[test]
     fn a_github_remote_gives_its_owner() {

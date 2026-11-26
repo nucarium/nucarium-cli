@@ -356,6 +356,31 @@ impl Dir {
         written
     }
 
+    /// Put a new file of the daemon's own, holding `bytes`, in place of the
+    /// entry `name`: written whole under a name of its own first, then
+    /// renamed over it, so whatever was there (a link included) is replaced
+    /// as an entry and never written through. A folder is not replaced.
+    pub fn replace(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let tmp = format!(".{name}.{}.tmp", std::process::id());
+        let _ = self.unlink(&tmp);
+        self.create_new(&tmp, bytes)?;
+        let (from, to) = (c_string(tmp.as_bytes())?, c_string(name.as_bytes())?);
+        // SAFETY: the descriptor this folder owns, twice, and two valid C
+        // strings.
+        let renamed = checked(unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                from.as_ptr(),
+                self.0.as_raw_fd(),
+                to.as_ptr(),
+            )
+        });
+        if renamed.is_err() {
+            let _ = self.unlink(&tmp);
+        }
+        renamed.map(|_| ())
+    }
+
     /// Remove an entry. A link is removed, never what it names; a folder is
     /// not removed.
     pub fn unlink(&self, name: &str) -> std::io::Result<()> {
@@ -522,6 +547,19 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
         fs::create_dir(dir.path().join("folder")).unwrap();
         assert!(held.create_new("folder", b"x").is_err());
+        // Replacing puts a file in place of a link, not through it, and
+        // leaves a folder.
+        held.replace("link", b"new").unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("link")).unwrap(), "new");
+        assert!(fs::symlink_metadata(dir.path().join("link"))
+            .unwrap()
+            .is_file());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+        assert!(held.replace("folder", b"x").is_err());
+        assert!(dir.path().join("folder").is_dir());
+        let mut names = held.names(16);
+        names.sort();
+        assert_eq!(names, ["folder", "link", "made", "target"]);
     }
 
     #[test]

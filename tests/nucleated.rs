@@ -685,7 +685,7 @@ fn moved_lines(report: &Value) -> String {
 }
 
 #[test]
-fn a_repo_with_a_worktree_registered_outside_its_sessions_is_never_repaired() {
+fn a_worktree_registered_outside_its_sessions_is_never_written_to() {
     let rig = Rig::new();
     let worktree = rig.session("fix-login");
     // A move that stopped before its repair: the session's worktree still
@@ -708,15 +708,15 @@ fn a_repo_with_a_worktree_registered_outside_its_sessions_is_never_repaired() {
         "{said}"
     );
 
-    // Without it (the refresh may have pruned it already), the repo is
-    // repaired as before.
-    let _ = fs::remove_dir_all(nested.join("worktrees/planted"));
-    let report = housekeeping(&rig, &["refresh"]);
-    assert!(
-        moved_lines(&report).contains(&format!("repaired the worktrees of {}", nested.display())),
-        "{report}"
-    );
+    // The session's own worktree is pointed at the repo again all the same.
     assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"]
+        ),
+        nested.canonicalize().unwrap().to_str().unwrap()
+    );
 }
 
 #[test]
@@ -739,12 +739,11 @@ fn a_nucleus_a_container_writes_is_left_in_the_flat_layout() {
     let rig = Rig::new();
     rig.configure_in_container("");
     rig.session("fix-login");
+    // One a refresh would move, were it not a container's.
     let flat = rig.flatten();
-    let victim = register_outside(&rig, &flat, "planted");
     let report = housekeeping(&rig, &["refresh"]);
     assert!(report["moved"].is_null(), "{report}");
     assert!(flat.is_dir());
-    assert!(!victim.join(".git").exists());
 }
 
 #[test]
@@ -772,6 +771,38 @@ fn the_daemon_moves_a_nucleus_made_before_owner_folders_when_it_starts() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(stderr(&out).contains(&format!("client-a: moved {}", flat.display())));
     assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn the_daemon_leaves_a_nucleus_a_container_writes_as_it_is_when_it_starts() {
+    let rig = Rig::new();
+    rig.configure_in_container("");
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    rig.session("fix-login");
+    // One the daemon would move, were it not a container's.
+    let flat = rig.flatten();
+    let child = rig
+        .nucleated()
+        .arg("run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("the first heartbeat", || {
+        !mock.to("/v1/heartbeats:ingest").is_empty()
+    });
+    signal(child.id(), "-TERM");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(flat.is_dir());
+    assert!(!rig.root.join(".repos/_/web.git").exists());
+    assert!(
+        !stderr(&out).contains("client-a: moved"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

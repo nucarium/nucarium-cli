@@ -100,9 +100,10 @@ A nucleus made by an earlier `nucleate` keeps its clones at
 `.repos/<name>.git`. They are still read, and they move to their owner folders
 the first time `nucleate init`, `nucleate clone`, `nucleate refresh`,
 `nucleated`'s refresh or `nucleated` itself starts. Each move renames the bare
-clone, runs `git worktree repair` inside it so that every worktree registered
-in it points at it again (a session's, and a session's `.subworktrees/`), and
-rewrites the `bare` path in each session's manifest. A session at work keeps working: a git command started in it at the
+clone, points every worktree registered in it at it again (a session's, and a
+session's `.subworktrees/`) by rewriting that worktree's `.git` file as `git
+worktree repair` would, and rewrites the `bare` path in each session's
+manifest. A session at work keeps working: a git command started in it at the
 very moment of the move can fail once. What moved goes to standard error, or
 to `nucleated`'s log. One run at a time moves anything, and running it again
 does nothing.
@@ -110,8 +111,8 @@ does nothing.
 A repo is left where it is, and the reason said, when the vetting refuses it
 (moving it would mean running git in it), when the place it would move to
 is taken, or when it has a worktree registered anywhere but the nucleus's
-`.worktrees/`: git writes into every worktree it repairs, and a session can
-say where one is. Such a repo is still listed and used as before. A nucleus a
+`.worktrees/`, which could not be pointed at the new place. Nothing is ever
+written outside `.worktrees/`, whatever a repo's records say. Such a repo is still listed and used as before. A nucleus a
 container writes is not moved at all by `nucleated`. A run that stopped
 part way is finished by the next one, and a manifest that still names the old
 place is read as naming the new one.
