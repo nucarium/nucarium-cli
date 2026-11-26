@@ -310,9 +310,13 @@ pub fn record_as(
         // If this agent runs inside a driver's session, the driver lists it
         // too. The record says so, and the daemon has the driver's adapter
         // stand aside: the hook wins.
-        claim: driver::hook_claim(settings, adapter.name(), cwd.as_deref(), &|name| {
-            std::env::var(name).ok()
-        }),
+        claim: driver::hook_claim(
+            settings,
+            environment,
+            adapter.name(),
+            cwd.as_deref(),
+            &|name| std::env::var(name).ok(),
+        ),
         // What a session left behind is the reporter's to say, not a hook's.
         ..Draft::default()
     };

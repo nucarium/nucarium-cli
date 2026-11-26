@@ -622,18 +622,25 @@ pub fn note_claim(state_dir: &Path, claim: &envelope::Claim, environment: &str, 
     let _ = paths::write_private(&path, note.as_bytes());
 }
 
-/// Ask every configured driver whether a hook's agent is one of its own,
-/// and say which, for the hook's spool record: the first driver environment
-/// whose adapter claims it, the key, and numbers made from where the hook's
-/// session works. The hook entry point calls this for every event it
-/// records.
+/// Ask the drivers in the hook's own container whether its agent is one of
+/// theirs, and say which, for the hook's spool record: the first driver
+/// environment there whose adapter claims it, the key, and numbers made from
+/// where the hook's session works. `own` is the environment the hook
+/// records for. A driver in another container cannot be running this agent,
+/// and an environment on the host has no claim the daemon would count. The
+/// hook entry point calls this for every event it records.
 pub fn hook_claim(
     settings: &Settings,
+    own: &Environment,
     agent: &str,
     cwd: Option<&Path>,
     var: &dyn Fn(&str) -> Option<String>,
 ) -> Option<envelope::Claim> {
+    let container = own.container()?;
     settings.environments.iter().find_map(|candidate| {
+        if candidate.container() != Some(container) {
+            return None;
+        }
         let adapter = candidate.driver_adapter()?;
         let hook = HookProcess {
             environment: candidate,
@@ -2463,9 +2470,14 @@ mod tests {
         from(None);
         assert_eq!(look(&placed), events(&[]));
         // The agent's own hook, from a folder inside the thread's, is.
-        let claimed = hook_claim(&settings, "claude-code", Some(&inside), &|_| {
-            Some("thread-7".to_string())
-        })
+        let boxed = in_one_container(&settings);
+        let claimed = hook_claim(
+            &boxed,
+            boxed.environment("client-a").unwrap(),
+            "claude-code",
+            Some(&inside),
+            &|_| Some("thread-7".to_string()),
+        )
         .unwrap();
         assert_eq!(claimed.driver_env, "t3");
         assert_eq!(claimed.key, "thread-7");
@@ -2571,13 +2583,24 @@ mod tests {
         assert_eq!(standing_claim(&settings, "client-a", "s1"), None);
     }
 
+    /// `settings` with every environment in `client-a`'s container.
+    fn in_one_container(settings: &Settings) -> Settings {
+        let mut settings = settings.clone();
+        for environment in &mut settings.environments {
+            environment.unit = "agent-env-client-a.service".into();
+        }
+        settings
+    }
+
     #[test]
     fn a_hook_says_which_drivers_session_it_runs_in_by_numbers_and_never_a_folder() {
         let (dir, settings) = rig();
+        let settings = in_one_container(&settings);
+        let own = settings.environment("client-a").unwrap();
         let inside = dir.path().join("work").join("SENTINEL named for a task");
         fs::create_dir_all(&inside).unwrap();
         let thread = |name: &str| (name == "T3CODE_THREAD_ID").then(|| "thread-7".to_string());
-        let claimed = hook_claim(&settings, "claude-code", Some(&inside), &thread).unwrap();
+        let claimed = hook_claim(&settings, own, "claude-code", Some(&inside), &thread).unwrap();
         assert_eq!(claimed.driver_env, "t3");
         assert_eq!(claimed.key, "thread-7");
         assert_eq!(claimed.folders, folder_numbers(&inside));
@@ -2586,14 +2609,38 @@ mod tests {
             .unwrap()
             .contains("SENTINEL"));
         // No folder, no numbers; no driver's variable, no claim.
-        assert!(hook_claim(&settings, "claude-code", None, &thread)
+        assert!(hook_claim(&settings, own, "claude-code", None, &thread)
             .unwrap()
             .folders
             .is_empty());
         assert_eq!(
-            hook_claim(&settings, "claude-code", Some(&inside), &|_| None),
+            hook_claim(&settings, own, "claude-code", Some(&inside), &|_| None),
             None
         );
+    }
+
+    #[test]
+    fn a_hook_asks_only_the_drivers_in_its_own_container() {
+        let (_dir, settings) = rig();
+        let thread = |name: &str| (name == "T3CODE_THREAD_ID").then(|| "thread-7".to_string());
+        let claim = |settings: &Settings| {
+            let own = settings.environment("client-a").unwrap();
+            hook_claim(settings, own, "claude-code", None, &thread)
+        };
+        // On the host, no claim the daemon would count is made.
+        assert_eq!(claim(&settings), None);
+        // T3 Code in its own container cannot be running this hook's agent.
+        let mut apart = in_one_container(&settings);
+        let t3 = apart.environments.iter_mut().find(|e| e.name == "t3");
+        t3.unwrap().unit = "agent-env-t3.service".into();
+        assert_eq!(claim(&apart), None);
+        // A second T3 Code, listed later, in the hook's own container, is
+        // the one asked.
+        let mut second = apart.environments[0].clone();
+        second.name = "t3-beside".into();
+        second.unit = "agent-env-client-a.service".into();
+        apart.environments.push(second);
+        assert_eq!(claim(&apart).unwrap().driver_env, "t3-beside");
     }
 
     #[test]

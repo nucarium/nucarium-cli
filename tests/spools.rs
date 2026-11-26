@@ -377,6 +377,64 @@ fn a_claim_counts_only_from_the_folder_of_an_environment_in_the_drivers_containe
 }
 
 #[test]
+fn a_hook_in_a_second_containers_t3_thread_claims_that_containers_t3_code() {
+    // Two logins, each in its own container with T3 Code beside it, `client-a`'s
+    // listed first.
+    let rig = Rig::new();
+    let root_b = rig.home.dir.join("client-b");
+    std::fs::create_dir_all(&root_b).unwrap();
+    let t3 = |name: &str, unit: &str| {
+        format!(
+            "[[environment]]\nname = \"{name}\"\nroot = \"{root}\"\ndriver = \"t3code\"\n\
+             check = \"true\"\nunit = \"{unit}\"\ndriver_home = \"{home}\"\n\
+             driver_poll = \"off\"\n",
+            root = rig.root.display(),
+            home = rig.home.dir.join("no-t3-here").display(),
+        )
+    };
+    rig.configure_in_container(&format!(
+        "{}{}[[environment]]\nname = \"client-b\"\nroot = \"{}\"\ncheck = \"true\"\n\
+         unit = \"agent-env-client-b.service\"\n",
+        t3("client-a-t3", "agent-env-client-a.service"),
+        t3("client-b-t3", "agent-env-client-b.service"),
+        root_b.display(),
+    ));
+    // Claude Code in one of `client-b`'s T3 threads fires its hook, inside
+    // `client-b`'s container, with that container's spool.
+    let spool_b = rig.home.state_dir().join("spools").join("client-b");
+    let config = std::fs::read_to_string(rig.home.config_file()).unwrap();
+    let inside_b = rig.home.config_file().with_file_name("in-client-b.toml");
+    std::fs::write(
+        &inside_b,
+        format!("{config}\n[spool]\ndir = \"{}\"\n", spool_b.display()),
+    )
+    .unwrap();
+    let out = common::run(
+        rig.nucleated()
+            .args(["hook", "UserPromptSubmit", "--env", "client-b"])
+            .env("NUCLEATED_CONFIG", &inside_b)
+            .env("T3CODE_THREAD_ID", "thread_01HZX"),
+        &serde_json::json!({ "session_id": "s1", "cwd": root_b }).to_string(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", common::stderr(&out));
+    let hooked = entries(&spool_b);
+    assert_eq!(hooked.len(), 1, "{hooked:?}");
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(spool_b.join(&hooked[0])).unwrap()).unwrap();
+    assert_eq!(record["event"]["claim"]["driver_env"], "client-b-t3");
+
+    // The daemon counts it, for `client-b`'s T3 Code.
+    gate::tick(&rig);
+    let held = claims(&rig);
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(held[0]
+        .0
+        .ends_with("claims/client-b-t3/thread_01HZX/s1.json"));
+    let note = String::from_utf8(held[0].1.clone()).unwrap();
+    assert_eq!(note.lines().next(), Some("client-b"), "{note}");
+}
+
+#[test]
 fn a_counted_claim_puts_the_driver_reference_on_the_sessions_events_while_it_stands() {
     let rig = box_with_t3_beside_the_login();
     let mock = gate::watch_taking(&["driver_session"]);
