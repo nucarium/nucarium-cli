@@ -546,12 +546,12 @@ impl Reporter {
         // A nucleus that is not there, on a disk that is not mounted say,
         // tells nothing about what a session in it holds. Nor does a link
         // in the place of its sessions' folder, or of one session's: what
-        // it leads to is not this nucleus's.
-        if !fs::symlink_metadata(&sessions).is_ok_and(|meta| meta.is_dir()) {
-            return None;
-        }
+        // it leads to is not this nucleus's. Each is held open, never
+        // through a link, and the manifest read from the session's folder
+        // held, so a link swapped in meanwhile is not followed either.
+        let held = paths::Dir::open(&sessions, false).ok()?;
         let folder = sessions.join(name);
-        match fs::symlink_metadata(&folder) {
+        let session = match held.at(name) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // The session's folder is gone, and with it anything that
                 // existed only there. What else it left is no longer
@@ -560,10 +560,10 @@ impl Reporter {
                 draft.unpushed_commits = Some(0);
                 return Some(draft);
             }
-            Ok(meta) if meta.is_dir() => {}
-            _ => return None,
-        }
-        let manifest = Workspace::load_manifest(&folder).ok()?;
+            Ok(session) => session,
+            Err(_) => return None,
+        };
+        let manifest = Workspace::load_manifest_in(&session, &folder).ok()?;
         let workspace = self.workspace(settings, environment);
         // Git runs only in the worktrees the folder really holds: each a
         // folder directly in it, of the repo its manifest names, which has

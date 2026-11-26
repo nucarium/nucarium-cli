@@ -697,8 +697,23 @@ impl Workspace {
         // Not through a link, and not without end: the session wrote it.
         let text = paths::read_plain(&path, MAX_MANIFEST)
             .with_context(|| format!("reading {}", path.display()))?;
+        Self::parse_manifest(&text, &path)
+    }
+
+    /// The manifest of the session folder `held` open, which is `session`:
+    /// read from that very folder, so a link swapped in for the folder
+    /// since it was opened is not followed.
+    pub fn load_manifest_in(held: &paths::Dir, session: &Path) -> Result<Manifest> {
+        let path = session.join(MANIFEST);
+        let text = held
+            .read_plain(MANIFEST, MAX_MANIFEST)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Self::parse_manifest(&text, &path)
+    }
+
+    fn parse_manifest(text: &str, path: &Path) -> Result<Manifest> {
         let mut manifest: Manifest =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
         // A repo moved to its owner folder since this was written.
         layout::relocate_all(&mut manifest);
         Ok(manifest)
