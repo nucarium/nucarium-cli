@@ -297,6 +297,11 @@ pub enum Outcome {
     Failed,
     /// It was gone already.
     Gone,
+    /// Backed up and not removed, as asked: the host looks again first.
+    BackedUp,
+    /// Its removal was begun, and the time was up before it was said how
+    /// it came out.
+    Started,
 }
 
 /// One folder a removal was asked about.
@@ -339,6 +344,10 @@ pub struct Backup {
     pub repo: String,
     #[serde(rename = "ref")]
     pub reference: String,
+    /// The branch it is a backup of, whose name the ref is made from.
+    pub branch: String,
+    /// The tree it holds: the repo's work as it was backed up.
+    pub tree: String,
 }
 
 /// The name a snapshot is recorded by, `<repo>-<branch>`: at most 200 of
@@ -560,6 +569,8 @@ pub struct Asked<'a> {
     pub discard: Option<&'a str>,
     /// Nothing was to be done, only said.
     pub dry_run: bool,
+    /// A removal was asked only to back up.
+    pub backup_only: bool,
 }
 
 impl<'a> Asked<'a> {
@@ -572,6 +583,7 @@ impl<'a> Asked<'a> {
             folders: &[],
             discard: None,
             dry_run: false,
+            backup_only: false,
         }
     }
 }
@@ -608,10 +620,14 @@ impl Snapshot {
 }
 
 impl Removal {
-    fn fits(&self, discard: Option<&str>) -> bool {
-        let ours = |reference: &str| {
+    fn fits(&self, discard: Option<&str>, backup_only: bool, cut_short: bool) -> bool {
+        // The ref a backup of this branch for this action goes to, and no
+        // other.
+        let ours = |backup: &Backup| {
             discard.is_some_and(|id| {
-                valid_wip_ref(reference) && reference.ends_with(&format!("-{id}"))
+                reportable_branch(&backup.branch)
+                    && valid_wip_ref(&backup.reference)
+                    && backup.reference == crate::worktrees::backup_ref(&backup.branch, id)
             })
         };
         valid_folder(&self.folder)
@@ -625,9 +641,17 @@ impl Removal {
             && self
                 .backed_up
                 .iter()
-                .all(|backup| valid_label(&backup.repo) && ours(&backup.reference))
+                .all(|backup| valid_label(&backup.repo) && commit_id(&backup.tree) && ours(backup))
             && (self.outcome != Outcome::Kept || self.why.is_some())
             && (self.outcome != Outcome::Removed || self.why.is_none())
+            // Asked only to back up, it removes nothing, and backing up is
+            // all it may say it did.
+            && match self.outcome {
+                // Or the time was up between the backups and the removal.
+                Outcome::BackedUp => (backup_only || cut_short) && self.why.is_none(),
+                Outcome::Removed | Outcome::Started => !backup_only,
+                _ => true,
+            }
     }
 }
 
@@ -775,7 +799,8 @@ impl Answer {
                 .all(|pushed| valid_label(&pushed.repo) && pushed.pushed <= MAX_COUNT)
             && folders.len() == self.removals.len()
             && self.removals.iter().all(|removal| {
-                asked.folders.contains(&removal.folder) && removal.fits(asked.discard)
+                asked.folders.contains(&removal.folder)
+                    && removal.fits(asked.discard, asked.backup_only, cut_short)
             });
         if !fits {
             return Err(Condition::BadReply);
@@ -836,6 +861,7 @@ mod tests {
         folders: &[],
         discard: None,
         dry_run: false,
+        backup_only: false,
     };
 
     fn checked(value: &Value, asked: &Asked) -> Result<Answer, Condition> {
@@ -979,6 +1005,7 @@ mod tests {
             folders: &[],
             discard: None,
             dry_run: false,
+            backup_only: false,
         };
         let mut one = good();
         one["folders"] = json!([good()["folders"][0].clone()]);

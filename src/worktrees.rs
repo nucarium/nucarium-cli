@@ -24,7 +24,7 @@ use crate::envelope::{rfc3339, unix_ms, valid_env_key};
 use crate::housekeeping;
 use crate::reporter;
 use crate::repos::answer::Word;
-use crate::repos::{self, could_not_know, transfer, Contained, Inside, Nucleus};
+use crate::repos::{self, could_not_know, transfer, Contained, Inside, Nucleus, Removing};
 use crate::sessions::Store;
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{GitHub, RepoInfo, Unsaved, Workspace};
@@ -902,7 +902,7 @@ fn new_gitlinks(git: &git::Git, worktree: &Path, tree: &str) -> anyhow::Result<b
 /// ref as a file, whose name may be at most 255 bytes, so a long branch name
 /// is cut, at a character's edge, leaving room for git's `.lock` beside it;
 /// the id keeps it the action's own.
-fn backup_ref(branch: &str, id: &str) -> String {
+pub(crate) fn backup_ref(branch: &str, id: &str) -> String {
     let wip = housekeeping::wip_ref(branch);
     let dashed = wip.strip_prefix("refs/wip/").unwrap_or(&wip);
     let room = 255 - ".lock".len() - id.len() - 1;
@@ -913,9 +913,19 @@ fn backup_ref(branch: &str, id: &str) -> String {
     format!("refs/wip/{}-{id}", &dashed[..cut])
 }
 
-/// The ref a backup went to, or why it could not be made.
+/// One backup pushed: of which repo, to which ref, of which branch, and
+/// the tree it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Backed {
+    pub name: String,
+    pub reference: String,
+    pub branch: String,
+    pub tree: String,
+}
+
+/// A backup pushed, or why it could not be made.
 enum Backup {
-    Pushed(String),
+    Pushed { reference: String, branch: String },
     Failed(Word),
 }
 
@@ -958,7 +968,7 @@ fn back_up(
         Some(PUSH_TIMEOUT),
     )?;
     Ok(match (pushed.ok, transfer::word(&pushed.stderr)) {
-        (true, _) => Backup::Pushed(reference),
+        (true, _) => Backup::Pushed { reference, branch },
         (false, Word::NoNetwork) => Backup::Failed(Word::NoNetwork),
         (false, _) => Backup::Failed(Word::NotPushed),
     })
@@ -981,8 +991,25 @@ pub(crate) enum Cleaned {
         repo: Option<String>,
         backed_up: Vec<(String, String)>,
     },
-    /// Its removal was not started: its time was up.
-    NotStarted,
+    /// Its removal was not started, after these backups: its time was up.
+    NotStarted { backed_up: Vec<(String, String)> },
+    /// Its removal was begun, after these backups, and its time was up
+    /// before it was said how it came out.
+    Unknown { backed_up: Vec<(String, String)> },
+    /// Backed up and not removed, as asked: [`Stage::BackupOnly`].
+    BackedUp { backed_up: Vec<Backed> },
+}
+
+/// How much of a Clean up with discard one call does.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Stage<'a> {
+    /// Back up, then remove.
+    All,
+    /// Back up, and stop there: the host looks again before the removal.
+    BackupOnly,
+    /// Remove what was backed up: each repo's work must still be one of
+    /// these trees, which the backups hold.
+    Backed(&'a std::collections::BTreeSet<String>),
 }
 
 /// Around the one step that removes a folder: `begin` says whether it may
@@ -1021,6 +1048,10 @@ pub(crate) struct Cleaning<'a> {
     pub plain: bool,
     pub usable: &'a dyn Fn(&str) -> bool,
     pub committing: &'a Committing<'a>,
+    pub stage: Stage<'a>,
+    /// Told the backups pushed so far, after each, and just before the
+    /// removal begins.
+    pub noted: &'a dyn Fn(&[Backed]),
 }
 
 pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) -> Cleaned {
@@ -1051,9 +1082,17 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
         }
     }
     if holding.is_empty() && other.is_empty() {
+        if matches!(how.stage, Stage::BackupOnly) {
+            return Cleaned::BackedUp {
+                backed_up: Vec::new(),
+            };
+        }
+        (how.noted)(&[]);
         // Removed only if, looked at again, it still holds nothing unsaved.
         return match how.committing.within(|| workspace.remove_session(path)) {
-            None => Cleaned::NotStarted,
+            None => Cleaned::NotStarted {
+                backed_up: Vec::new(),
+            },
             Some(Ok(_)) => Cleaned::Removed {
                 backed_up: Vec::new(),
             },
@@ -1092,8 +1131,8 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
         }
     }
     // Every backup is pushed before anything is removed, and one that fails
-    // removes nothing.
-    let mut backed_up = Vec::new();
+    // removes nothing. Work backed up by an earlier call must be as it was.
+    let mut full: Vec<Backed> = Vec::new();
     for (name, info, _) in &holding {
         let Some(at) = worktrees
             .iter()
@@ -1101,9 +1140,25 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
         else {
             return unreadable();
         };
+        if let Stage::Backed(trees) = how.stage {
+            if !trees.contains(&before[at].tree) {
+                return Cleaned::Failed {
+                    why: Word::Changed,
+                    repo: None,
+                    backed_up: Vec::new(),
+                };
+            }
+            continue;
+        }
         let why = match back_up(git, info, &before[at], id, how.usable) {
-            Ok(Backup::Pushed(reference)) => {
-                backed_up.push((name.clone(), reference));
+            Ok(Backup::Pushed { reference, branch }) => {
+                full.push(Backed {
+                    name: name.clone(),
+                    reference,
+                    branch,
+                    tree: before[at].tree.clone(),
+                });
+                (how.noted)(&full);
                 continue;
             }
             Ok(Backup::Failed(word)) => word,
@@ -1112,9 +1167,13 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
         return Cleaned::Failed {
             why,
             repo: Some(name.clone()),
-            backed_up,
+            backed_up: pairs(&full),
         };
     }
+    if matches!(how.stage, Stage::BackupOnly) {
+        return Cleaned::BackedUp { backed_up: full };
+    }
+    let backed_up = pairs(&full);
     // Looked at once more just before the removal. A session that came
     // back to it, a repo added or gone, or a commit or a change made since
     // the backup, and nothing is removed.
@@ -1136,11 +1195,12 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
             backed_up,
         };
     }
+    (how.noted)(&full);
     match how
         .committing
         .within(|| workspace.remove_session_as_listed(path, &as_listed, true))
     {
-        None => Cleaned::NotStarted,
+        None => Cleaned::NotStarted { backed_up },
         Some(Ok(_)) => Cleaned::Removed { backed_up },
         Some(Err(_)) => Cleaned::Failed {
             why: Word::NotRemoved,
@@ -1148,6 +1208,14 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
             backed_up,
         },
     }
+}
+
+/// The backups as a result names them: (repo, ref).
+pub(crate) fn pairs(backed: &[Backed]) -> Vec<(String, String)> {
+    backed
+        .iter()
+        .map(|one| (one.name.clone(), one.reference.clone()))
+        .collect()
 }
 
 /// What a Clean up came to, as one result. With `network`, a backup the
@@ -1162,6 +1230,10 @@ fn cleaned_ended(cleaned: &Cleaned, network: bool) -> Ended {
         fit(format!("Backed up to {}.", listed(&parts)), || {
             format!("Backed up {repos} repos to GitHub.")
         })
+    };
+    let prefix = |backed_up: &[(String, String)]| match backed_up.is_empty() {
+        true => String::new(),
+        false => format!("{} ", backed(backed_up)),
     };
     match cleaned {
         Cleaned::Removed { backed_up } if backed_up.is_empty() => {
@@ -1187,7 +1259,33 @@ fn cleaned_ended(cleaned: &Cleaned, network: bool) -> Ended {
                 }),
             )
         }
-        Cleaned::NotStarted => ended(Outcome::Failed, "It took too long, so nothing was removed."),
+        Cleaned::NotStarted { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!(
+                    "{}It took too long, so nothing was removed.",
+                    prefix(backed_up)
+                ),
+                || "It took too long, so nothing was removed.".to_string(),
+            ),
+        ),
+        Cleaned::Unknown { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!(
+                    "{}It took too long to say whether it was removed.",
+                    prefix(backed_up)
+                ),
+                || "It took too long to say whether it was removed.".to_string(),
+            ),
+        ),
+        Cleaned::BackedUp { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!("{}Nothing was removed.", prefix(&pairs(backed_up))),
+                || "Nothing was removed.".to_string(),
+            ),
+        ),
         Cleaned::Failed {
             why,
             repo,
@@ -1326,6 +1424,8 @@ fn run(
                 plain: false,
                 usable: &|_| true,
                 committing: &UNHURRIED,
+                stage: Stage::All,
+                noted: &|_| {},
             };
             cleaned_ended(&clean_up_core(&workspace, &path, &how), false)
         }
@@ -1401,25 +1501,137 @@ fn run_contained(
         Kind::CleanUp => {
             let store = Store::new(&settings.state_dir);
             let sharing = housekeeping::sharing_nucleus(settings, environment);
-            let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
-            if housekeeping::in_use_beneath(&sessions, &environment.root, &action.folder).is_some()
-            {
+            // Whether a session of this box works in it, by its own store
+            // and processes: asked first, and again just before the removal.
+            let in_use = || {
+                let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
+                housekeeping::in_use_beneath(&sessions, &environment.root, &action.folder).is_some()
+            };
+            if in_use() {
                 return ended(Outcome::Refused, "A session is still using it.");
             }
             let discard = action.discard.then_some(action.id.as_str());
             let folders = [(action.folder.clone(), stamp)];
-            let answer = match contained.remove(inside, settings, &folders, &merged, discard) {
+            let remove =
+                |stage| contained.remove(inside, settings, &folders, &merged, discard, stage);
+            let finish = |answer: repos::answer::Answer, backed: &[(String, String)]| {
+                let removal = answer.removals.first();
+                let mut cleaned = match removal {
+                    None => Cleaned::NotStarted {
+                        backed_up: Vec::new(),
+                    },
+                    Some(removal) => {
+                        let kept = removal.outcome == repos::answer::Outcome::Kept;
+                        if let Some(refused) = refused_for(removal.why).filter(|_| kept) {
+                            return with_backups(refused, backed);
+                        }
+                        cleaned_of(removal)
+                    }
+                };
+                // The backups an earlier call pushed are this one's too.
+                if !backed.is_empty() {
+                    cleaned = cleaned.after(backed);
+                }
+                cleaned_ended(&cleaned, true)
+            };
+            let Some(_) = discard else {
+                return match remove(Removing::All) {
+                    Ok(answer) => finish(answer, &[]),
+                    Err(condition) => not_known(condition),
+                };
+            };
+            // With discard: the backups first, then, the host having looked
+            // again, the removal of what they hold.
+            let backed = match remove(Removing::BackupOnly) {
                 Ok(answer) => answer,
                 Err(condition) => return not_known(condition),
             };
-            let Some(removal) = answer.removals.first() else {
-                return cleaned_ended(&Cleaned::NotStarted, true);
+            let Some(first) = backed.removals.first() else {
+                return cleaned_ended(
+                    &Cleaned::NotStarted {
+                        backed_up: Vec::new(),
+                    },
+                    true,
+                );
             };
-            let kept = removal.outcome == repos::answer::Outcome::Kept;
-            if let Some(refused) = refused_for(removal.why).filter(|_| kept) {
-                return refused;
+            let pushed: Vec<(String, String)> = first
+                .backed_up
+                .iter()
+                .map(|backup| (backup.repo.clone(), backup.reference.clone()))
+                .collect();
+            if first.outcome != repos::answer::Outcome::BackedUp || !backed.complete {
+                return match first.outcome {
+                    repos::answer::Outcome::BackedUp => {
+                        cleaned_ended(&Cleaned::NotStarted { backed_up: pushed }, true)
+                    }
+                    _ => finish(backed.clone(), &[]),
+                };
             }
-            cleaned_ended(&cleaned_of(removal), true)
+            if in_use() {
+                return with_backups(
+                    ended(Outcome::Refused, "A session is still using it."),
+                    &pushed,
+                );
+            }
+            let trees: Vec<String> = first
+                .backed_up
+                .iter()
+                .map(|backup| backup.tree.clone())
+                .collect();
+            match remove(Removing::Backed(trees)) {
+                Ok(answer) => finish(answer, &pushed),
+                Err(condition) => with_backups(not_known(condition), &pushed),
+            }
+        }
+    }
+}
+
+/// A result, with the backups pushed before it said first.
+fn with_backups(end: Ended, backed: &[(String, String)]) -> Ended {
+    if backed.is_empty() {
+        return end;
+    }
+    let parts: Vec<String> = backed
+        .iter()
+        .map(|(name, reference)| format!("{reference} in {name}"))
+        .collect();
+    let detail = end.detail.clone();
+    Ended {
+        outcome: end.outcome,
+        detail: fit(format!("Backed up to {}. {detail}", listed(&parts)), || {
+            detail
+        }),
+    }
+}
+
+impl Cleaned {
+    /// The same outcome, after these backups too.
+    fn after(self, backed: &[(String, String)]) -> Cleaned {
+        let join = |mut have: Vec<(String, String)>| {
+            let mut all = backed.to_vec();
+            all.append(&mut have);
+            all
+        };
+        match self {
+            Cleaned::Removed { backed_up } => Cleaned::Removed {
+                backed_up: join(backed_up),
+            },
+            Cleaned::Failed {
+                why,
+                repo,
+                backed_up,
+            } => Cleaned::Failed {
+                why,
+                repo,
+                backed_up: join(backed_up),
+            },
+            Cleaned::NotStarted { backed_up } => Cleaned::NotStarted {
+                backed_up: join(backed_up),
+            },
+            Cleaned::Unknown { backed_up } => Cleaned::Unknown {
+                backed_up: join(backed_up),
+            },
+            other => other,
         }
     }
 }
@@ -1434,6 +1646,19 @@ fn cleaned_of(removal: &repos::answer::Removal) -> Cleaned {
         .collect();
     match removal.outcome {
         Came::Removed | Came::Gone => Cleaned::Removed { backed_up },
+        Came::Started => Cleaned::Unknown { backed_up },
+        Came::BackedUp => Cleaned::BackedUp {
+            backed_up: removal
+                .backed_up
+                .iter()
+                .map(|backup| Backed {
+                    name: backup.repo.clone(),
+                    reference: backup.reference.clone(),
+                    branch: backup.branch.clone(),
+                    tree: backup.tree.clone(),
+                })
+                .collect(),
+        },
         Came::Kept if matches!(removal.why, Some(Word::Unsaved | Word::OtherFiles)) => {
             Cleaned::Holding {
                 holding: removal

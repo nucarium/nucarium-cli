@@ -102,6 +102,15 @@ enum Command {
         /// The Clean up whose backups those are.
         #[arg(long, value_name = "ID")]
         id: Option<String>,
+        /// Only back up, and remove nothing.
+        #[arg(long)]
+        backup_only: bool,
+        /// A tree an earlier call backed up.
+        #[arg(long, value_name = "TREE")]
+        backed: Vec<String>,
+        /// How long the time's being up waits for a removal under way.
+        #[arg(long, value_name = "MS")]
+        grace: Option<u64>,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -457,6 +466,9 @@ fn main() -> ExitCode {
         merged,
         discard,
         id,
+        backup_only,
+        backed,
+        grace,
     } = &cli.command
     {
         repos::inside::run(&repos::inside::Asked {
@@ -474,6 +486,9 @@ fn main() -> ExitCode {
             merged,
             discard: *discard,
             id: id.as_deref(),
+            backup_only: *backup_only,
+            backed,
+            grace_ms: *grace,
         });
         return ExitCode::SUCCESS;
     }

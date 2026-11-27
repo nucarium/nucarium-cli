@@ -27,7 +27,7 @@ use crate::housekeeping::Snapped;
 use crate::reporter::commit_id;
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{Manifest, RepoInfo, Workspace, SUBWORKTREES};
-use crate::worktrees::{clean_up_core, Cleaned, Cleaning, Committing};
+use crate::worktrees::{clean_up_core, Backed, Cleaned, Cleaning, Committing, Stage};
 use crate::worktrees::{last_change, reportable_branch, valid_folder};
 use crate::{bounded, git, housekeeping, paths};
 use std::collections::BTreeSet;
@@ -126,6 +126,15 @@ pub struct Asked<'a> {
     pub discard: bool,
     /// The Clean up whose backups those are.
     pub id: Option<&'a str>,
+    /// A removal with discard that only backs up: the host looks again
+    /// before the removal.
+    pub backup_only: bool,
+    /// The trees backed up by an earlier call: the removal goes ahead only
+    /// where each repo's work is still one of them.
+    pub backed: &'a [String],
+    /// How long, in milliseconds, the time's being up waits for a removal
+    /// under way.
+    pub grace_ms: Option<u64>,
 }
 
 /// Whether the time is up, and whether a removal is under way, which the
@@ -141,8 +150,10 @@ static CLOCK: Mutex<Clock> = Mutex::new(Clock {
     committing: false,
 });
 static TURN: Condvar = Condvar::new();
-/// The longest the time's being up waits for a removal under way.
-const COMMIT_GRACE: Duration = Duration::from_secs(8);
+/// The longest the time's being up waits for a removal under way, unless
+/// the host says: what it gives the call less what the call gives itself,
+/// less a margin.
+const COMMIT_GRACE: Duration = Duration::from_secs(5);
 
 fn clock() -> std::sync::MutexGuard<'static, Clock> {
     CLOCK
@@ -184,31 +195,46 @@ pub fn run(asked: &Asked) {
         return;
     };
     *answer_so_far() = Some(Answer::nothing(op, Condition::Ok));
+    let grace = asked
+        .grace_ms
+        .map(Duration::from_millis)
+        .unwrap_or(COMMIT_GRACE)
+        .min(MOST);
     std::thread::spawn(move || {
         std::thread::sleep(within);
         let mut held = clock();
         held.up = true;
         let waited = std::time::Instant::now();
-        while held.committing && waited.elapsed() < COMMIT_GRACE {
+        while held.committing && waited.elapsed() < grace {
             held = TURN
-                .wait_timeout(held, COMMIT_GRACE)
+                .wait_timeout(held, grace.saturating_sub(waited.elapsed()))
                 .map(|(held, _)| held)
                 .unwrap_or_else(|poisoned| poisoned.into_inner().0);
         }
         drop(held);
         // What it did is taken before anything is stopped, so that what
         // stopping does is not taken for something it did.
-        let partial = answer_so_far().take().map(|mut answer| {
-            answer.condition = Condition::Timeout;
-            answer.complete = false;
-            fit(answer)
-        });
+        let Some(mut partial) = answer_so_far().take() else {
+            // The whole answer is being printed: that is the answer.
+            loop {
+                std::thread::park();
+            }
+        };
+        partial.condition = Condition::Timeout;
+        partial.complete = false;
         bounded::stop_all();
-        say(&partial.unwrap_or_else(|| Answer::nothing(op, Condition::Timeout)));
+        say(&fit(partial));
         std::process::exit(0);
     });
     std::panic::set_hook(Box::new(|_| {}));
     let condition = std::panic::catch_unwind(|| one(asked, op)).unwrap_or(Condition::BadReply);
+    if time_is_up() {
+        // The time ran out while it worked: what it did is printed by the
+        // clock, as cut short.
+        loop {
+            std::thread::park();
+        }
+    }
     let Some(mut answer) = answer_so_far().take() else {
         // The time is up, and what there is is being printed.
         loop {
@@ -956,7 +982,8 @@ fn push(
 
 /// Remove each folder asked about, as cleanup and Watch's Clean up do,
 /// each only if it still stands as the host saw it, and none once the time
-/// is up. One begun is finished.
+/// is up. One begun is finished, and is in the answer as begun before it
+/// is.
 fn remove(
     settings: &Settings,
     environment: &Environment,
@@ -969,17 +996,36 @@ fn remove(
     let Some(scratch) = Scratch::new() else {
         return Condition::Error;
     };
+    let backed: BTreeSet<String> = asked
+        .backed
+        .iter()
+        .filter(|tree| commit_id(tree))
+        .cloned()
+        .collect();
+    let stage = match (asked.backup_only, asked.backed.is_empty()) {
+        (true, _) => Stage::BackupOnly,
+        (false, false) => Stage::Backed(&backed),
+        (false, true) => Stage::All,
+    };
     for (name, expect) in asked.folders.iter().zip(asked.expect) {
         if time_is_up() {
             return Condition::Ok;
         }
-        let removal = remove_one(&workspace, environment, name, expect, discard, &scratch.0);
+        let removal = remove_one(
+            &workspace,
+            environment,
+            name,
+            expect,
+            discard,
+            stage,
+            &scratch.0,
+        );
         let Some(removal) = removal else {
             // Its removal was not started: the time was up.
             release();
             return Condition::Ok;
         };
-        building(|answer| answer.removals.push(removal));
+        noting(removal);
         release();
     }
     if !time_is_up() {
@@ -989,12 +1035,40 @@ fn remove(
     Condition::Ok
 }
 
+/// Put a folder's removal in the answer, in place of what it said of that
+/// folder so far.
+fn noting(removal: Removal) {
+    building(|answer| {
+        match answer
+            .removals
+            .iter_mut()
+            .find(|have| have.folder == removal.folder)
+        {
+            Some(have) => *have = removal,
+            None => answer.removals.push(removal),
+        }
+    });
+}
+
+/// The backups as an answer names them.
+fn backups(full: &[Backed]) -> Vec<Backup> {
+    full.iter()
+        .map(|one| Backup {
+            repo: reported(&one.name),
+            reference: one.reference.clone(),
+            branch: one.branch.clone(),
+            tree: one.tree.clone(),
+        })
+        .collect()
+}
+
 fn remove_one(
     workspace: &Workspace,
     environment: &Environment,
     name: &str,
     expect: &str,
     discard: Option<&str>,
+    stage: Stage,
     keys: &Path,
 ) -> Option<Removal> {
     let came = |outcome, why| Removal {
@@ -1037,8 +1111,30 @@ fn remove_one(
     if in_use() {
         return Some(came(Outcome::Kept, Some(Word::InUse)));
     }
+    // What has been backed up so far is in the answer as soon as it is,
+    // and the removal as begun before it begins.
+    let full: std::cell::RefCell<Vec<Backed>> = std::cell::RefCell::new(Vec::new());
+    let noted = |pushed: &[Backed]| {
+        *full.borrow_mut() = pushed.to_vec();
+        if !pushed.is_empty() {
+            noting(Removal {
+                backed_up: backups(pushed),
+                ..came(Outcome::BackedUp, None)
+            });
+        }
+    };
+    let start = || {
+        if time_is_up() {
+            return false;
+        }
+        noting(Removal {
+            backed_up: backups(&full.borrow()),
+            ..came(Outcome::Started, None)
+        });
+        begin()
+    };
     let committing = Committing {
-        begin: &begin,
+        begin: &start,
         end: &|| {},
     };
     let how = Cleaning {
@@ -1048,19 +1144,41 @@ fn remove_one(
         plain: true,
         usable: &valid_wip_ref,
         committing: &committing,
+        stage,
+        noted: &noted,
     };
-    let pairs = |list: Vec<(String, String)>| -> Vec<Backup> {
-        list.into_iter()
-            .map(|(repo, reference)| Backup {
-                repo: reported(&repo),
-                reference,
-            })
+    let cleaned = clean_up_core(workspace, &path, &how);
+    // The backups a result names, as an answer names them.
+    let named = |pairs: Vec<(String, String)>| -> Vec<Backup> {
+        let full = full.borrow();
+        pairs
+            .iter()
+            .filter_map(|(_, reference)| full.iter().find(|one| &one.reference == reference))
+            .cloned()
+            .map(|one| backups(&[one]).remove(0))
             .collect()
     };
-    Some(match clean_up_core(workspace, &path, &how) {
-        Cleaned::NotStarted => return None,
+    Some(match cleaned {
+        Cleaned::NotStarted { backed_up } => {
+            if backed_up.is_empty() {
+                return None;
+            }
+            // Backed up, and the time was up before the removal began.
+            Removal {
+                backed_up: named(backed_up),
+                ..came(Outcome::BackedUp, None)
+            }
+        }
+        Cleaned::Unknown { backed_up } => Removal {
+            backed_up: named(backed_up),
+            ..came(Outcome::Started, None)
+        },
+        Cleaned::BackedUp { backed_up } => Removal {
+            backed_up: backups(&backed_up),
+            ..came(Outcome::BackedUp, None)
+        },
         Cleaned::Removed { backed_up } => Removal {
-            backed_up: pairs(backed_up),
+            backed_up: named(backed_up),
             ..came(Outcome::Removed, None)
         },
         Cleaned::Holding {
@@ -1091,7 +1209,7 @@ fn remove_one(
             backed_up,
         } => Removal {
             repo: repo.map(|repo| reported(&repo)),
-            backed_up: pairs(backed_up),
+            backed_up: named(backed_up),
             ..came(Outcome::Failed, Some(why))
         },
     })

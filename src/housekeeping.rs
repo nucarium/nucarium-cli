@@ -313,10 +313,29 @@ fn run_contained(
             }
             // The last word is the container's: each folder only if it
             // still stands as it was looked at, all of it or none of it.
+            // Looked at again just before: a session that came back to one
+            // meanwhile keeps it.
+            going.retain(|(folder, _)| {
+                let sessions = agent_sessions(&store, &sharing, folder);
+                match in_use_beneath(&sessions, &environment.root, folder) {
+                    None => true,
+                    Some(why) => {
+                        report.push(json!({ "session": folder, "action": "kept", "reason": why }));
+                        false
+                    }
+                }
+            });
             if !going.is_empty() {
                 let merged = contained.merged_among(facts);
                 let answer = contained
-                    .remove(inside, settings, &going, &merged, None)
+                    .remove(
+                        inside,
+                        settings,
+                        &going,
+                        &merged,
+                        None,
+                        repos::Removing::All,
+                    )
                     .map_err(not_known)?;
                 for (folder, _) in &going {
                     let removal = answer.removals.iter().find(|r| &r.folder == folder);
@@ -474,6 +493,11 @@ fn removal_entry(folder: &str, removal: Option<&repos::answer::Removal>) -> Valu
         Outcome::Gone => entry("kept", Some("it is gone")),
         Outcome::Kept => entry("kept", Some(why)),
         Outcome::Failed => entry("failed", Some(why)),
+        Outcome::BackedUp => entry("failed", Some("it took too long, so it was not removed")),
+        Outcome::Started => entry(
+            "failed",
+            Some("it took too long to say whether it was removed"),
+        ),
     }
 }
 

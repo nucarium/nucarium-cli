@@ -313,6 +313,7 @@ impl Contained {
         folders: &[(String, String)],
         merged: &[String],
         discard: Option<&str>,
+        stage: Removing,
     ) -> Result<Answer, Condition> {
         let mut more = Vec::new();
         for (folder, stamp) in folders {
@@ -324,11 +325,26 @@ impl Contained {
         if let Some(id) = discard {
             more.extend(["--discard".to_string(), format!("--id={id}")]);
         }
+        match &stage {
+            Removing::All => {}
+            Removing::BackupOnly => more.push("--backup-only".to_string()),
+            Removing::Backed(trees) => {
+                more.extend(trees.iter().map(|tree| format!("--backed={tree}")));
+            }
+        }
+        // A removal under way when its time is up is finished, within what
+        // the host gives it less what it gives itself, less a margin.
+        let (outer, inner) = inside.limits(Op::Remove);
+        let grace = outer
+            .saturating_sub(inner)
+            .saturating_sub(Duration::from_secs(5));
+        more.push(format!("--grace={}", grace.as_millis()));
         let names: Vec<String> = folders.iter().map(|(folder, _)| folder.clone()).collect();
         let asked = Asked {
             op: Op::Remove,
             folders: &names,
             discard,
+            backup_only: matches!(stage, Removing::BackupOnly),
             ..Asked::census()
         };
         self.ask(inside, settings, more, &asked)
@@ -353,6 +369,16 @@ impl Contained {
         merged.dedup();
         merged
     }
+}
+
+/// How much of a removal one call does: all of it; for a Clean up with
+/// discard, only the backups, so that the host can look again before the
+/// removal; or the removal of what those backups hold, these trees.
+#[derive(Debug, Clone)]
+pub enum Removing {
+    All,
+    BackupOnly,
+    Backed(Vec<String>),
 }
 
 /// How the host runs `nucleated repos`: the box's own program and `podman`,
