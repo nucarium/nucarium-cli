@@ -373,6 +373,15 @@ pub struct Guarded {
     stopped_with_caller: bool,
 }
 
+/// Settings given to a call stopped with its caller: nothing it starts by
+/// itself goes on after it.
+const IN_THE_CALL: [&str; 4] = [
+    "-c",
+    "gc.autoDetach=false",
+    "-c",
+    "maintenance.autoDetach=false",
+];
+
 /// The longest one call stopped with its caller may run, and the most it
 /// may print. Its caller's own time is shorter.
 const STOPPED_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -710,6 +719,12 @@ impl Guarded {
     ) -> Result<Command> {
         let mut command = self.command();
         command.args(OVERRIDES);
+        if self.stopped_with_caller {
+            // A gc or maintenance git starts on its own after a fetch runs
+            // detached, outside what is stopped with the caller: here it
+            // runs in the call, and is stopped with it.
+            command.args(IN_THE_CALL);
+        }
         if let Some(github) = &self.github {
             command.args(github.args());
         }
@@ -1211,6 +1226,23 @@ mod tests {
         ] {
             assert!(!allowed(key, value), "{key} = {value:?}");
         }
+    }
+
+    #[test]
+    fn a_call_stopped_with_its_caller_leaves_no_gc_running_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("web.git");
+        Git::Plain.init_bare(&repo).unwrap();
+        let said = |guarded: Guarded| -> String {
+            let git = Git::Guarded(guarded.quiet());
+            let out = git
+                .bare(&repo, &["config", "--get", "gc.autoDetach"])
+                .unwrap_or_default();
+            out
+        };
+        let here = Guarded::new(None, Vetting::Enforce);
+        assert_eq!(said(here.clone()), "");
+        assert_eq!(said(here.stopped_with_caller()), "false");
     }
 
     #[test]
