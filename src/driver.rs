@@ -75,10 +75,10 @@ pub const INNER_LIMIT: Duration = Duration::from_millis(4500);
 pub const ASK_LIMIT: Duration = Duration::from_secs(4);
 /// How long the host gives the container engine to say which process is a
 /// container's first, to end a look it gave up on.
-const END_LIMIT: Duration = Duration::from_secs(2);
+pub const END_LIMIT: Duration = Duration::from_secs(2);
 /// How long `podman exec` is then given to return by itself, as it does once
 /// the look has ended, before it is stopped.
-const END_GRACE: Duration = Duration::from_secs(3);
+pub const END_GRACE: Duration = Duration::from_secs(3);
 /// A session a complete look does not list is ended once this many looks in
 /// a row have not listed it. One look can catch a driver between two states.
 pub const MISSING_LOOKS: u8 = 2;

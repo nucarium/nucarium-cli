@@ -11,7 +11,7 @@ mod common;
 
 use common::gate::{self, mark, MARK};
 use common::{contract, run, stderr, Rig, CLIENT_A_CONTAINER_UNIT};
-use nucleate::driver::{Condition, Memory, LOOK_LIMIT};
+use nucleate::driver::{Condition, Memory, END_GRACE, END_LIMIT, LOOK_LIMIT};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,15 +107,23 @@ fn answer(sessions: Value) -> Value {
     })
 }
 
+/// A process's state, as one letter, where the box keeps it in `/proc`.
+fn state(pid: &str) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
 /// Whether a process is still running. A process that was killed and is
 /// waiting for its parent to collect it (a zombie) runs nothing, so it does
 /// not count: on Linux its state in `/proc` says so.
 fn alive(pid: &str) -> bool {
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-        let state = stat
-            .rsplit_once(')')
-            .and_then(|(_, rest)| rest.split_whitespace().next());
-        return !matches!(state, Some("Z" | "X"));
+    if let Some(state) = state(pid) {
+        return !matches!(state, 'Z' | 'X');
     }
     std::process::Command::new("sh")
         .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
@@ -124,14 +132,36 @@ fn alive(pid: &str) -> bool {
         .success()
 }
 
-/// Wait a little for a process that was just killed to be gone.
-fn gone(pid: &str) -> bool {
+/// How long a process that was just killed may take to be gone.
+const KILLED: Duration = Duration::from_secs(3);
+
+/// How long the host may take, once it has given up on a look, to end what
+/// is left of it: ask the engine which process is the container's first,
+/// end the look from the box, give `podman exec` its grace to return by
+/// itself, then stop it.
+const ENDING: Duration = END_LIMIT.saturating_add(END_GRACE).saturating_add(KILLED);
+
+/// Wait, at most `within`, for a process that is being ended to be gone.
+fn gone(pid: &str, within: Duration) -> bool {
     let started = Instant::now();
     while alive(pid) {
-        if started.elapsed() > Duration::from_secs(3) {
+        if started.elapsed() > within {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Wait, at most [`KILLED`], until `ready` holds.
+#[cfg(target_os = "linux")]
+fn soon(ready: impl Fn() -> bool) -> bool {
+    let started = Instant::now();
+    while !ready() {
+        if started.elapsed() > KILLED {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
     true
 }
@@ -283,11 +313,14 @@ fn whatever_a_container_prints_in_place_of_an_answer_costs_one_short_look_and_sa
         .filter(|call| call.starts_with("exec "))
         .count();
     assert_eq!(execs, 2 + looks, "{calls:?}");
-    // Nothing a hung look started is still running.
+    // Nothing a hung look started is still running once the host has ended
+    // it. In these the container ran its own program in place of the look,
+    // so there is no look to end from the box: the `podman exec` itself
+    // hangs, and it is stopped when its grace is up.
     let pids = pids_in(&pid_file);
     assert_eq!(pids.len(), 2, "{pids:?}");
     for pid in pids {
-        assert!(gone(&pid), "{pid} is still running");
+        assert!(gone(&pid, ENDING), "{pid} is still running");
     }
 
     // And once the container answers properly again, so does the look.
@@ -315,7 +348,7 @@ fn a_driver_that_hangs_inside_the_container_is_ended_there_with_everything_it_st
     let started = pids_in(&pids);
     assert_eq!(started.len(), 2);
     for pid in &started {
-        assert!(gone(pid), "{pid} is still running");
+        assert!(gone(pid, ENDING), "{pid} is still running");
     }
 
     // The look keeps its own time, whatever its driver does: when the time
@@ -340,7 +373,7 @@ fn a_driver_that_hangs_inside_the_container_is_ended_there_with_everything_it_st
     let started = pids_in(&pids);
     assert_eq!(started.len(), 2);
     for pid in &started {
-        assert!(gone(pid), "{pid} is still running");
+        assert!(gone(pid, KILLED), "{pid} is still running");
     }
 }
 
@@ -374,8 +407,15 @@ fn a_look_the_container_holds_still_is_ended_from_the_box_with_everything_it_sta
             looks = looks.display(),
         ),
     );
-    // Another look on the box, held still as well, that is none of this
-    // one's business.
+    // Another look on the box, at another environment, that is none of this
+    // one's business: held still in the middle of asking its driver, which
+    // hangs.
+    let other_driver = home.join("other-driver.pid");
+    stand_in(
+        &boxed.cli_b,
+        &format!("echo $$ > '{}'\nexec sleep 60", other_driver.display()),
+    );
+    rig.looker();
     let mut other = rig.nucleated();
     other
         .env(
@@ -386,11 +426,21 @@ fn a_look_the_container_holds_still_is_ended_from_the_box_with_everything_it_sta
         .stdout(std::process::Stdio::null());
     let mut other = other.spawn().unwrap();
     let other_pid = other.id().to_string();
+    assert!(
+        soon(|| pids_in(&other_driver).len() == 1),
+        "the other look did not start its driver"
+    );
+    let other_driver = pids_in(&other_driver).remove(0);
     assert!(std::process::Command::new("kill")
         .args(["-STOP", &other_pid])
         .status()
         .unwrap()
         .success());
+    assert!(
+        soon(|| state(&other_pid) == Some('T')),
+        "the other look was not held still: {:?}",
+        state(&other_pid)
+    );
 
     let (memory, took) = boxed.timed_look();
     assert_eq!(memory.condition, Condition::Timeout);
@@ -399,11 +449,17 @@ fn a_look_the_container_holds_still_is_ended_from_the_box_with_everything_it_sta
     let driver = pids_in(&drivers);
     assert_eq!((look.len(), driver.len()), (1, 2), "{look:?} {driver:?}");
     for pid in pids_in(&client).iter().chain(&look).chain(&driver) {
-        assert!(gone(pid), "{pid} is still running");
+        assert!(gone(pid, ENDING), "{pid} is still running");
     }
-    assert!(alive(&other_pid), "another look was ended");
+    // The other look is still stopped, as this test left it, and its driver
+    // still runs: ending this look touched neither.
+    assert_eq!(state(&other_pid), Some('T'), "another look was ended");
+    assert!(alive(&other_driver), "another look's driver was ended");
     let _ = other.kill();
     let _ = other.wait();
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &other_driver])
+        .status();
     // Nothing more was run in the container to end it.
     let calls = rig.podman_calls();
     let execs = calls
