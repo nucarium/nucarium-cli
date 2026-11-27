@@ -113,7 +113,8 @@ A repo is left where it is, and the reason said, when the vetting refuses it
 is taken, or when it has a worktree registered anywhere but the nucleus's
 `.worktrees/`, which could not be pointed at the new place. Nothing is ever
 written outside `.worktrees/`, whatever a repo's records say. Such a repo is still listed and used as before. A nucleus a
-container writes is not moved at all by `nucleated`. A run that stopped
+container writes is moved inside that container, by the same code, when the
+daemon starts and at each refresh. A run that stopped
 part way is finished by the next one, and a manifest that still names the old
 place is read as naming the new one.
 
@@ -1493,16 +1494,29 @@ them could lead it out of the environment. It runs the box's own `nucleated
 repos` inside the container with one `podman exec`, as it takes a driver's
 look, with the same check and overrides there, and takes back one small
 answer held to fixed shapes and caps: repo and folder names, branches, commit
-ids, counts and fixed words, and never a path, a file's name or contents, or a
-commit's subject. GitHub is still asked from the host, with the host's own
-token, about the commits the answer names. The count of unsaved work, the
-session folders a heartbeat reports, what a stopped session left behind, and
-what `cleanup` would remove all come from that answer. A container that is
-not running, or an answer that does not fit, leaves the count and the folders
-unknown and tells no outcome, and `cleanup` fails with a fixed sentence and
-removes nothing. `refresh`, `snapshot`, `cleanup`'s removal, and Watch's Push
-and Clean up are not done yet for such an environment: each says so and does
-nothing, and none is done on the host in its place.
+ids, refs under `refs/wip/`, counts and fixed words, and never a path, a
+file's name or contents, a commit's subject, or anything git said. GitHub is
+still asked from the host, with the host's own token, about the commits the
+answer names, and its verdicts are handed in.
+
+The count of unsaved work, the session folders a heartbeat reports, what a
+stopped session left behind, and what `cleanup` would remove all come from
+such an answer. The host decides; the container does: `refresh` moves the
+repos to their owner folders and fetches them, `snapshot` pushes what is not
+committed (copying a worktree's index only when it is a plain file, into a
+folder of its own, and skipping a tree the host has recorded as pushed, whose
+record the host keeps), Watch's Push pushes a folder's branches, and
+`cleanup`'s removal and Watch's Clean up remove a folder only if it still
+stands as the host saw it and no process in the container works in it, a
+discard's backups going first to `refs/wip/<branch>-<action id>`. A
+container that is not running, or an answer that does not fit, leaves the
+count and the folders unknown, tells no outcome, fails the job or the action
+with a fixed sentence, and removes nothing. A job or an action that runs out
+of time is taken for what its answer says it did, and nothing more.
+
+Where the environment's network does not reach GitHub, its proxy refuses
+the fetch, the snapshot, the Push and the backup, and each says "The
+environment's network does not reach GitHub, so nothing was sent."
 
 ## Assumptions
 
