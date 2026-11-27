@@ -61,6 +61,13 @@ pub fn slug(url: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// A remote address for the GitHub repo `slug`, `owner/name`, that
+/// [`slug`] reads back; an empty one, which is no GitHub repo's, for none.
+pub fn remote_of(slug: Option<&str>) -> String {
+    slug.map(|slug| format!("{}/{slug}.git", crate::git::GITHUB_ORIGIN))
+        .unwrap_or_default()
+}
+
 fn token(token_file: Option<&Path>) -> Option<String> {
     for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(value) = env::var(var) {

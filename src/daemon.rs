@@ -18,6 +18,7 @@ use crate::health;
 use crate::notifier::{Notifier, Waiting};
 use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
+use crate::repos::{self, Nucleus};
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
 use crate::spool::{self, Record, Spool, Unread};
@@ -1253,17 +1254,34 @@ impl Daemon {
 
 /// Move each nucleus made before owner folders to them, before anything
 /// else reads its repos. One that cannot be moved now is tried again by the
-/// next refresh. A nucleus a container writes is left as it is: the move
-/// has git repair its repos' worktrees, which a session can point anywhere.
+/// next refresh. A nucleus a container writes is moved inside the container
+/// (see [`crate::repos`]), on a thread of its own, so that a container that
+/// does not answer holds up nothing.
 fn move_to_owner_folders(settings: &Settings) {
+    let mut contained = Vec::new();
     for environment in &settings.environments {
-        if environment.driver_owns_worktrees()
-            || housekeeping::contained(settings, environment)
-            || !environment.root.join(".repos").is_dir()
-        {
+        if environment.driver_owns_worktrees() {
             continue;
         }
-        let workspace = housekeeping::workspace(settings, environment);
+        let repos = environment.root.join(".repos");
+        let workspace = match housekeeping::workspace(settings, environment) {
+            Nucleus::Host(_) if !repos.is_dir() => continue,
+            Nucleus::Host(workspace) => *workspace,
+            // A container writes it: a link in the place of its `.repos` is
+            // not followed, and is no nucleus.
+            Nucleus::Contained(_) if !fs::symlink_metadata(&repos).is_ok_and(|m| m.is_dir()) => {
+                continue
+            }
+            Nucleus::Contained(_) => {
+                let first = housekeeping::one_per_nucleus(settings)
+                    .iter()
+                    .any(|chosen| chosen.name == environment.name);
+                if first {
+                    contained.push(environment.name.clone());
+                }
+                continue;
+            }
+        };
         match workspace.move_to_owner_folders() {
             Ok(moved) => {
                 for line in moved.lines() {
@@ -1273,6 +1291,38 @@ fn move_to_owner_folders(settings: &Settings) {
             Err(error) => log(&format!("{}: moving repos: {error:#}", environment.name)),
         }
     }
+    if contained.is_empty() {
+        return;
+    }
+    let settings = settings.clone();
+    std::thread::spawn(move || {
+        let Some(inside) = repos::Inside::of_this_box() else {
+            return;
+        };
+        for name in contained {
+            let Some(environment) = settings.environment(&name) else {
+                continue;
+            };
+            let Nucleus::Contained(nucleus) = housekeeping::workspace(&settings, environment)
+            else {
+                continue;
+            };
+            match nucleus.refresh(&inside, &settings, false, true) {
+                Ok(answer) if answer.why.is_some() => {
+                    log(&format!("{name}: moving repos to owner folders failed"))
+                }
+                Ok(answer) if answer.moved > 0 => log(&format!(
+                    "{name}: moved {} repos to their owner folders",
+                    answer.moved
+                )),
+                Ok(_) => {}
+                Err(condition) => log(&format!(
+                    "{name}: moving repos: {}",
+                    repos::could_not_know(condition)
+                )),
+            }
+        }
+    });
 }
 
 /// `nucleated run`. Returns when `stop` is set.

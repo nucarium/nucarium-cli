@@ -750,7 +750,13 @@ pub fn check(settings: &Settings) -> (Value, bool) {
                 },
             );
         } else {
-            let nucleus = environment.root.join(".repos").is_dir();
+            // A container writes a nucleus it shares: a link in the place
+            // of its `.repos` is not followed, and is no nucleus.
+            let repos = environment.root.join(".repos");
+            let nucleus = match housekeeping::container_of(settings, environment) {
+                Some(_) => std::fs::symlink_metadata(&repos).is_ok_and(|meta| meta.is_dir()),
+                None => repos.is_dir(),
+            };
             add(
                 format!("{}: nucleus", environment.name),
                 nucleus,

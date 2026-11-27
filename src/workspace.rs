@@ -77,6 +77,9 @@ pub struct Workspace {
     /// Where GitHub's answers to "was this commit merged?" are remembered,
     /// for a caller that asks on a schedule.
     merges: Option<PathBuf>,
+    /// The commits GitHub said were merged, as someone else asked it: when
+    /// set, GitHub is not asked here, and a commit not among them was not.
+    known_merged: Option<std::collections::BTreeSet<String>>,
     /// Folders that belong to something else, a driver that makes and
     /// removes its own worktrees. Nothing under one is removed, pruned,
     /// snapshotted or counted here. See [`Workspace::left_alone_because`]
@@ -121,6 +124,61 @@ impl Unsaved {
         }
         reasons
     }
+}
+
+impl Unsaved {
+    /// What a worktree holds that exists nowhere else, by the one rule, from
+    /// what git said of it and, only when that leaves it open, whether
+    /// GitHub says its `HEAD` was merged: commits ahead of its own upstream
+    /// when it tracks one; else none when `HEAD` is on a remote branch or in
+    /// a merged pull request; else those on no remote, one at least.
+    pub fn verdict(facts: &Facts, merged: impl FnOnce() -> bool) -> Unsaved {
+        if facts.tracked {
+            return Unsaved {
+                uncommitted: facts.uncommitted,
+                unpushed: facts.ahead,
+                tracked: true,
+            };
+        }
+        let unpushed = match facts.on_remote || merged() {
+            true => 0,
+            false => facts.alone.max(1),
+        };
+        Unsaved {
+            uncommitted: facts.uncommitted,
+            unpushed,
+            tracked: false,
+        }
+    }
+}
+
+/// What git says of one worktree: everything [`Unsaved::verdict`] and the
+/// questions about its pull requests need, and nothing GitHub says. For a
+/// container's worktree it is found inside the container, and only these
+/// facts cross to the host, which asks GitHub itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// Changes that are not committed, untracked files included.
+    pub uncommitted: bool,
+    /// Its branch tracks a branch of its own on a remote, one that still
+    /// exists and is not the remote's default branch.
+    pub tracked: bool,
+    /// The commits ahead of that branch; none when it tracks none.
+    pub ahead: u32,
+    /// `HEAD` is on a remote branch.
+    pub on_remote: bool,
+    /// The commits on no remote branch, counted only when it tracks none
+    /// and `HEAD` is on no remote branch; else none.
+    pub alone: u32,
+    /// The commit `HEAD` names.
+    pub head: String,
+    /// `HEAD` is on the remote's default branch.
+    pub on_default: bool,
+    /// `owner/name` for a repo on GitHub.
+    pub slug: Option<String>,
+    /// A number made from what `git status` said, so that a change to what
+    /// is not committed changes it. What git said is not kept.
+    pub changes: u64,
 }
 
 /// One answer from GitHub about one commit, and when it was given: whether
@@ -191,6 +249,13 @@ fn valid_name(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// `owner/name` as a GitHub repo may be called.
+pub(crate) fn valid_slug(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(owner, name)| layout::valid_owner(owner) && valid_name(name))
+}
+
 fn valid_branch(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
@@ -223,6 +288,100 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// GitHub, as the host asks it about the commits of its repos: with its
+/// own token, and, when it is told where, with what GitHub said before
+/// remembered. It reads nothing of a repository.
+#[derive(Debug, Clone)]
+pub struct GitHub {
+    api: String,
+    token_file: Option<PathBuf>,
+    merges: Option<PathBuf>,
+}
+
+impl GitHub {
+    pub fn new(api: String, token_file: Option<PathBuf>) -> GitHub {
+        GitHub {
+            api,
+            token_file,
+            merges: None,
+        }
+    }
+
+    /// Remember GitHub's answers in `file`, as [`Workspace::remembering_merges`].
+    pub fn remembering_merges(mut self, file: PathBuf) -> GitHub {
+        self.merges = Some(file);
+        self
+    }
+
+    /// Ask a stand-in on this machine in place of GitHub. Any other address
+    /// is ignored.
+    pub fn asking_at(mut self, url: &str) -> GitHub {
+        if let Some(url) = github::stand_in(url) {
+            self.api = url;
+        }
+        self
+    }
+
+    pub fn api(&self) -> &str {
+        &self.api
+    }
+
+    pub fn token_file(&self) -> Option<&Path> {
+        self.token_file.as_deref()
+    }
+
+    /// Whether GitHub says the commit `sha` of the repo `slug` names is one
+    /// of a merged pull request's. No for a repo that is not on GitHub.
+    pub fn merged_on_github(&self, slug: Option<&str>, sha: &str) -> bool {
+        self.asked(&github::remote_of(slug), sha).merged
+    }
+
+    /// As [`Workspace::pull_requests`], from the facts git gave of it.
+    pub fn pull_requests_from(&self, facts: &Facts) -> PullRequests {
+        if facts.on_default || facts.slug.is_none() || (!facts.on_remote && facts.tracked) {
+            return PullRequests::default();
+        }
+        let asked = self.asked(&github::remote_of(facts.slug.as_deref()), &facts.head);
+        PullRequests {
+            merged: asked.merged_pull.filter(|_| asked.merged),
+            open: asked.open_pull,
+        }
+    }
+
+    /// What GitHub said about a commit of the repo at `remote`: remembered
+    /// when told where, asked again after an hour unless it was merged, and
+    /// asked afresh each time otherwise.
+    fn asked(&self, remote: &str, sha: &str) -> Asked {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let ask = || {
+            let found = github::lookup(&self.api, remote, sha, self.token_file.as_deref())
+                .unwrap_or_default();
+            Asked {
+                merged: found.merged,
+                at_s: now_s,
+                merged_pull: found.merged_pull,
+                open_pull: found.open_pull,
+            }
+        };
+        let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(remote)) else {
+            return ask();
+        };
+        let key = format!("{owner}/{repo}@{sha}");
+        match read_merges(file).get(&key) {
+            Some(answer) if answer.merged => return answer.clone(),
+            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => {
+                return answer.clone()
+            }
+            _ => {}
+        }
+        let answer = ask();
+        remember_merge(file, key, answer.clone());
+        answer
+    }
+}
+
 impl Workspace {
     /// A workspace that runs git as `nucleate` does: guarded, with every
     /// repository's git data held to the nucleus's `.repos`, and a repository
@@ -239,6 +398,7 @@ impl Workspace {
             sessions_dir: root.join(".worktrees"),
             seeds_dir: root.join(".seeds"),
             merges: None,
+            known_merged: None,
             protected: Vec::new(),
             git,
         }
@@ -330,6 +490,13 @@ impl Workspace {
     /// Remember GitHub's answers in `file`, so that counting unsaved work on
     /// a schedule asks about each commit once an hour at most, and never
     /// again once it was merged.
+    /// Take these commits for the ones GitHub says were merged, and ask
+    /// GitHub nothing: inside a container, where the host has asked it.
+    pub fn knowing_merged(mut self, merged: &[String]) -> Self {
+        self.known_merged = Some(merged.iter().cloned().collect());
+        self
+    }
+
     pub fn remembering_merges(mut self, file: PathBuf) -> Self {
         self.merges = Some(file);
         self
@@ -981,6 +1148,69 @@ impl Workspace {
         })
     }
 
+    /// What git says of a worktree, for [`Unsaved::verdict`] and for the
+    /// questions about its pull requests: asked inside a container for its
+    /// worktrees, whose host asks GitHub itself. GitHub is not asked here.
+    pub fn facts(&self, child: &Path) -> Result<Facts> {
+        // Without the optional lock, as `unsaved` asks.
+        let status = self
+            .git
+            .tree(child, &["--no-optional-locks", "status", "--porcelain"])?;
+        let common = self.git.tree(
+            child,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?;
+        let common = Path::new(&common);
+        let tracked = self.has_own_upstream(child, common)?;
+        let ahead = match tracked {
+            true => count(
+                &self
+                    .git
+                    .tree(child, &["rev-list", "--count", "@{upstream}..HEAD"])?,
+            )?,
+            false => 0,
+        };
+        let on_remote = !self
+            .git
+            .tree(child, &["branch", "-r", "--contains", "HEAD"])?
+            .is_empty();
+        let head = self.git.tree(child, &["rev-parse", "HEAD"])?;
+        let alone = match tracked || on_remote {
+            true => 0,
+            false => count(&self.git.tree(
+                child,
+                &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+            )?)?,
+        };
+        let default = format!("refs/remotes/origin/{}", self.default_branch(common));
+        let on_default = self
+            .git
+            .try_tree(child, &["merge-base", "--is-ancestor", &head, &default])?
+            .ok;
+        let slug = github::slug(&self.remote_url(common))
+            .filter(|(owner, name)| layout::valid_owner(owner) && valid_name(name))
+            .map(|(owner, name)| format!("{owner}/{name}"));
+        Ok(Facts {
+            uncommitted: !status.is_empty(),
+            tracked,
+            ahead,
+            on_remote,
+            alone,
+            head,
+            on_default,
+            slug,
+            changes: crate::driver::fnv(status.as_bytes()),
+        })
+    }
+
+    /// Whether GitHub says the commit `sha` of the repo `slug` names is one
+    /// of a merged pull request's, remembered as [`Workspace::unsaved`]
+    /// remembers it. No for a repo that is not on GitHub. For a container's
+    /// worktree, from the facts found inside it.
+    pub fn merged_on_github(&self, slug: Option<&str>, sha: &str) -> bool {
+        self.asked_remote(&github::remote_of(slug), sha).merged
+    }
+
     /// True when a worktree's branch tracks a branch of its own on a remote,
     /// one that still exists: the commits ahead of it are then the ones not
     /// pushed. The remote's default branch is not such a branch. A session's
@@ -1047,39 +1277,27 @@ impl Workspace {
     /// told where, asked again after an hour unless it was merged, and asked
     /// afresh each time otherwise.
     fn asked(&self, bare: &Path, sha: &str) -> Asked {
-        let remote = self.remote_url(bare);
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        let ask = || {
-            let found = github::lookup(
-                &self.config.github_api,
-                &remote,
-                sha,
-                self.config.github_token_file.as_deref(),
-            )
-            .unwrap_or_default();
-            Asked {
-                merged: found.merged,
-                at_s: now_s,
-                merged_pull: found.merged_pull,
-                open_pull: found.open_pull,
-            }
-        };
-        let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(&remote)) else {
-            return ask();
-        };
-        let key = format!("{owner}/{repo}@{sha}");
-        match read_merges(file).get(&key) {
-            Some(answer) if answer.merged => return answer.clone(),
-            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => {
-                return answer.clone()
-            }
-            _ => {}
+        self.asked_remote(&self.remote_url(bare), sha)
+    }
+
+    /// As [`Workspace::asked`], for a repo whose remote is `remote`.
+    fn asked_remote(&self, remote: &str, sha: &str) -> Asked {
+        if let Some(known) = &self.known_merged {
+            return Asked {
+                merged: known.contains(sha),
+                ..Asked::default()
+            };
         }
-        let answer = ask();
-        remember_merge(file, key, answer.clone());
-        answer
+        self.github().asked(remote, sha)
+    }
+
+    /// GitHub as this workspace asks it.
+    fn github(&self) -> GitHub {
+        GitHub {
+            api: self.config.github_api.clone(),
+            token_file: self.config.github_token_file.clone(),
+            merges: self.merges.clone(),
+        }
     }
 
     fn remove_one(&self, name: &str, info: &RepoInfo, force: bool) -> Result<()> {

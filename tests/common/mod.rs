@@ -778,6 +778,12 @@ pub fn stand_in_podman(home: &Home) -> PathBuf {
         containers = home.dir.join("containers").display(),
         inside = home.config_file().with_file_name("inside.toml").display(),
     );
+    // Written once, and again only when it changes: a program being
+    // written, or moved into place, cannot be started at that moment, and
+    // a look given up on may be starting it on a thread of its own.
+    if std::fs::read_to_string(&path).is_ok_and(|have| have == script) {
+        return path;
+    }
     let fresh = path.with_extension("new");
     std::fs::write(&fresh, script).unwrap();
     std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();

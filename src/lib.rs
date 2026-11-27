@@ -23,6 +23,7 @@ pub mod paths;
 pub mod pause;
 pub mod process;
 pub mod reporter;
+pub mod repos;
 pub mod sessions;
 pub mod settings;
 pub mod setup;

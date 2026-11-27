@@ -19,12 +19,15 @@
 //! subagents made under `.subworktrees/`: each is reported, pushed, backed
 //! up and removed like the others.
 
+use crate::driver::Condition;
 use crate::envelope::{rfc3339, unix_ms, valid_env_key};
 use crate::housekeeping;
 use crate::reporter;
+use crate::repos::answer::Word;
+use crate::repos::{self, could_not_know, transfer, Contained, Inside, Nucleus, Removing};
 use crate::sessions::Store;
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::{RepoInfo, Unsaved, Workspace};
+use crate::workspace::{GitHub, RepoInfo, Unsaved, Workspace};
 use crate::{driver, git, paths, usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -108,7 +111,7 @@ pub fn valid_folder(value: &str) -> bool {
 }
 
 /// `^[0-9A-Za-z._/-]{1,140}$`
-fn valid_repo(value: &str) -> bool {
+pub(crate) fn valid_repo(value: &str) -> bool {
     (1..=140).contains(&value.len())
         && value
             .chars()
@@ -136,7 +139,7 @@ fn js_space(c: char) -> bool {
 /// A branch as Watch takes one: at most 255 UTF-16 units, as JavaScript
 /// counts a string's length, with nothing in it that JavaScript's `\s`
 /// matches and no control character.
-fn reportable_branch(value: &str) -> bool {
+pub(crate) fn reportable_branch(value: &str) -> bool {
     value.encode_utf16().count() <= MAX_BRANCH
         && !value.chars().any(|c| js_space(c) || c.is_control())
 }
@@ -153,7 +156,10 @@ fn repo_name(key: &str, info: &RepoInfo) -> Option<String> {
 }
 
 /// Every worktree of a folder that is there: its repos and its subagents'.
-fn worktrees_of(workspace: &Workspace, path: &Path) -> anyhow::Result<Vec<(String, RepoInfo)>> {
+pub(crate) fn worktrees_of(
+    workspace: &Workspace,
+    path: &Path,
+) -> anyhow::Result<Vec<(String, RepoInfo)>> {
     Ok(workspace
         .session_worktrees(path)?
         .into_iter()
@@ -164,7 +170,7 @@ fn worktrees_of(workspace: &Workspace, path: &Path) -> anyhow::Result<Vec<(Strin
 /// The newest modification time, in Unix milliseconds, of any file that git
 /// tracks or would track in these worktrees. Nothing when git cannot list
 /// them, or when there are too many to look at.
-fn last_change(git: &git::Git, worktrees: &[&Path]) -> Option<u64> {
+pub(crate) fn last_change(git: &git::Git, worktrees: &[&Path]) -> Option<u64> {
     let mut newest = None;
     let mut seen = 0;
     for worktree in worktrees {
@@ -305,6 +311,83 @@ pub fn report(workspace: &Workspace, store: &Store, sharing: &[String]) -> Vec<W
         .collect()
 }
 
+/// As [`report`], for a nucleus a container writes, from what the container
+/// said of it: the folders it told of in full, at most [`MAX_FOLDERS`],
+/// GitHub asked here about the commits it names, and whether one is in use
+/// from this box's own store and processes. `root` is the nucleus's.
+pub(crate) fn report_answer(
+    answer: &repos::answer::Answer,
+    host: &GitHub,
+    store: &Store,
+    sharing: &[String],
+    root: &Path,
+) -> Vec<Worktree> {
+    answer
+        .folders
+        .iter()
+        .filter(|told| !told.gone && !told.unreadable)
+        .filter_map(|told| folder_of_answer(told, host, store, sharing, root))
+        .take(MAX_FOLDERS)
+        .collect()
+}
+
+/// One folder a container told of, by [`folder`]'s rules: nothing when one
+/// of its worktrees could not be read or it holds more repos than Watch
+/// takes.
+fn folder_of_answer(
+    told: &repos::answer::Folder,
+    host: &GitHub,
+    store: &Store,
+    sharing: &[String],
+    root: &Path,
+) -> Option<Worktree> {
+    let agent_sessions = housekeeping::agent_sessions(store, sharing, &told.folder);
+    let in_use = housekeeping::in_use_beneath(&agent_sessions, root, &told.folder).is_some();
+    let mut repos = Vec::new();
+    for worktree in &told.worktrees {
+        let facts = worktree.facts.as_ref()?.taken();
+        let unsaved = Unsaved::verdict(&facts, || {
+            host.merged_on_github(facts.slug.as_deref(), &facts.head)
+        });
+        let pulls = host.pull_requests_from(&facts);
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: worktree.label.clone(),
+                branch: worktree.branch.clone(),
+                uncommitted: unsaved.uncommitted,
+                unpushed_commits: u64::from(unsaved.unpushed).min(MAX_UNPUSHED),
+                merged_pull_request: pulls.merged,
+                open_pull_request: pulls.open,
+            },
+        );
+    }
+    if told.other_files {
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: told.folder.clone(),
+                branch: String::new(),
+                uncommitted: true,
+                unpushed_commits: 0,
+                merged_pull_request: None,
+                open_pull_request: None,
+            },
+        );
+    }
+    if repos.len() > MAX_REPOS {
+        return None;
+    }
+    Some(Worktree {
+        folder: told.folder.clone(),
+        in_use,
+        last_change_at: told
+            .last_change_ms
+            .map(|ms| rfc3339(UNIX_EPOCH + Duration::from_millis(ms))),
+        repos,
+    })
+}
+
 // ---- actions and their results --------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +412,7 @@ pub struct Action {
 }
 
 /// `^wta_[0-9a-z]{16}$`
-fn valid_id(value: &str) -> bool {
+pub(crate) fn valid_id(value: &str) -> bool {
     value.strip_prefix("wta_").is_some_and(|rest| {
         rest.len() == 16
             && rest
@@ -578,45 +661,30 @@ fn commits(count: u32) -> String {
 
 /// Why a push failed, from git's own words, said plainly. Nothing git said
 /// is passed on: it may name the remote's address, and through it a token.
+#[cfg(test)]
 fn push_failure(stderr: &str, repo: &str) -> String {
-    let said = stderr.to_lowercase();
-    let why = if said == "timed out" {
-        "it took too long"
-    } else if ["non-fast-forward", "[rejected]", "fetch first"]
-        .iter()
-        .any(|word| said.contains(word))
-    {
-        "the branch on GitHub has commits this one does not"
-    } else if [
-        "authentication failed",
-        "could not read username",
-        "permission",
-        "denied",
-        "403",
-    ]
-    .iter()
-    .any(|word| said.contains(word))
-    {
-        "GitHub did not accept the box's sign-in"
-    } else if [
-        "could not resolve host",
-        "unable to access",
-        "connection",
-        "timed out",
-    ]
-    .iter()
-    .any(|word| said.contains(word))
-    {
-        "GitHub could not be reached"
-    } else if ["protected branch", "declined"]
-        .iter()
-        .any(|word| said.contains(word))
-    {
-        "GitHub refused it"
-    } else {
-        "git could not push it"
-    };
-    format!("{repo} was not pushed: {why}.")
+    format!(
+        "{repo} was not pushed: {}.",
+        push_why(transfer::word(stderr), false)
+    )
+}
+
+/// Why a push failed, in the words a result uses for its word.
+fn push_why(word: Word, network: bool) -> &'static str {
+    match word {
+        Word::TimedOut => "it took too long",
+        Word::Rejected => "the branch on GitHub has commits this one does not",
+        Word::SignIn => "GitHub did not accept the box's sign-in",
+        Word::NoNetwork if network => "the environment's network does not reach GitHub",
+        // On the host, a proxy's 403 reads as it always has: its 403 was
+        // taken for GitHub's own refusal of the sign-in.
+        Word::NoNetwork => "GitHub did not accept the box's sign-in",
+        Word::Unreachable => "GitHub could not be reached",
+        Word::Refused => "GitHub refused it",
+        Word::BadBranch => "its branch has a name that cannot be pushed safely",
+        Word::CannotRun => "git cannot be run there",
+        _ => "git could not push it",
+    }
 }
 
 /// True for a branch name that can go into a refspec as it is: git takes it
@@ -629,54 +697,128 @@ fn pushable_branch(git: &git::Git, worktree: &Path, branch: &str) -> bool {
             .is_ok_and(|out| out.ok && out.stdout == branch)
 }
 
-fn push(workspace: &Workspace, worktrees: &[(String, RepoInfo)]) -> Ended {
+/// What a Push came to in one worktree of a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushOne {
+    /// The name it goes by in a result.
+    pub name: String,
+    /// The commits pushed.
+    pub pushed: u32,
+    pub uncommitted: bool,
+    /// Why it was not pushed, or not read.
+    pub failure: Option<Word>,
+}
+
+/// Push the branch of each worktree that holds commits on no remote, each
+/// within its time.
+pub(crate) fn push_each(
+    workspace: &Workspace,
+    worktrees: &[(String, RepoInfo)],
+    each: &mut dyn FnMut(&PushOne),
+) -> Vec<PushOne> {
+    let mut done = Vec::new();
+    for (key, info) in worktrees {
+        let one = push_one(workspace, key, info);
+        each(&one);
+        done.push(one);
+    }
+    done
+}
+
+fn push_one(workspace: &Workspace, key: &str, info: &RepoInfo) -> PushOne {
     let git = workspace.git();
+    let name = repo_name(key, info).unwrap_or_else(|| "a repo".to_string());
+    let Ok(unsaved) = workspace.unsaved(&info.path) else {
+        return PushOne {
+            name,
+            pushed: 0,
+            uncommitted: false,
+            failure: Some(Word::Unreadable),
+        };
+    };
+    let mut one = PushOne {
+        name,
+        pushed: 0,
+        uncommitted: unsaved.uncommitted,
+        failure: None,
+    };
+    if unsaved.unpushed == 0 {
+        return one;
+    }
+    // A detached HEAD is on no branch to push.
+    let branch = git
+        .tree(&info.path, &["branch", "--show-current"])
+        .unwrap_or_default();
+    if branch.is_empty() {
+        return one;
+    }
+    if !pushable_branch(git, &info.path, &branch) {
+        one.failure = Some(Word::BadBranch);
+        return one;
+    }
+    let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+    let args = ["-q", "-u", "origin", "--", refspec.as_str()];
+    match transfer::push(git, &info.path, &args, Some(PUSH_TIMEOUT)) {
+        Ok(out) if out.ok => one.pushed = unsaved.unpushed,
+        Ok(out) => one.failure = Some(transfer::word(&out.stderr)),
+        Err(_) => one.failure = Some(Word::CannotRun),
+    }
+    one
+}
+
+/// What a Push came to, as one result. With `network`, a push the
+/// environment's network would not take to GitHub is said so, for the
+/// whole of it; `cut_short` says the rest was not done.
+fn pushed_ended(done: &[PushOne], network: bool, cut_short: bool) -> Ended {
+    // Nothing went anywhere, and only because the network would not take
+    // it: said so, for the whole of it.
+    let failed: Vec<Word> = done.iter().filter_map(|one| one.failure).collect();
+    let none_pushed = done.iter().all(|one| one.pushed == 0);
+    if network
+        && none_pushed
+        && !failed.is_empty()
+        && failed.iter().all(|word| *word == Word::NoNetwork)
+    {
+        return ended(Outcome::Failed, repos::NO_NETWORK);
+    }
     let mut pushed: Vec<(String, u32)> = Vec::new();
     let mut uncommitted: Vec<String> = Vec::new();
     let mut failures = Vec::new();
-    for (key, info) in worktrees {
-        let name = repo_name(key, info).unwrap_or_else(|| "a repo".to_string());
-        let Ok(unsaved) = workspace.unsaved(&info.path) else {
-            failures.push(format!("{name} could not be read."));
-            continue;
-        };
-        if unsaved.uncommitted && !uncommitted.contains(&name) {
+    for one in done {
+        let name = &one.name;
+        if one.uncommitted && !uncommitted.contains(name) {
             uncommitted.push(name.clone());
         }
-        if unsaved.unpushed == 0 {
-            continue;
-        }
-        // A detached HEAD is on no branch to push.
-        let branch = git
-            .tree(&info.path, &["branch", "--show-current"])
-            .unwrap_or_default();
-        if branch.is_empty() {
-            continue;
-        }
-        if !pushable_branch(git, &info.path, &branch) {
-            failures.push(format!(
-                "{name} was not pushed: its branch has a name that cannot be pushed safely."
-            ));
-            continue;
-        }
-        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
-        let args = ["push", "-q", "-u", "origin", "--", refspec.as_str()];
-        match git.try_tree_within(&info.path, &args, PUSH_TIMEOUT) {
-            Ok(out) if out.ok => match pushed.iter_mut().find(|(have, _)| *have == name) {
-                Some((_, count)) => *count = count.saturating_add(unsaved.unpushed),
-                None => pushed.push((name, unsaved.unpushed)),
+        match one.failure {
+            Some(Word::Unreadable) => failures.push(format!("{name} could not be read.")),
+            Some(word) => failures.push(format!(
+                "{name} was not pushed: {}.",
+                push_why(word, network)
+            )),
+            None if one.pushed > 0 => match pushed.iter_mut().find(|(have, _)| have == name) {
+                Some((_, count)) => *count = count.saturating_add(one.pushed),
+                None => pushed.push((name.clone(), one.pushed)),
             },
-            Ok(out) => failures.push(push_failure(&out.stderr, &name)),
-            Err(_) => failures.push(format!("{name} was not pushed: git cannot be run there.")),
+            None => {}
         }
+    }
+    if cut_short {
+        failures.push("The rest was not pushed: it took too long.".to_string());
     }
     if !failures.is_empty() {
         let count = failures.len();
+        // For a container, what was pushed beside them is said first.
+        let parts: Vec<String> = pushed
+            .iter()
+            .map(|(name, count)| format!("{} in {name}", commits(*count)))
+            .collect();
+        let mut text = failures.join(" ");
+        if network && !parts.is_empty() {
+            text = format!("Pushed {}. {text}", listed(&parts));
+        }
         return ended(
             Outcome::Failed,
-            fit(failures.join(" "), || {
-                format!("{count} repos were not pushed.")
-            }),
+            fit(text, || format!("{count} repos were not pushed.")),
         );
     }
     if pushed.is_empty() {
@@ -730,10 +872,10 @@ struct Standing {
     tree: String,
 }
 
-fn standing(git: &git::Git, info: &RepoInfo, keys: &Path) -> anyhow::Result<Standing> {
+fn standing(git: &git::Git, info: &RepoInfo, keys: &Path, plain: bool) -> anyhow::Result<Standing> {
     Ok(Standing {
         head: git.tree(&info.path, &["rev-parse", "HEAD"])?,
-        tree: housekeeping::working_tree(git, &info.path, keys, "backup")?,
+        tree: housekeeping::working_tree(git, &info.path, keys, "backup", plain)?,
     })
 }
 
@@ -761,7 +903,7 @@ fn new_gitlinks(git: &git::Git, worktree: &Path, tree: &str) -> anyhow::Result<b
 /// ref as a file, whose name may be at most 255 bytes, so a long branch name
 /// is cut, at a character's edge, leaving room for git's `.lock` beside it;
 /// the id keeps it the action's own.
-fn backup_ref(branch: &str, id: &str) -> String {
+pub(crate) fn backup_ref(branch: &str, id: &str) -> String {
     let wip = housekeeping::wip_ref(branch);
     let dashed = wip.strip_prefix("refs/wip/").unwrap_or(&wip);
     let room = 255 - ".lock".len() - id.len() - 1;
@@ -772,22 +914,33 @@ fn backup_ref(branch: &str, id: &str) -> String {
     format!("refs/wip/{}-{id}", &dashed[..cut])
 }
 
-/// The ref a backup went to, or why it could not be made.
+/// One backup pushed: of which repo, to which ref, of which branch, and
+/// the tree it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Backed {
+    pub name: String,
+    pub reference: String,
+    pub branch: String,
+    pub tree: String,
+}
+
+/// A backup pushed, or why it could not be made.
 enum Backup {
-    Pushed(String),
-    Failed(String),
+    Pushed { reference: String, branch: String },
+    Failed(Word),
 }
 
 /// Push a backup of one worktree's unsaved work to a ref of this action's
 /// own, `refs/wip/<branch>-<action id>`, that nothing else writes: its
 /// commits and, as a commit of their own made on no branch, its uncommitted
-/// changes. Never over anything already there.
+/// changes. Never over anything already there. `usable` says whether a ref
+/// may be pushed to.
 fn back_up(
     git: &git::Git,
-    name: &str,
     info: &RepoInfo,
     seen: &Standing,
-    action: &Action,
+    id: &str,
+    usable: &dyn Fn(&str) -> bool,
 ) -> anyhow::Result<Backup> {
     let current = git.tree(&info.path, &["branch", "--show-current"])?;
     let branch = if current.is_empty() {
@@ -795,17 +948,12 @@ fn back_up(
     } else {
         current
     };
-    if !pushable_branch(git, &info.path, &branch) {
-        return Ok(Backup::Failed(format!(
-            "The backup of {name} could not be made, as its branch has a name that cannot be \
-             used, so nothing was removed."
-        )));
+    let reference = backup_ref(&branch, id);
+    if !pushable_branch(git, &info.path, &branch) || !usable(&reference) {
+        return Ok(Backup::Failed(Word::BadBranch));
     }
     if new_gitlinks(git, &info.path, &seen.tree)? {
-        return Ok(Backup::Failed(format!(
-            "{name} holds another git repository that cannot be backed up, so nothing was \
-             removed."
-        )));
+        return Ok(Backup::Failed(Word::NestedRepo));
     }
     let head_tree = git.tree(&info.path, &["rev-parse", "HEAD^{tree}"])?;
     let commit = if seen.tree == head_tree {
@@ -813,34 +961,106 @@ fn back_up(
     } else {
         housekeeping::wip_commit(git, &info.path, &seen.tree, &branch, SystemTime::now())?
     };
-    let reference = backup_ref(&branch, &action.id);
     let refspec = format!("{commit}:{reference}");
-    let pushed = git.try_tree_within(
+    let pushed = transfer::push(
+        git,
         &info.path,
-        &["push", "-q", "origin", "--", refspec.as_str()],
-        PUSH_TIMEOUT,
+        &["-q", "origin", "--", refspec.as_str()],
+        Some(PUSH_TIMEOUT),
     )?;
-    Ok(match pushed.ok {
-        true => Backup::Pushed(reference),
-        false => Backup::Failed(format!(
-            "The backup of {name} could not be pushed, so nothing was removed."
-        )),
+    Ok(match (pushed.ok, transfer::word(&pushed.stderr)) {
+        (true, _) => Backup::Pushed { reference, branch },
+        (false, Word::NoNetwork) => Backup::Failed(Word::NoNetwork),
+        (false, _) => Backup::Failed(Word::NotPushed),
     })
 }
 
-fn clean_up(
-    workspace: &Workspace,
-    path: &Path,
-    action: &Action,
-    in_use: &dyn Fn() -> bool,
-    keys: &Path,
-) -> Ended {
+/// What a Clean up came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Cleaned {
+    /// Removed, after these backups: (repo, ref).
+    Removed { backed_up: Vec<(String, String)> },
+    /// Kept: what its repos hold that is not on GitHub, and whether it
+    /// holds files outside them.
+    Holding {
+        holding: Vec<(String, Unsaved)>,
+        other_files: bool,
+    },
+    /// Not removed, for `why`, about `repo` when one, after these backups.
+    Failed {
+        why: Word,
+        repo: Option<String>,
+        backed_up: Vec<(String, String)>,
+    },
+    /// Its removal was not started, after these backups: its time was up.
+    NotStarted { backed_up: Vec<(String, String)> },
+    /// Its removal was begun, after these backups, and its time was up
+    /// before it was said how it came out.
+    Unknown { backed_up: Vec<(String, String)> },
+    /// Backed up and not removed, as asked: [`Stage::BackupOnly`].
+    BackedUp { backed_up: Vec<Backed> },
+}
+
+/// How much of a Clean up with discard one call does.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Stage<'a> {
+    /// Back up, then remove.
+    All,
+    /// Back up, and stop there: the host looks again before the removal.
+    BackupOnly,
+    /// Remove what was backed up: each repo's work must still be one of
+    /// these trees, which the backups hold.
+    Backed(&'a std::collections::BTreeSet<String>),
+}
+
+/// Around the one step that removes a folder: `begin` says whether it may
+/// start, which it may not once the time it was given is up, and `end`
+/// that it is over. A removal begun is finished.
+pub(crate) struct Committing<'a> {
+    pub begin: &'a dyn Fn() -> bool,
+    pub end: &'a dyn Fn(),
+}
+
+/// The removal of a folder whose time never runs out.
+pub(crate) const UNHURRIED: Committing<'static> = Committing {
+    begin: &|| true,
+    end: &|| {},
+};
+
+impl Committing<'_> {
+    fn within<T>(&self, step: impl FnOnce() -> T) -> Option<T> {
+        if !(self.begin)() {
+            return None;
+        }
+        let done = step();
+        (self.end)();
+        Some(done)
+    }
+}
+
+/// How a Clean up is done: with `discard`, the action's id, unsaved work
+/// may go once it is backed up; `in_use` is asked just before anything is
+/// removed; the copies of the index go to `keys`, `plain` or not; and a
+/// backup may only go to a ref `usable` takes.
+pub(crate) struct Cleaning<'a> {
+    pub discard: Option<&'a str>,
+    pub in_use: &'a dyn Fn() -> bool,
+    pub keys: &'a Path,
+    pub plain: bool,
+    pub usable: &'a dyn Fn(&str) -> bool,
+    pub committing: &'a Committing<'a>,
+    pub stage: Stage<'a>,
+    /// Told the backups pushed so far, after each, and just before the
+    /// removal begins.
+    pub noted: &'a dyn Fn(&[Backed]),
+}
+
+pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) -> Cleaned {
     let git = workspace.git();
-    let unreadable = || {
-        ended(
-            Outcome::Failed,
-            "A repo in it could not be read, so nothing was removed.",
-        )
+    let unreadable = || Cleaned::Failed {
+        why: Word::Unreadable,
+        repo: None,
+        backed_up: Vec::new(),
     };
     // The session's worktrees as listed, those gone included: what the
     // removal is checked against at the end.
@@ -863,48 +1083,57 @@ fn clean_up(
         }
     }
     if holding.is_empty() && other.is_empty() {
+        if matches!(how.stage, Stage::BackupOnly) {
+            return Cleaned::BackedUp {
+                backed_up: Vec::new(),
+            };
+        }
+        (how.noted)(&[]);
         // Removed only if, looked at again, it still holds nothing unsaved.
-        return match workspace.remove_session(path) {
-            Ok(_) => ended(Outcome::Done, "Cleaned up."),
-            Err(_) => ended(Outcome::Failed, "It could not be removed."),
+        return match how.committing.within(|| workspace.remove_session(path)) {
+            None => Cleaned::NotStarted {
+                backed_up: Vec::new(),
+            },
+            Some(Ok(_)) => Cleaned::Removed {
+                backed_up: Vec::new(),
+            },
+            Some(Err(_)) => Cleaned::Failed {
+                why: Word::NotRemoved,
+                repo: None,
+                backed_up: Vec::new(),
+            },
         };
     }
-    if !action.discard {
-        let mut words: Vec<String> = holding
-            .iter()
-            .flat_map(|(name, _, found)| unsaved_words(found, name))
-            .collect();
-        if !other.is_empty() {
-            words.push("files outside its repos".to_string());
-        }
-        let repos = holding.len();
-        return ended(
-            Outcome::Refused,
-            fit(format!("It holds {}.", listed(&words)), || {
-                format!("It holds work that is not on GitHub in {repos} repos.")
-            }),
-        );
-    }
+    let Some(id) = how.discard else {
+        return Cleaned::Holding {
+            holding: holding
+                .into_iter()
+                .map(|(name, _, found)| (name, found))
+                .collect(),
+            other_files: !other.is_empty(),
+        };
+    };
     // Files outside its repos are in no repo to back up to: they are not
     // dropped.
     if !other.is_empty() {
-        return ended(
-            Outcome::Failed,
-            "It holds files outside its repos, which cannot be backed up, so nothing was removed.",
-        );
+        return Cleaned::Failed {
+            why: Word::OtherFiles,
+            repo: None,
+            backed_up: Vec::new(),
+        };
     }
     // How each worktree stands before anything is pushed: what is backed up,
     // and what it is compared with just before anything is removed.
     let mut before = Vec::new();
     for (_, info) in &worktrees {
-        match standing(git, info, keys) {
+        match standing(git, info, how.keys, how.plain) {
             Ok(seen) => before.push(seen),
             Err(_) => return unreadable(),
         }
     }
     // Every backup is pushed before anything is removed, and one that fails
-    // removes nothing.
-    let mut backed_up = Vec::new();
+    // removes nothing. Work backed up by an earlier call must be as it was.
+    let mut full: Vec<Backed> = Vec::new();
     for (name, info, _) in &holding {
         let Some(at) = worktrees
             .iter()
@@ -912,56 +1141,227 @@ fn clean_up(
         else {
             return unreadable();
         };
-        match back_up(git, name, info, &before[at], action) {
-            Ok(Backup::Pushed(reference)) => backed_up.push(format!("{reference} in {name}")),
-            Ok(Backup::Failed(detail)) => return ended(Outcome::Failed, fit(detail, String::new)),
-            Err(_) => {
-                return ended(
-                    Outcome::Failed,
-                    format!("The backup of {name} could not be made, so nothing was removed."),
-                )
+        if let Stage::Backed(trees) = how.stage {
+            if !trees.contains(&before[at].tree) {
+                return Cleaned::Failed {
+                    why: Word::Changed,
+                    repo: None,
+                    backed_up: Vec::new(),
+                };
             }
+            continue;
         }
+        let why = match back_up(git, info, &before[at], id, how.usable) {
+            Ok(Backup::Pushed { reference, branch }) => {
+                full.push(Backed {
+                    name: name.clone(),
+                    reference,
+                    branch,
+                    tree: before[at].tree.clone(),
+                });
+                (how.noted)(&full);
+                continue;
+            }
+            Ok(Backup::Failed(word)) => word,
+            Err(_) => Word::NotMade,
+        };
+        return Cleaned::Failed {
+            why,
+            repo: Some(name.clone()),
+            backed_up: pairs(&full),
+        };
     }
-    let repos = backed_up.len();
-    let backed = fit(format!("Backed up to {}.", listed(&backed_up)), || {
-        format!("Backed up {repos} repos to GitHub.")
-    });
+    if matches!(how.stage, Stage::BackupOnly) {
+        return Cleaned::BackedUp { backed_up: full };
+    }
+    let backed_up = pairs(&full);
     // Looked at once more just before the removal. A session that came
     // back to it, a repo added or gone, or a commit or a change made since
     // the backup, and nothing is removed.
-    let changed = in_use()
+    let changed = (how.in_use)()
         || worktrees_of(workspace, path).map_or(true, |now| {
             now.len() != worktrees.len()
                 || now.iter().zip(&worktrees).zip(&before).any(
                     |(((_, now_info), (_, then_info)), seen)| {
                         now_info.path != then_info.path
-                            || standing(git, now_info, keys).map_or(true, |now| &now != seen)
+                            || standing(git, now_info, how.keys, how.plain)
+                                .map_or(true, |now| &now != seen)
                     },
                 )
         });
     if changed {
-        return ended(
-            Outcome::Failed,
-            fit(
-                format!("{backed} It changed while it was backed up, so nothing was removed."),
-                || "It changed while it was backed up, so nothing was removed.".to_string(),
-            ),
-        );
+        return Cleaned::Failed {
+            why: Word::Changed,
+            repo: None,
+            backed_up,
+        };
     }
-    match workspace.remove_session_as_listed(path, &as_listed, true) {
-        Ok(_) => ended(Outcome::Done, backed),
-        Err(_) => ended(
-            Outcome::Failed,
-            fit(format!("{backed} It could not be removed."), || {
-                "Backed up, but it could not be removed.".to_string()
-            }),
-        ),
+    (how.noted)(&full);
+    match how
+        .committing
+        .within(|| workspace.remove_session_as_listed(path, &as_listed, true))
+    {
+        None => Cleaned::NotStarted { backed_up },
+        Some(Ok(_)) => Cleaned::Removed { backed_up },
+        Some(Err(_)) => Cleaned::Failed {
+            why: Word::NotRemoved,
+            repo: None,
+            backed_up,
+        },
     }
 }
 
-/// Run one action in one environment.
-fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended {
+/// The backups as a result names them: (repo, ref).
+pub(crate) fn pairs(backed: &[Backed]) -> Vec<(String, String)> {
+    backed
+        .iter()
+        .map(|one| (one.name.clone(), one.reference.clone()))
+        .collect()
+}
+
+/// What a Clean up came to, as one result. With `network`, a backup the
+/// environment's network would not take to GitHub is said so.
+fn cleaned_ended(cleaned: &Cleaned, network: bool) -> Ended {
+    let backed = |backed_up: &[(String, String)]| {
+        let parts: Vec<String> = backed_up
+            .iter()
+            .map(|(name, reference)| format!("{reference} in {name}"))
+            .collect();
+        let repos = parts.len();
+        fit(format!("Backed up to {}.", listed(&parts)), || {
+            format!("Backed up {repos} repos to GitHub.")
+        })
+    };
+    let prefix = |backed_up: &[(String, String)]| match backed_up.is_empty() {
+        true => String::new(),
+        false => format!("{} ", backed(backed_up)),
+    };
+    match cleaned {
+        Cleaned::Removed { backed_up } if backed_up.is_empty() => {
+            ended(Outcome::Done, "Cleaned up.")
+        }
+        Cleaned::Removed { backed_up } => ended(Outcome::Done, backed(backed_up)),
+        Cleaned::Holding {
+            holding,
+            other_files,
+        } => {
+            let mut words: Vec<String> = holding
+                .iter()
+                .flat_map(|(name, found)| unsaved_words(found, name))
+                .collect();
+            if *other_files {
+                words.push("files outside its repos".to_string());
+            }
+            let repos = holding.len();
+            ended(
+                Outcome::Refused,
+                fit(format!("It holds {}.", listed(&words)), || {
+                    format!("It holds work that is not on GitHub in {repos} repos.")
+                }),
+            )
+        }
+        Cleaned::NotStarted { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!(
+                    "{}It took too long, so nothing was removed.",
+                    prefix(backed_up)
+                ),
+                || "It took too long, so nothing was removed.".to_string(),
+            ),
+        ),
+        Cleaned::Unknown { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!(
+                    "{}It took too long to say whether it was removed.",
+                    prefix(backed_up)
+                ),
+                || "It took too long to say whether it was removed.".to_string(),
+            ),
+        ),
+        Cleaned::BackedUp { backed_up } => ended(
+            Outcome::Failed,
+            fit(
+                format!("{}Nothing was removed.", prefix(&pairs(backed_up))),
+                || "Nothing was removed.".to_string(),
+            ),
+        ),
+        Cleaned::Failed {
+            why,
+            repo,
+            backed_up,
+        } => {
+            let name = repo.clone().unwrap_or_else(|| "a repo".to_string());
+            // For a container, backups that were pushed before one failed
+            // are said; on the host, as it always has been, they are not.
+            let before = match network && !backed_up.is_empty() {
+                true => format!("{} ", backed(backed_up)),
+                false => String::new(),
+            };
+            let detail = match why {
+                Word::NoNetwork if network && backed_up.is_empty() => repos::NO_NETWORK.to_string(),
+                Word::NoNetwork if network => format!(
+                    "{before}The backup of {name} could not be pushed, as the environment's \
+                     network does not reach GitHub, so nothing was removed."
+                ),
+                Word::OtherFiles => "It holds files outside its repos, which cannot be backed up, \
+                                     so nothing was removed."
+                    .to_string(),
+                Word::BadBranch => format!(
+                    "{before}The backup of {name} could not be made, as its branch has a name \
+                     that cannot be used, so nothing was removed."
+                ),
+                Word::NestedRepo => format!(
+                    "{before}{name} holds another git repository that cannot be backed up, so \
+                     nothing was removed."
+                ),
+                Word::NotPushed | Word::NoNetwork => format!(
+                    "{before}The backup of {name} could not be pushed, so nothing was removed."
+                ),
+                Word::NotMade => format!(
+                    "{before}The backup of {name} could not be made, so nothing was removed."
+                ),
+                Word::Changed => {
+                    return ended(
+                        Outcome::Failed,
+                        fit(
+                            format!(
+                                "{}It changed while it was backed up, so nothing was removed.",
+                                prefix(backed_up)
+                            ),
+                            || {
+                                "It changed while it was backed up, so nothing was removed."
+                                    .to_string()
+                            },
+                        ),
+                    )
+                }
+                Word::NotRemoved if backed_up.is_empty() => "It could not be removed.".to_string(),
+                Word::NotRemoved => {
+                    return ended(
+                        Outcome::Failed,
+                        fit(
+                            format!("{} It could not be removed.", backed(backed_up)),
+                            || "Backed up, but it could not be removed.".to_string(),
+                        ),
+                    )
+                }
+                _ => "A repo in it could not be read, so nothing was removed.".to_string(),
+            };
+            ended(Outcome::Failed, fit(detail, String::new))
+        }
+    }
+}
+
+/// Run one action in one environment. For one in a container, git runs
+/// inside the container through `inside`.
+fn run(
+    settings: &Settings,
+    environment: &Environment,
+    action: &Action,
+    inside: Option<&Inside>,
+) -> Ended {
     // The box's owner turns actions on; until then each is refused unrun.
     if !settings.worktree_actions {
         return ended(Outcome::Refused, "Actions are off on this box.");
@@ -969,9 +1369,18 @@ fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended
     if environment.driver_owns_worktrees() {
         return ended(Outcome::Refused, "The box leaves this folder alone.");
     }
-    let workspace = housekeeping::workspace(settings, environment)
+    let nucleus = housekeeping::workspace(settings, environment)
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(housekeeping::merges_file(&settings.state_dir));
+    let workspace = match nucleus {
+        Nucleus::Host(workspace) => *workspace,
+        Nucleus::Contained(contained) => {
+            return match inside {
+                Some(inside) => run_contained(settings, environment, &contained, inside, action),
+                None => ended(Outcome::Failed, could_not_know(Condition::Absent)),
+            }
+        }
+    };
     let path = environment.root.join(".worktrees").join(&action.folder);
     if !path.exists() {
         return match action.kind {
@@ -993,7 +1402,11 @@ fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended
         return ended(Outcome::Refused, "The box leaves this folder alone.");
     }
     match action.kind {
-        Kind::Push => push(&workspace, &worktrees),
+        Kind::Push => pushed_ended(
+            &push_each(&workspace, &worktrees, &mut |_| {}),
+            false,
+            false,
+        ),
         Kind::CleanUp => {
             let store = Store::new(&settings.state_dir);
             let sharing = housekeeping::sharing_nucleus(settings, environment);
@@ -1005,8 +1418,271 @@ fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended
                 return ended(Outcome::Refused, "A session is still using it.");
             }
             let keys = base(&settings.state_dir).join("index");
-            clean_up(&workspace, &path, action, &in_use, &keys)
+            let how = Cleaning {
+                discard: action.discard.then_some(action.id.as_str()),
+                in_use: &in_use,
+                keys: &keys,
+                plain: false,
+                usable: &|_| true,
+                committing: &UNHURRIED,
+                stage: Stage::All,
+                noted: &|_| {},
+            };
+            cleaned_ended(&clean_up_core(&workspace, &path, &how), false)
         }
+    }
+}
+
+/// One action in an environment whose folders a container writes: the host
+/// reads the folder inside the container, asks GitHub about the commits it
+/// names and its own store whether a session uses it, and has the push or
+/// the removal done inside, then says what came of it in the same words as
+/// for a folder on the host.
+fn run_contained(
+    settings: &Settings,
+    environment: &Environment,
+    contained: &Contained,
+    inside: &Inside,
+    action: &Action,
+) -> Ended {
+    let not_known = |condition| ended(Outcome::Failed, could_not_know(condition));
+    let census = match contained.census(inside, settings, Some(&action.folder), false) {
+        Ok(census) => census,
+        Err(condition) => return not_known(condition),
+    };
+    let Some(folder) = census.folders.first() else {
+        return not_known(Condition::BadReply);
+    };
+    if folder.gone {
+        return match action.kind {
+            Kind::Push => ended(Outcome::Refused, "There is nothing to push."),
+            Kind::CleanUp => ended(Outcome::Done, "It was already cleaned up."),
+        };
+    }
+    let (false, Some(stamp)) = (folder.unreadable, folder.stamp.clone()) else {
+        return ended(Outcome::Failed, "A repo in it could not be read.");
+    };
+    let merged = contained.merged_among(folder.worktrees.iter().filter_map(|w| w.facts.as_ref()));
+    let refused_for = |why: Option<Word>| match why {
+        Some(Word::Gone) => match action.kind {
+            Kind::Push => Some(ended(Outcome::Refused, "There is nothing to push.")),
+            Kind::CleanUp => Some(ended(Outcome::Done, "It was already cleaned up.")),
+        },
+        Some(Word::NotASession) => Some(ended(Outcome::Refused, "It is not a session folder.")),
+        Some(Word::LeftAlone) => Some(ended(Outcome::Refused, "The box leaves this folder alone.")),
+        Some(Word::InUse) => Some(ended(Outcome::Refused, "A session is still using it.")),
+        Some(Word::Changed) => Some(ended(
+            Outcome::Failed,
+            "It changed while it was looked at, so nothing was done.",
+        )),
+        Some(Word::Unreadable) => Some(ended(Outcome::Failed, "A repo in it could not be read.")),
+        _ => None,
+    };
+    match action.kind {
+        Kind::Push => {
+            let answer = match contained.push(inside, settings, &action.folder, &merged) {
+                Ok(answer) => answer,
+                Err(condition) => return not_known(condition),
+            };
+            if let Some(refused) = refused_for(answer.why) {
+                return refused;
+            }
+            let done: Vec<PushOne> = answer
+                .pushes
+                .iter()
+                .map(|one| PushOne {
+                    name: one.repo.clone(),
+                    pushed: one.pushed,
+                    uncommitted: one.uncommitted,
+                    failure: one.failure,
+                })
+                .collect();
+            pushed_ended(&done, true, !answer.complete)
+        }
+        Kind::CleanUp => {
+            let store = Store::new(&settings.state_dir);
+            let sharing = housekeeping::sharing_nucleus(settings, environment);
+            // Whether a session of this box works in it, by its own store
+            // and processes: asked first, and again just before the removal.
+            let in_use = || {
+                let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
+                housekeeping::in_use_beneath(&sessions, &environment.root, &action.folder).is_some()
+            };
+            if in_use() {
+                return ended(Outcome::Refused, "A session is still using it.");
+            }
+            let discard = action.discard.then_some(action.id.as_str());
+            let folders = [(action.folder.clone(), stamp)];
+            let remove =
+                |stage| contained.remove(inside, settings, &folders, &merged, discard, stage);
+            let finish = |answer: repos::answer::Answer, backed: &[(String, String)]| {
+                let removal = answer.removals.first();
+                let mut cleaned = match removal {
+                    None => Cleaned::NotStarted {
+                        backed_up: Vec::new(),
+                    },
+                    Some(removal) => {
+                        let kept = removal.outcome == repos::answer::Outcome::Kept;
+                        if let Some(refused) = refused_for(removal.why).filter(|_| kept) {
+                            return with_backups(refused, backed);
+                        }
+                        cleaned_of(removal)
+                    }
+                };
+                // The backups an earlier call pushed are this one's too.
+                if !backed.is_empty() {
+                    cleaned = cleaned.after(backed);
+                }
+                cleaned_ended(&cleaned, true)
+            };
+            let Some(_) = discard else {
+                return match remove(Removing::All) {
+                    Ok(answer) => finish(answer, &[]),
+                    // Asked to remove, and no answer: it may have.
+                    Err(_) => ended(Outcome::Failed, repos::NOT_TOLD),
+                };
+            };
+            // With discard: the backups first, then, the host having looked
+            // again, the removal of what they hold.
+            let backed = match remove(Removing::BackupOnly) {
+                Ok(answer) => answer,
+                Err(condition) => return not_known(condition),
+            };
+            let Some(first) = backed.removals.first() else {
+                return cleaned_ended(
+                    &Cleaned::NotStarted {
+                        backed_up: Vec::new(),
+                    },
+                    true,
+                );
+            };
+            let pushed: Vec<(String, String)> = first
+                .backed_up
+                .iter()
+                .map(|backup| (backup.repo.clone(), backup.reference.clone()))
+                .collect();
+            if first.outcome != repos::answer::Outcome::BackedUp || !backed.complete {
+                return match first.outcome {
+                    repos::answer::Outcome::BackedUp => {
+                        cleaned_ended(&Cleaned::NotStarted { backed_up: pushed }, true)
+                    }
+                    _ => finish(backed.clone(), &[]),
+                };
+            }
+            if in_use() {
+                return with_backups(
+                    ended(Outcome::Refused, "A session is still using it."),
+                    &pushed,
+                );
+            }
+            let trees: Vec<String> = first
+                .backed_up
+                .iter()
+                .map(|backup| backup.tree.clone())
+                .collect();
+            match remove(Removing::Backed(trees)) {
+                Ok(answer) => finish(answer, &pushed),
+                Err(_) => with_backups(ended(Outcome::Failed, repos::NOT_TOLD), &pushed),
+            }
+        }
+    }
+}
+
+/// A result, with the backups pushed before it said first.
+fn with_backups(end: Ended, backed: &[(String, String)]) -> Ended {
+    if backed.is_empty() {
+        return end;
+    }
+    let parts: Vec<String> = backed
+        .iter()
+        .map(|(name, reference)| format!("{reference} in {name}"))
+        .collect();
+    let detail = end.detail.clone();
+    Ended {
+        outcome: end.outcome,
+        detail: fit(format!("Backed up to {}. {detail}", listed(&parts)), || {
+            detail
+        }),
+    }
+}
+
+impl Cleaned {
+    /// The same outcome, after these backups too.
+    fn after(self, backed: &[(String, String)]) -> Cleaned {
+        let join = |mut have: Vec<(String, String)>| {
+            let mut all = backed.to_vec();
+            all.append(&mut have);
+            all
+        };
+        match self {
+            Cleaned::Removed { backed_up } => Cleaned::Removed {
+                backed_up: join(backed_up),
+            },
+            Cleaned::Failed {
+                why,
+                repo,
+                backed_up,
+            } => Cleaned::Failed {
+                why,
+                repo,
+                backed_up: join(backed_up),
+            },
+            Cleaned::NotStarted { backed_up } => Cleaned::NotStarted {
+                backed_up: join(backed_up),
+            },
+            Cleaned::Unknown { backed_up } => Cleaned::Unknown {
+                backed_up: join(backed_up),
+            },
+            other => other,
+        }
+    }
+}
+
+/// What a removal inside a container came to, as a Clean up's outcome.
+fn cleaned_of(removal: &repos::answer::Removal) -> Cleaned {
+    use repos::answer::Outcome as Came;
+    let backed_up: Vec<(String, String)> = removal
+        .backed_up
+        .iter()
+        .map(|backup| (backup.repo.clone(), backup.reference.clone()))
+        .collect();
+    match removal.outcome {
+        Came::Removed | Came::Gone => Cleaned::Removed { backed_up },
+        Came::Started => Cleaned::Unknown { backed_up },
+        Came::BackedUp => Cleaned::BackedUp {
+            backed_up: removal
+                .backed_up
+                .iter()
+                .map(|backup| Backed {
+                    name: backup.repo.clone(),
+                    reference: backup.reference.clone(),
+                    branch: backup.branch.clone(),
+                    tree: backup.tree.clone(),
+                })
+                .collect(),
+        },
+        Came::Kept if matches!(removal.why, Some(Word::Unsaved | Word::OtherFiles)) => {
+            Cleaned::Holding {
+                holding: removal
+                    .holding
+                    .iter()
+                    .map(|held| {
+                        let found = Unsaved {
+                            uncommitted: held.uncommitted,
+                            unpushed: held.unpushed,
+                            tracked: false,
+                        };
+                        (held.repo.clone(), found)
+                    })
+                    .collect(),
+                other_files: removal.other_files,
+            }
+        }
+        Came::Kept | Came::Failed => Cleaned::Failed {
+            why: removal.why.unwrap_or(Word::Unreadable),
+            repo: removal.repo.clone(),
+            backed_up,
+        },
     }
 }
 
@@ -1023,6 +1699,11 @@ fn too_old(requested_at: &str, now: SystemTime) -> bool {
 /// Returns how many ran. While the record of what was started cannot be
 /// read, nothing runs: each is refused, and Watch hears why.
 pub fn run_queued(settings: &Settings) -> usize {
+    run_queued_with(settings, Inside::of_this_box().as_ref())
+}
+
+/// As [`run_queued`], with git for a container run through `inside`.
+pub fn run_queued_with(settings: &Settings, inside: Option<&Inside>) -> usize {
     let state_dir = &settings.state_dir;
     let Ok(entries) = fs::read_dir(queue_dir(state_dir)) else {
         return 0;
@@ -1091,7 +1772,7 @@ pub fn run_queued(settings: &Settings) -> usize {
             );
             continue;
         }
-        let end = run(settings, environment, &action);
+        let end = run(settings, environment, &action, inside);
         let result = ActionResult {
             id: action.id.clone(),
             outcome: end.outcome,
@@ -1175,6 +1856,16 @@ mod tests {
         );
         let denied = push_failure("remote: Permission to octo/api.git denied", "octo/api");
         assert!(denied.ends_with("did not accept the box's sign-in."));
+        // A host environment's proxy refusing GitHub reads as it always
+        // has.
+        assert_eq!(
+            push_failure(
+                "fatal: unable to access 'https://github.com/octo/api.git/': \
+                 CONNECT tunnel failed, response 403",
+                "api"
+            ),
+            "api was not pushed: GitHub did not accept the box's sign-in."
+        );
         let other = push_failure(
             "fatal: '/srv/repos/api' does not appear to be a git repository",
             "api",

@@ -1,5 +1,7 @@
 //! The reporter: the part of the daemon that runs git to learn what a
-//! heartbeat and an outcome event say about a session's work.
+//! heartbeat and an outcome event say about a session's work. For a nucleus
+//! a container writes, that git runs inside the container, and the reporter
+//! uses its answer (see [`crate::repos`]).
 //!
 //! It has a thread of its own, so neither a heartbeat nor an event ever waits
 //! on git, and it does two things:
@@ -19,12 +21,14 @@
 //! one thing, whether it is empty, and then dropped. A pull request's title,
 //! body, branch and author are skipped by the parser and never held.
 
+use crate::driver::Runner;
 use crate::envelope::{unix_ms, valid_env_key, valid_session_id, Draft, Envelope, EventType};
 use crate::housekeeping;
+use crate::repos::{self, Contained};
 use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
-use crate::workspace::{RepoInfo, Workspace, SUBWORKTREES};
+use crate::workspace::{Facts, GitHub, RepoInfo, Unsaved, Workspace, SUBWORKTREES};
 use crate::worktrees::{self, Worktree};
 use crate::{driver, git, github, paths};
 use serde::{Deserialize, Serialize};
@@ -101,14 +105,54 @@ impl Tally {
         let Some(refused) = refused else {
             return false;
         };
-        if !self.refused.iter().any(|seen| seen.repo == refused.repo) {
+        self.note(&refused.repo, refused.reason, git.enforcing())
+    }
+
+    /// As [`Tally::refuses`], for a refusal a container told of.
+    fn note(&mut self, repo: &str, reason: git::Reason, enforcing: bool) -> bool {
+        if !self.refused.iter().any(|seen| seen.repo == repo) {
             self.refused.push(RefusedRepo {
-                repo: refused.repo,
-                reason: refused.reason,
+                repo: repo.to_string(),
+                reason,
             });
         }
-        self.left_out |= git.enforcing();
-        git.enforcing()
+        self.left_out |= enforcing;
+        enforcing
+    }
+
+    /// What a container's answer tells of every worktree in it, counted by
+    /// the one rule, GitHub asked here about the commits it names. Anything
+    /// it left out, could not read or was not let run git in, when
+    /// enforcing, makes the count not known.
+    fn of_answer(answer: &repos::answer::Answer, contained: &Contained) -> Tally {
+        let mut tally = Tally {
+            left_out: answer.left_out || answer.unreadable || !answer.complete,
+            ..Tally::default()
+        };
+        let enforcing = contained.enforcing();
+        for repo in &answer.repos {
+            if let Some(reason) = repo.refused {
+                tally.note(&repo.repo, reason, enforcing);
+            }
+        }
+        for worktree in answer.worktrees() {
+            if let Some(reason) = worktree.refused {
+                if tally.note(&worktree.repo, reason, enforcing) {
+                    continue;
+                }
+            }
+            let Some(facts) = &worktree.facts else {
+                tally.left_out = true;
+                continue;
+            };
+            let facts = facts.taken();
+            tally.add(Unsaved::verdict(&facts, || {
+                contained
+                    .host
+                    .merged_on_github(facts.slug.as_deref(), &facts.head)
+            }));
+        }
+        tally
     }
 
     /// The count, when nothing was left out of it.
@@ -117,7 +161,7 @@ impl Tally {
         (counted, self.refused)
     }
 
-    fn add(&mut self, unsaved: crate::workspace::Unsaved) {
+    fn add(&mut self, unsaved: Unsaved) {
         self.counted.uncommitted_repos += u64::from(unsaved.uncommitted);
         self.counted.unpushed_commits += u64::from(unsaved.unpushed);
     }
@@ -216,30 +260,8 @@ fn asks(state_dir: &Path) -> Vec<Ask> {
 
 /// A commit id as a manifest records one. It goes to git as an argument, so
 /// it has to be one.
-fn commit_id(text: &str) -> bool {
+pub(crate) fn commit_id(text: &str) -> bool {
     matches!(text.len(), 40 | 64) && text.bytes().all(|c| c.is_ascii_hexdigit())
-}
-
-/// The folders the box holds what it reads for an environment to, when a
-/// container can write there: the environment's own, resolved. Nothing for
-/// folders only the host writes, which are read as they are.
-fn held_to(settings: &Settings, environment: &Environment) -> Option<Vec<PathBuf>> {
-    housekeeping::contained(settings, environment).then(|| {
-        environment
-            .own_folders()
-            .iter()
-            .filter_map(|folder| folder.canonicalize().ok())
-            .collect()
-    })
-}
-
-/// Whether `path` is in one of the folders a read is `held` to. A path that
-/// cannot be resolved is in none of them.
-fn inside(held: Option<&[PathBuf]>, path: &Path) -> bool {
-    held.is_none_or(|folders| {
-        path.canonicalize()
-            .is_ok_and(|path| folders.iter().any(|folder| path.starts_with(folder)))
-    })
 }
 
 /// How many commits a session made in one repo: those on its branch since
@@ -257,6 +279,24 @@ fn commits_made(workspace: &Workspace, info: &RepoInfo) -> Option<u32> {
         .ok()
         .filter(|out| out.ok)?;
     made.stdout.parse().ok()
+}
+
+/// As [`open_pulls`], from what a container said of a worktree, GitHub
+/// asked here.
+fn open_pulls_of(host: &GitHub, facts: Option<&Facts>, made: Option<u32>) -> Option<Vec<String>> {
+    if made == Some(0) {
+        return Some(Vec::new());
+    }
+    let facts = facts?;
+    if !facts.on_remote {
+        return None;
+    }
+    github::open_pulls(
+        host.api(),
+        &github::remote_of(facts.slug.as_deref()),
+        &facts.head,
+        host.token_file(),
+    )
 }
 
 /// The open pull requests for one repo of a session, or nothing when that
@@ -301,6 +341,12 @@ pub struct Reporter {
     loaded: bool,
     /// A stand-in for GitHub on this machine, for tests.
     github: Option<String>,
+    /// How git is run inside a container; this program and the box's
+    /// `podman` unless told otherwise.
+    runner: Option<Runner>,
+    /// How long the host gives a container to answer, when not as long as
+    /// [`repos::CENSUS_LIMITS`] says.
+    census_limit: Option<Duration>,
 }
 
 impl Reporter {
@@ -311,13 +357,45 @@ impl Reporter {
         self
     }
 
-    fn workspace(&self, settings: &Settings, environment: &Environment) -> Workspace {
+    /// Run git inside a container with this program and this `podman`.
+    pub fn running_with(mut self, runner: Runner) -> Reporter {
+        self.runner = Some(runner);
+        self
+    }
+
+    /// Give a container this long to answer, and its call a little less.
+    pub fn waiting_at_most(mut self, outer: Duration) -> Reporter {
+        self.census_limit = Some(outer);
+        self
+    }
+
+    fn workspace(&self, settings: &Settings, environment: &Environment) -> repos::Nucleus {
         let workspace = housekeeping::workspace(settings, environment)
             .remembering_merges(housekeeping::merges_file(&settings.state_dir));
         match &self.github {
             Some(url) => workspace.asking_github_at(url),
             None => workspace,
         }
+    }
+
+    /// Read a nucleus a container writes, inside the container, or one of
+    /// its session folders, or a driver's worktrees in it.
+    fn census(
+        &self,
+        settings: &Settings,
+        contained: &Contained,
+        folder: Option<&str>,
+        driver: bool,
+    ) -> Result<repos::answer::Answer, driver::Condition> {
+        let runner = self.runner.clone().or_else(Runner::of_this_box);
+        let Some(runner) = runner else {
+            return Err(driver::Condition::Absent);
+        };
+        let inside = repos::Inside {
+            runner,
+            patience: self.census_limit,
+        };
+        contained.census(&inside, settings, folder, driver)
     }
 
     /// One look: report the outcomes that are due, then count unsaved work if
@@ -327,34 +405,17 @@ impl Reporter {
         self.count_if_due(settings, now);
     }
 
-    /// The unsaved work in one nucleus, or nothing when a worktree could not
-    /// be read, and the repos that were refused. When enforcing, git is not
-    /// run in a refused repo or a refused worktree of one, and the count is
-    /// then not known: a number that left them out would read as all there
-    /// is. The other repos are still looked at, for the refusals they hold.
-    fn count_nucleus(
-        &self,
-        settings: &Settings,
-        environment: &Environment,
-    ) -> (Option<Counted>, Vec<RefusedRepo>) {
+    /// The unsaved work in one nucleus on the host, or nothing when a
+    /// worktree could not be read, and the repos that were refused. When
+    /// enforcing, git is not run in a refused repo or a refused worktree of
+    /// one, and the count is then not known: a number that left them out
+    /// would read as all there is. The other repos are still looked at, for
+    /// the refusals they hold.
+    fn count_nucleus(&self, workspace: &Workspace) -> (Option<Counted>, Vec<RefusedRepo>) {
         let mut tally = Tally::default();
-        if !environment.root.is_dir() {
-            return (None, tally.refused);
-        }
-        let workspace = self
-            .workspace(settings, environment)
-            .leaving_alone(driver::protected_roots(settings));
         let git = workspace.git();
-        let held = held_to(settings, environment);
         let counted = (|| -> Option<()> {
             for item in workspace.available().ok()? {
-                // A container writes where its repos' worktrees are said to
-                // be: one said to be outside its folders is not looked at,
-                // and the count is not known without it.
-                if !inside(held.as_deref(), &item.bare) {
-                    tally.left_out = true;
-                    continue;
-                }
                 if tally.refuses(git, git.vet_bare(&item.bare)) {
                     continue;
                 }
@@ -364,10 +425,6 @@ impl Reporter {
                     // repos is counted here, the nucleus's own or not:
                     // counting only reads.
                     if !worktree.is_dir() || workspace.under_a_driver(&worktree) {
-                        continue;
-                    }
-                    if !inside(held.as_deref(), &worktree) {
-                        tally.left_out = true;
                         continue;
                     }
                     let refused = git.vet_tree(&worktree).map(|refused| git::Refused {
@@ -385,11 +442,54 @@ impl Reporter {
         tally.finish(counted)
     }
 
+    /// One nucleus: the unsaved work in it, the repos refused, and its
+    /// session folders. On the host, git is run here; for a nucleus a
+    /// container writes, the container is asked once, for all of it, and
+    /// nothing of it is known when it cannot be.
+    fn look_at_nucleus(
+        &self,
+        settings: &Settings,
+        environment: &Environment,
+        sharing: &[String],
+    ) -> (Option<Counted>, Vec<RefusedRepo>, Option<Vec<Worktree>>) {
+        if !environment.root.is_dir() {
+            return (None, Vec::new(), None);
+        }
+        let store = Store::new(&settings.state_dir);
+        let nucleus = self
+            .workspace(settings, environment)
+            .leaving_alone(driver::protected_roots(settings));
+        match nucleus {
+            repos::Nucleus::Host(workspace) => {
+                let (unsaved, refused) = self.count_nucleus(&workspace);
+                let folders = worktrees::report(&workspace, &store, sharing);
+                (unsaved, refused, Some(folders))
+            }
+            repos::Nucleus::Contained(contained) => match self
+                .census(settings, &contained, None, false)
+            {
+                Ok(answer) => {
+                    let (unsaved, refused) = Tally::of_answer(&answer, &contained).finish(Some(()));
+                    let folders = worktrees::report_answer(
+                        &answer,
+                        &contained.host,
+                        &store,
+                        sharing,
+                        &environment.root,
+                    );
+                    (unsaved, refused, Some(folders))
+                }
+                Err(_) => (None, Vec::new(), None),
+            },
+        }
+    }
+
     /// The unsaved work in the worktrees a driver owns, by the same rule as
     /// a nucleus's: the driver's adapter says where they are, and
-    /// [`Workspace::unsaved`] says what each holds. It only reads them.
-    /// Nothing when a folder cannot be read, or while the driver itself
-    /// lists a worktree that is in none of them.
+    /// [`Workspace::unsaved`] says what each holds. It only reads them; for
+    /// a driver in a container, inside the container. Nothing when a folder
+    /// cannot be read, or while the driver itself lists a worktree that is
+    /// in none of them.
     fn count_driver(
         &self,
         settings: &Settings,
@@ -397,9 +497,6 @@ impl Reporter {
     ) -> (Option<Counted>, Vec<RefusedRepo>) {
         let mut tally = Tally::default();
         let Some(adapter) = environment.driver_adapter() else {
-            return (None, tally.refused);
-        };
-        let Some(worktrees) = adapter.worktrees(environment) else {
             return (None, tally.refused);
         };
         // The driver's own last answer listed a worktree that looking in
@@ -411,17 +508,21 @@ impl Reporter {
         if left_out {
             return (None, tally.refused);
         }
-        let workspace = self.workspace(settings, environment);
+        let workspace = match self.workspace(settings, environment) {
+            repos::Nucleus::Host(workspace) => *workspace,
+            repos::Nucleus::Contained(contained) => {
+                return match self.census(settings, &contained, None, true) {
+                    Ok(answer) => Tally::of_answer(&answer, &contained).finish(Some(())),
+                    Err(_) => (None, tally.refused),
+                };
+            }
+        };
+        let Some(worktrees) = adapter.worktrees(environment) else {
+            return (None, tally.refused);
+        };
         let git = workspace.git();
-        let held = held_to(settings, environment);
         let counted = (|| -> Option<()> {
             for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
-                // In a container, a worktree is in the driver's own folders,
-                // not at the end of a link out of them.
-                if !inside(held.as_deref(), worktree) {
-                    tally.left_out = true;
-                    continue;
-                }
                 if tally.refuses(git, git.vet_tree(worktree)) {
                     continue;
                 }
@@ -454,14 +555,9 @@ impl Reporter {
         let nuclei = housekeeping::one_per_nucleus(settings)
             .into_iter()
             .map(|environment| {
-                let (unsaved, refused) = self.count_nucleus(settings, environment);
                 let sharing = housekeeping::sharing_nucleus(settings, environment);
-                let worktrees = environment.root.is_dir().then(|| {
-                    let workspace = self
-                        .workspace(settings, environment)
-                        .leaving_alone(driver::protected_roots(settings));
-                    worktrees::report(&workspace, &Store::new(&settings.state_dir), &sharing)
-                });
+                let (unsaved, refused, worktrees) =
+                    self.look_at_nucleus(settings, environment, &sharing);
                 Nucleus {
                     environments: sharing,
                     unsaved,
@@ -542,6 +638,12 @@ impl Reporter {
         let name = session.workspace.as_deref().filter(|name| {
             !name.is_empty() && !name.contains(['/', '\\']) && !matches!(*name, "." | "..")
         })?;
+        let workspace = match self.workspace(settings, environment) {
+            repos::Nucleus::Host(workspace) => *workspace,
+            repos::Nucleus::Contained(contained) => {
+                return self.outcome_of(settings, &contained, name, draft);
+            }
+        };
         let sessions = environment.root.join(".worktrees");
         // A nucleus that is not there, on a disk that is not mounted say,
         // tells nothing about what a session in it holds. Nor does a link
@@ -564,7 +666,6 @@ impl Reporter {
             Err(_) => return None,
         };
         let manifest = Workspace::load_manifest_in(&session, &folder).ok()?;
-        let workspace = self.workspace(settings, environment);
         // Git runs only in the worktrees the folder really holds: each a
         // folder directly in it, of the repo its manifest names, which has
         // it registered there. The session wrote the manifest.
@@ -604,6 +705,75 @@ impl Reporter {
             .map(|info| info.label.clone())
             .collect();
         draft.branch = Some(manifest.branch);
+        draft.commits = commits;
+        draft.uncommitted_repos = unsaved.map(|(uncommitted, _)| uncommitted);
+        draft.unpushed_commits = unsaved.map(|(_, unpushed)| unpushed);
+        draft.pull_requests = pulls;
+        Some(draft)
+    }
+
+    /// What a session in a folder a container writes left behind: the
+    /// container reads the folder, and GitHub is asked here. Nothing when
+    /// the container cannot be asked, or cannot read the folder; none left
+    /// when it says the folder is gone.
+    fn outcome_of(
+        &self,
+        settings: &Settings,
+        contained: &Contained,
+        name: &str,
+        mut draft: Draft,
+    ) -> Option<Draft> {
+        if !worktrees::valid_folder(name) {
+            return None;
+        }
+        let answer = self.census(settings, contained, Some(name), false).ok()?;
+        let folder = answer.folders.into_iter().next()?;
+        if folder.gone {
+            draft.uncommitted_repos = Some(0);
+            draft.unpushed_commits = Some(0);
+            return Some(draft);
+        }
+        if folder.unreadable {
+            return None;
+        }
+        let host = &contained.host;
+        let mut commits = Some(0u32);
+        let mut unsaved = Some((0u32, 0u32));
+        let mut pulls = Some(Vec::new());
+        // The session's own worktrees, as its manifest lists them; its
+        // subagents' are not its outcome.
+        let own = folder.worktrees.iter().filter(|worktree| {
+            worktree
+                .key
+                .as_deref()
+                .is_some_and(|key| !key.starts_with(SUBWORKTREES))
+        });
+        for worktree in own {
+            let facts = worktree.facts.as_ref().map(|facts| facts.taken());
+            let made = worktree.commits.filter(|_| facts.is_some());
+            commits = commits
+                .zip(made)
+                .map(|(sum, made)| sum.saturating_add(made));
+            let repo = facts.as_ref().map(|facts| {
+                Unsaved::verdict(facts, || {
+                    host.merged_on_github(facts.slug.as_deref(), &facts.head)
+                })
+            });
+            unsaved = unsaved.zip(repo).map(|((uncommitted, unpushed), repo)| {
+                (
+                    uncommitted + u32::from(repo.uncommitted),
+                    unpushed.saturating_add(repo.unpushed),
+                )
+            });
+            pulls = pulls.zip(open_pulls_of(host, facts.as_ref(), made)).map(
+                |(mut all, more): (Vec<String>, _)| {
+                    all.extend(more);
+                    all
+                },
+            );
+        }
+        draft.repos = folder.labels;
+        draft.branch = folder.branch;
         draft.commits = commits;
         draft.uncommitted_repos = unsaved.map(|(uncommitted, _)| uncommitted);
         draft.unpushed_commits = unsaved.map(|(_, unpushed)| unpushed);
