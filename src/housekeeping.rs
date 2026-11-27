@@ -1142,11 +1142,22 @@ pub(crate) fn wip_commit(
         Vec::new()
     };
     let message = format!("wip snapshot {} {branch}", rfc3339(now));
-    let (ok, commit, error) = git.tree_raw(
-        worktree,
-        &["commit-tree", tree, "-p", "HEAD", "-m", &message],
-        &identity,
-    )?;
+    // Signed as the box signs its commits, where it does: `commit-tree`
+    // reads no `commit.gpgsign` of its own.
+    let set = |key: &str| {
+        git.try_tree(worktree, &["config", key])
+            .is_ok_and(|out| out.ok && !out.stdout.is_empty())
+    };
+    let signs = git
+        .try_tree(worktree, &["config", "--bool", "commit.gpgsign"])
+        .is_ok_and(|out| out.ok && out.stdout == "true")
+        && set("user.signingkey");
+    let mut args = vec!["commit-tree"];
+    if signs {
+        args.push("-S");
+    }
+    args.extend([tree, "-p", "HEAD", "-m", &message]);
+    let (ok, commit, error) = git.tree_raw(worktree, &args, &identity)?;
     if !ok {
         bail!("git commit-tree failed: {error}");
     }

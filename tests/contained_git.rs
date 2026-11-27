@@ -2573,3 +2573,95 @@ fn backups_pushed_before_one_failed_are_said() {
     );
     assert!(two.is_dir());
 }
+
+/// Have the box sign its commits with an ssh key of its own, in its
+/// global git config. Returns the allowed-signers file that checks them.
+fn signing(rig: &Rig) -> PathBuf {
+    let dir = rig.home.dir.join("signing");
+    fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("key");
+    let made = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "ssh-keygen did not make a key");
+    let public = fs::read_to_string(dir.join("key.pub")).unwrap();
+    let signers = dir.join("signers");
+    fs::write(&signers, format!("box@example.com {}", public.trim())).unwrap();
+    fs::write(
+        rig.home.gitconfig(),
+        format!(
+            "[gpg]\n\tformat = ssh\n[user]\n\tsigningkey = {}\n[commit]\n\tgpgsign = true\n",
+            key.display()
+        ),
+    )
+    .unwrap();
+    signers
+}
+
+/// Whether the commit `reference` names in the upstream is signed by the
+/// key `signers` allows.
+fn signed_by(rig: &Rig, reference: &str, signers: Option<&Path>) -> bool {
+    let commit = git(&rig.upstream, &["cat-file", "commit", reference]);
+    let Some(signers) = signers else {
+        return commit.contains("gpgsig ");
+    };
+    let checked = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.upstream)
+        .args(["-c", "gpg.format=ssh"])
+        .arg("-c")
+        .arg(format!("gpg.ssh.allowedSignersFile={}", signers.display()))
+        .args(["verify-commit", reference])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    commit.contains("gpgsig ") && checked.status.success()
+}
+
+#[test]
+fn a_snapshot_is_signed_where_the_box_signs_its_commits_and_not_where_it_does_not() {
+    // On the host.
+    let rig = Rig::new();
+    with_work(&rig, "fix-login");
+    let out = run(
+        rig.nucleated().args(["housekeeping", "run", "snapshot"]),
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!signed_by(&rig, "refs/wip/workspace-fix-login", None));
+    let signers = signing(&rig);
+    fs::write(rig.root.join(".worktrees/fix-login/web/more.txt"), "more\n").unwrap();
+    age(&rig.root.join(".worktrees/fix-login/web/more.txt"));
+    let out = run(
+        rig.nucleated().args(["housekeeping", "run", "snapshot"]),
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout_json(&out)[0]["worktrees"][0]["action"], "snapshot");
+    assert!(signed_by(
+        &rig,
+        "refs/wip/workspace-fix-login",
+        Some(&signers)
+    ));
+
+    // Inside a container.
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let signers = signing(rig);
+    with_work(rig, "fix-login");
+    let out = boxed.job("snapshot", &[], None);
+    assert_eq!(
+        stdout_json(&out)[0]["worktrees"][0]["action"],
+        "snapshot",
+        "{}",
+        stderr(&out)
+    );
+    assert!(signed_by(
+        rig,
+        "refs/wip/workspace-fix-login",
+        Some(&signers)
+    ));
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
