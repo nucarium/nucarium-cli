@@ -1387,6 +1387,10 @@ fn run_contained(
             let Some(removal) = answer.removals.first() else {
                 return cleaned_ended(&Cleaned::NotStarted, true);
             };
+            let kept = removal.outcome == repos::answer::Outcome::Kept;
+            if let Some(refused) = refused_for(removal.why).filter(|_| kept) {
+                return refused;
+            }
             cleaned_ended(&cleaned_of(removal), true)
         }
     }
