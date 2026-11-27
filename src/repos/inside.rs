@@ -1014,19 +1014,19 @@ fn remove(
         (false, false, false) => Stage::All,
         _ => return Condition::BadReply,
     };
+    // The root as the box's processes see it, resolved once: a process's
+    // working folder is always resolved.
+    let root = environment.root.canonicalize().ok();
     for (name, expect) in asked.folders.iter().zip(asked.expect) {
         if time_is_up() {
             return Condition::Ok;
         }
-        let removal = remove_one(
-            &workspace,
+        let place = Place {
             environment,
+            root: root.as_deref(),
             name,
-            expect,
-            discard,
-            stage,
-            &scratch.0,
-        );
+        };
+        let removal = remove_one(&workspace, &place, expect, discard, stage, &scratch.0);
         let Some(removal) = removal else {
             // Its removal was not started: the time was up.
             release();
@@ -1069,15 +1069,23 @@ fn backups(full: &[Backed]) -> Vec<Backup> {
         .collect()
 }
 
+/// The folder a removal is of: its environment, the environment's root
+/// resolved, and its name.
+struct Place<'a> {
+    environment: &'a Environment,
+    root: Option<&'a Path>,
+    name: &'a str,
+}
+
 fn remove_one(
     workspace: &Workspace,
-    environment: &Environment,
-    name: &str,
+    place: &Place,
     expect: &str,
     discard: Option<&str>,
     stage: Stage,
     keys: &Path,
 ) -> Option<Removal> {
+    let (environment, name) = (place.environment, place.name);
     let came = |outcome, why| Removal {
         folder: name.to_string(),
         outcome,
@@ -1114,7 +1122,12 @@ fn remove_one(
     }
     // A process in the container working in it, or a container that cannot
     // say, keeps it.
-    let in_use = || housekeeping::in_use(&path) != Some(false);
+    let resolved = place.root.map(|root| root.join(".worktrees").join(name));
+    let in_use = || {
+        resolved
+            .as_deref()
+            .is_none_or(|resolved| housekeeping::in_use(resolved) != Some(false))
+    };
     if in_use() {
         return Some(came(Outcome::Kept, Some(Word::InUse)));
     }
