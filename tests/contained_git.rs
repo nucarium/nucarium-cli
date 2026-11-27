@@ -1337,6 +1337,17 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
     );
     let error = job_inside(&boxed, Job::Refresh, None).unwrap_err();
     assert!(format!("{error:#}").contains("took too long"), "{error:#}");
+    // As when it could not read, or did not look at, some of the nucleus.
+    for flag in ["unreadable", "left_out"] {
+        let mut answer = write_answer("refresh", "ok", "fetched", fetched("web"));
+        answer[flag] = json!(true);
+        answers(rig, "refresh", &answer);
+        let error = job_inside(&boxed, Job::Refresh, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not read all"),
+            "{flag}: {error:#}"
+        );
+    }
 
     let tree = "0123456789abcdef0123456789abcdef01234567";
     let snapshot = |reference: &str| {
@@ -1394,6 +1405,25 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
     assert!(job_inside(&boxed, Job::Snapshot, None).is_err());
     let kept = fs::read_to_string(keys.join("web-workspace-fix-login")).unwrap();
     assert_eq!(kept.trim(), tree);
+    // One that could not read, or did not look at, some of the nucleus is
+    // recorded for what it did, and the run is not good.
+    for flag in ["unreadable", "left_out"] {
+        fs::remove_dir_all(&keys).unwrap();
+        let mut answer = write_answer(
+            "snapshot",
+            "ok",
+            "snapshots",
+            snapshot("refs/wip/workspace-fix-login"),
+        );
+        answer[flag] = json!(true);
+        answers(rig, "snapshot", &answer);
+        let error = job_inside(&boxed, Job::Snapshot, None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not read all"),
+            "{flag}: {error:#}"
+        );
+        assert!(keys.join("web-workspace-fix-login").is_file(), "{flag}");
+    }
     assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
 }
 

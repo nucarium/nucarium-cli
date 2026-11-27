@@ -216,6 +216,21 @@ pub fn run_job_with(
 /// What a job for a container says when the container did not finish in
 /// its time: what it did not list was not done.
 const TOO_LONG: &str = "The environment took too long, so the rest was not done.";
+/// What it says when the container could not read, or did not look at,
+/// some of the nucleus: what it did not list was not done.
+const NOT_ALL: &str = "The environment could not read all of its repos, so the rest was not done.";
+
+/// A write's answer that did not reach everything it was asked to: an
+/// error, once what it did do has been recorded, so the run is not good.
+fn all_done(answer: &repos::answer::Answer) -> Result<()> {
+    if !answer.complete {
+        bail!("{TOO_LONG}");
+    }
+    if answer.unreadable || answer.left_out {
+        bail!("{NOT_ALL}");
+    }
+    Ok(())
+}
 
 /// Run one job for an environment whose nucleus a container writes. Git
 /// runs only inside the container; what the host decides, it decides from
@@ -243,9 +258,7 @@ fn run_contained(
             } else if answer.moved > 0 {
                 report["moved"] = json!(answer.moved);
             }
-            if !answer.complete {
-                bail!("{TOO_LONG}");
-            }
+            all_done(&answer)?;
             report
         }
         Job::Snapshot => {
@@ -254,9 +267,7 @@ fn run_contained(
                 .snapshot(inside, settings, dry_run, &pushed_trees(&keys))
                 .map_err(not_known)?;
             let report = json!({ "worktrees": snapshot_report(&answer, &keys)? });
-            if !answer.complete {
-                bail!("{TOO_LONG}");
-            }
+            all_done(&answer)?;
             report
         }
         Job::Cleanup => {
