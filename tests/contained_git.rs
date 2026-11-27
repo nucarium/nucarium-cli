@@ -1026,10 +1026,13 @@ fn age(path: &Path) {
 /// The tree the host has recorded as snapshotted for `name`,
 /// `<repo>-<branch>`.
 fn recorded(rig: &Rig, name: &str) -> Option<String> {
-    let file = rig.home.state_dir().join("snapshots/client-a.json");
+    let file = rig
+        .home
+        .state_dir()
+        .join("snapshots-contained/client-a.json");
     let text = fs::read_to_string(file).ok()?;
     let recorded: Value = serde_json::from_str(&text).unwrap();
-    recorded[name].as_str().map(str::to_string)
+    recorded[name]["tree"].as_str().map(str::to_string)
 }
 
 /// A session whose worktree holds a file not committed that a snapshot
@@ -1121,10 +1124,37 @@ fn a_snapshot_is_pushed_from_inside_and_what_the_host_recorded_is_not_pushed_aga
     assert_eq!(report["worktrees"][0]["reason"], "already snapshotted");
     assert_eq!(boxed.host_git(), Vec::<String>::new());
 
-    // The record is one file, and it does not grow without end.
-    let file = rig.home.state_dir().join("snapshots/client-a.json");
+    // The record is one file of its own, and a full one reads back whole:
+    // the work recorded among four thousand others is not pushed again.
+    let file = rig
+        .home
+        .state_dir()
+        .join("snapshots-contained/client-a.json");
+    assert!(!rig.home.state_dir().join("snapshots/client-a").exists());
+    let long = "x".repeat(193);
+    let mut full: serde_json::Map<String, Value> = (0..4_095)
+        .map(|n| {
+            let name = format!("{long}-{n:05}");
+            (name, json!({ "tree": pushed.clone(), "at_ms": n + 1 }))
+        })
+        .collect();
+    full.insert(
+        "web-workspace-fix-login".into(),
+        json!({ "tree": pushed.clone(), "at_ms": 1_000_000 }),
+    );
+    fs::write(&file, Value::Object(full).to_string()).unwrap();
+    let out = boxed.job("snapshot", &[], None);
+    assert_eq!(
+        stdout_json(&out)[0]["worktrees"][0]["reason"],
+        "already snapshotted"
+    );
+
+    // It does not grow without end: the oldest go first.
     let many: serde_json::Map<String, Value> = (0..5_000)
-        .map(|n| (format!("old-{n:05}"), json!(pushed.clone())))
+        .map(|n| {
+            let name = format!("old-{n:05}");
+            (name, json!({ "tree": pushed.clone(), "at_ms": 5_000 - n }))
+        })
         .collect();
     fs::write(&file, Value::Object(many).to_string()).unwrap();
     fs::write(rig.root.join(".worktrees/fix-login/web/more.txt"), "more\n").unwrap();
@@ -1133,8 +1163,11 @@ fn a_snapshot_is_pushed_from_inside_and_what_the_host_recorded_is_not_pushed_aga
     assert_eq!(stdout_json(&out)[0]["worktrees"][0]["action"], "snapshot");
     let kept: serde_json::Map<String, Value> =
         serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert!(kept.len() <= 4096, "{}", kept.len());
+    assert_eq!(kept.len(), 4096);
     assert!(kept.contains_key("web-workspace-fix-login"));
+    // The newest of the old ones are the ones kept: the lowest numbers.
+    assert!(kept.contains_key("old-00000"));
+    assert!(!kept.contains_key("old-04999"));
 }
 
 #[test]
@@ -1490,7 +1523,10 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
     let boxed = boxed();
     let rig = &boxed.rig;
     with_work(rig, "fix-login");
-    let keys = rig.home.state_dir().join("snapshots/client-a.json");
+    let keys = rig
+        .home
+        .state_dir()
+        .join("snapshots-contained/client-a.json");
     let fetched = |repo: &str| json!([{ "repo": repo, "ok": true }]);
     for (what, answer) in [
         (

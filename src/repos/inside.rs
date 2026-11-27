@@ -16,13 +16,13 @@
 //! [`crate::driver::cut_off`]).
 
 use super::answer::{
-    valid_label, valid_name, valid_record, valid_wip_ref, Answer, Backup, Facts, Fetched, Folder,
-    Holding, Op, Outcome, Pushed, Removal, Repo, SnapAction, Snapshot, Word, Worktree, MAX_ANSWER,
-    MAX_COUNT, MAX_FOLDERS, MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
+    valid_label, valid_name, valid_wip_ref, Answer, Backup, Facts, Fetched, Folder, Holding, Op,
+    Outcome, Pushed, Removal, Repo, SnapAction, Snapshot, Word, Worktree, MAX_ANSWER, MAX_COUNT,
+    MAX_FOLDERS, MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
 };
 use super::transfer;
 use crate::driver::{self, Condition};
-use crate::envelope::{unix_ms, valid_branch};
+use crate::envelope::{unix_ms, valid_branch, valid_folder_number};
 use crate::housekeeping::Snapped;
 use crate::reporter::commit_id;
 use crate::settings::{self, Environment, Settings};
@@ -767,16 +767,18 @@ fn snapshot(
     let Some(scratch) = Scratch::new() else {
         return Condition::Error;
     };
-    // What the host recorded as pushed, by repo and branch.
+    // What the host recorded as pushed, by a number made from repo and
+    // branch: small enough that thousands fit on a command line.
     let pushed: std::collections::BTreeMap<&str, &str> = pushed
         .iter()
-        .filter_map(|pair| pair.rsplit_once('='))
-        .filter(|(name, tree)| valid_record(name) && commit_id(tree))
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(number, tree)| valid_folder_number(number) && commit_id(tree))
         .collect();
     let repo_now = std::cell::RefCell::new(String::new());
     let already = |branch: &str, tree: &str| {
         let name = format!("{}-{}", repo_now.borrow(), branch.replace('/', "-"));
-        pushed.get(name.as_str()) == Some(&tree)
+        let number = format!("{:016x}", driver::fnv(name.as_bytes()));
+        pushed.get(number.as_str()) == Some(&tree)
     };
     let how = housekeeping::Snapping {
         index_dir: &scratch.0,

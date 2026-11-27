@@ -256,7 +256,7 @@ impl Contained {
 
     /// Push what each worktree has not committed to its hidden ref, but not
     /// a tree `pushed` records as pushed already for that repo and branch:
-    /// `<repo>-<branch>=<tree>`.
+    /// `<number of repo-branch>=<tree>`.
     pub fn snapshot(
         &self,
         inside: &Inside,

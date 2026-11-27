@@ -262,10 +262,7 @@ fn run_contained(
             report
         }
         Job::Snapshot => {
-            let file = settings
-                .state_dir
-                .join("snapshots")
-                .join(format!("{}.json", environment.name));
+            let file = recorded_file(&settings.state_dir, &environment.name);
             let answer = contained
                 .snapshot(inside, settings, dry_run, &pushed_pairs(&recorded(&file)))
                 .map_err(not_known)?;
@@ -387,27 +384,61 @@ fn fetched_report(answer: &repos::answer::Answer) -> Vec<Value> {
 /// The most snapshots recorded for one environment in a container.
 const MAX_RECORDED: usize = repos::answer::MAX_WORKTREES;
 
+/// The most a record file of [`MAX_RECORDED`] entries can be: each is a
+/// name of at most 200 bytes, a tree of at most 64 and a time.
+const MAX_RECORD_FILE: u64 = MAX_RECORDED as u64 * 512;
+
+/// Where the host records the snapshots of an environment in a container:
+/// a folder of their own, beside no host environment's keys.
+pub(crate) fn recorded_file(state_dir: &Path, environment: &str) -> PathBuf {
+    state_dir
+        .join("snapshots-contained")
+        .join(format!("{environment}.json"))
+}
+
+/// One snapshot recorded: the tree pushed, and when, in Unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Recorded {
+    tree: String,
+    at_ms: u64,
+}
+
 /// What the host has recorded as snapshotted for an environment in a
-/// container: one small file, `<repo>-<branch>` to the tree pushed, held to
-/// [`MAX_RECORDED`].
-fn recorded(file: &Path) -> BTreeMap<String, String> {
-    let mut recorded: BTreeMap<String, String> = paths::read_plain(file, 1024 * 1024)
+/// container: one small file, `<repo>-<branch>` to the tree pushed and
+/// when, held to [`MAX_RECORDED`] by dropping the oldest.
+fn recorded(file: &Path) -> BTreeMap<String, Recorded> {
+    let mut recorded: BTreeMap<String, Recorded> = paths::read_plain(file, MAX_RECORD_FILE)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
-    recorded
-        .retain(|name, tree| repos::answer::valid_record(name) && crate::reporter::commit_id(tree));
-    while recorded.len() > MAX_RECORDED {
-        recorded.pop_first();
-    }
+    recorded.retain(|name, kept| {
+        repos::answer::valid_record(name) && crate::reporter::commit_id(&kept.tree)
+    });
+    keep_newest(&mut recorded);
     recorded
 }
 
-/// What the container is told of them: `<repo>-<branch>=<tree>`.
-fn pushed_pairs(recorded: &BTreeMap<String, String>) -> Vec<String> {
+/// Drop the oldest records until at most [`MAX_RECORDED`] are left.
+fn keep_newest(recorded: &mut BTreeMap<String, Recorded>) {
+    while recorded.len() > MAX_RECORDED {
+        let oldest = recorded
+            .iter()
+            .min_by_key(|(name, kept)| (kept.at_ms, (*name).clone()))
+            .map(|(name, _)| name.clone());
+        match oldest {
+            Some(name) => recorded.remove(&name),
+            None => break,
+        };
+    }
+}
+
+/// What the container is told of them: a number made from
+/// `<repo>-<branch>`, and the tree. A full record's names would not fit on
+/// a command line.
+fn pushed_pairs(recorded: &BTreeMap<String, Recorded>) -> Vec<String> {
     recorded
         .iter()
-        .map(|(name, tree)| format!("{name}={tree}"))
+        .map(|(name, kept)| format!("{:016x}={}", driver::fnv(name.as_bytes()), kept.tree))
         .collect()
 }
 
@@ -449,16 +480,18 @@ fn snapshot_report(answer: &repos::answer::Answer, file: &Path) -> Result<Vec<Va
             // but letters, digits and `._-`.
             let name = format!("{}-{}", snapped.repo, dashed(&snapped.branch));
             if repos::answer::valid_record(&name) {
-                record.insert(name, tree.clone());
+                let kept = Recorded {
+                    tree: tree.clone(),
+                    at_ms: unix_ms(SystemTime::now()),
+                };
+                record.insert(name, kept);
                 changed = true;
             }
         }
         report.push(entry);
     }
     if changed {
-        while record.len() > MAX_RECORDED {
-            record.pop_first();
-        }
+        keep_newest(&mut record);
         paths::write_private(file, serde_json::to_string(&record)?.as_bytes())?;
     }
     Ok(report)
