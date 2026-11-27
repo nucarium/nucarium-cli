@@ -1,8 +1,10 @@
-//! What the reporter reads on the host for an environment in a container,
-//! where the container writes: the session folders and manifests behind an
-//! outcome, the worktrees a nucleus's repos list, and the worktrees a driver
-//! keeps. Links, files too big to be manifests, and paths out of the
-//! container's folders are not followed, and git is not run there.
+//! What the reporter learns of an environment in a container, where the
+//! container writes: the session folders and manifests behind an outcome,
+//! the worktrees a nucleus's repos list, and the worktrees a driver keeps.
+//! The host runs no git for any of it: `nucleated repos` reads it inside the
+//! container, and the host uses its answer. Links, files too big to be
+//! manifests, and paths out of the container's folders are not followed in
+//! there either.
 
 mod common;
 
@@ -53,10 +55,26 @@ fn stopped_in(rig: &Rig, workspace: &str) -> nucleate::sessions::Session {
     session
 }
 
+/// The reporter as the daemon has it, its git for a container run inside
+/// the container: through the stand-in `podman`, by the box's own
+/// `nucleated repos`.
+fn reporter(rig: &Rig) -> Reporter {
+    Reporter::default().running_with(rig.looker())
+}
+
+/// Whether the reporter asked inside `client-a`'s container, and for what.
+fn asked_inside(rig: &Rig, what: &str) -> bool {
+    rig.podman_calls().iter().any(|call| {
+        call.starts_with("exec agent-env-client-a ")
+            && call.contains(" repos --env client-a ")
+            && call.contains(what)
+    })
+}
+
 fn outcome(rig: &Rig, session: &nucleate::sessions::Session) -> Option<Draft> {
     let settings = rig.settings();
     let environment = settings.environment("client-a").unwrap();
-    Reporter::default().outcome(&settings, environment, session)
+    reporter(rig).outcome(&settings, environment, session)
 }
 
 /// Move a session folder out of the nucleus, as another environment's.
@@ -76,6 +94,8 @@ fn an_outcome_reads_a_session_folder_of_the_nucleus_itself() {
     let told = outcome(&rig, &session).unwrap();
     assert_eq!(told.branch.as_deref(), Some("workspace/fix-login"));
     assert_eq!(told.uncommitted_repos, Some(1));
+    assert!(asked_inside(&rig, "--do census"));
+    assert!(asked_inside(&rig, "--folder fix-login"));
 }
 
 #[test]
@@ -167,7 +187,7 @@ fn worktree_at(rig: &Rig, path: &Path) {
 }
 
 fn uncommitted(rig: &Rig) -> Option<u64> {
-    let counts = Reporter::default().count(&rig.settings(), SystemTime::now());
+    let counts = reporter(rig).count(&rig.settings(), SystemTime::now());
     counts
         .nucleus("client-a")
         .unwrap()
@@ -181,6 +201,7 @@ fn a_container_nucleus_counts_no_worktree_its_repos_say_is_outside_it() {
     let inside = rig.session("fix-login");
     fs::write(inside.join("notes.txt"), "not committed\n").unwrap();
     assert_eq!(uncommitted(&rig), Some(1));
+    assert!(asked_inside(&rig, "--do census"));
     // The container can write where its repos say their worktrees are.
     worktree_at(&rig, &rig.home.dir.join("workspace-other").join("wt"));
     assert_eq!(uncommitted(&rig), None);
@@ -207,7 +228,7 @@ fn a_container_drivers_worktree_whose_git_is_outside_the_container_is_not_counte
         rig.home.dir.join("orca-data").display(),
     ));
     let driver = |rig: &Rig| {
-        let counts = Reporter::default().count(&rig.settings(), SystemTime::now());
+        let counts = reporter(rig).count(&rig.settings(), SystemTime::now());
         counts
             .nucleus("orca")
             .unwrap()
@@ -240,6 +261,10 @@ fn a_container_drivers_worktree_whose_git_is_outside_the_container_is_not_counte
     );
     fs::write(task.join("notes.txt"), "not committed\n").unwrap();
     assert_eq!(driver(&rig), Some(1));
+    assert!(rig
+        .podman_calls()
+        .iter()
+        .any(|call| call.contains(" repos --env orca ") && call.ends_with(" --driver")));
 
     // A worktree there whose git is somewhere the container does not have.
     let theirs = rig.home.dir.join("workspace-other").join("web");

@@ -18,6 +18,7 @@ use crate::health;
 use crate::notifier::{Notifier, Waiting};
 use crate::process::{self, Identity};
 use crate::reporter::{self, Counts};
+use crate::repos::Nucleus;
 use crate::sessions::{self, Status, Store};
 use crate::settings::{self, Environment, Settings, Target};
 use crate::spool::{self, Record, Spool, Unread};
@@ -1263,7 +1264,9 @@ fn move_to_owner_folders(settings: &Settings) {
         {
             continue;
         }
-        let workspace = housekeeping::workspace(settings, environment);
+        let Nucleus::Host(workspace) = housekeeping::workspace(settings, environment) else {
+            continue;
+        };
         match workspace.move_to_owner_folders() {
             Ok(moved) => {
                 for line in moved.lines() {

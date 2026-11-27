@@ -11,13 +11,14 @@
 //! of its own on top; it never takes a shortcut around it.
 
 use crate::config;
-use crate::driver;
+use crate::driver::{self, Condition};
 use crate::envelope::{rfc3339, unix_ms};
 use crate::git;
 use crate::paths;
+use crate::repos::{self, could_not_know, Contained, Nucleus, CENSUS_LIMITS, NOT_YET};
 use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::{RepoInfo, Workspace};
+use crate::workspace::{RepoInfo, Unsaved, Workspace};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -78,14 +79,31 @@ pub(crate) fn sharing_nucleus(settings: &Settings, environment: &Environment) ->
         .collect()
 }
 
+/// The container git for an environment's repositories runs in, and the
+/// environment it runs for there: its own, or, for an environment on the
+/// host that shares its nucleus with one in a container, the first such.
+/// Nothing when no container can write its nucleus.
+pub(crate) fn container_of(
+    settings: &Settings,
+    environment: &Environment,
+) -> Option<(String, String)> {
+    if let Some(container) = environment.container() {
+        return Some((container.to_string(), environment.name.clone()));
+    }
+    sharing_nucleus(settings, environment)
+        .iter()
+        .filter_map(|name| settings.environment(name))
+        .find_map(|other| {
+            other
+                .container()
+                .map(|container| (container.to_string(), other.name.clone()))
+        })
+}
+
 /// Whether a container can write this environment's nucleus: it runs in
 /// one, or shares its nucleus with one that does.
 pub(crate) fn contained(settings: &Settings, environment: &Environment) -> bool {
-    environment.container().is_some()
-        || sharing_nucleus(settings, environment)
-            .iter()
-            .filter_map(|name| settings.environment(name))
-            .any(|other| other.container().is_some())
+    container_of(settings, environment).is_some()
 }
 
 /// One environment per nucleus: where two logins share a nucleus, a job over
@@ -107,13 +125,46 @@ pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
     chosen
 }
 
-/// The workspace of one environment as the daemon sees it: git is run
-/// guarded, in repositories it has vetted. A nucleus's repositories must keep
-/// their git data in its `.repos`; a driver's are wherever the owner keeps
-/// them, and only their config is held to the allowlist.
-pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Workspace {
+/// The repositories of one environment as the daemon may get at them: on
+/// the host, git run guarded; or, where a container can write them, only
+/// through that container (see [`crate::repos`]), and never on the host.
+pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Nucleus {
+    match container_of(settings, environment) {
+        Some((container, env)) => Nucleus::Contained(Contained {
+            container,
+            env,
+            vetting: settings.git_vetting,
+            host: Workspace::new(config_of(environment)).guarded(git::Git::Elsewhere),
+        }),
+        None => Nucleus::Host(guarded(settings, environment, false)),
+    }
+}
+
+/// The workspace of an environment as `nucleated repos` sees it, inside
+/// the environment's container: git run guarded, as the daemon runs it on
+/// the host, and stopped with the call when its time is up.
+pub(crate) fn workspace_inside(settings: &Settings, environment: &Environment) -> Workspace {
+    guarded(settings, environment, true)
+}
+
+fn config_of(environment: &Environment) -> config::Config {
+    config::for_root(
+        &environment.root,
+        environment.github_token_file.clone(),
+        environment.branch_prefix.clone(),
+    )
+}
+
+/// The workspace of one environment where git is run guarded, in
+/// repositories vetted first. A nucleus's repositories must keep their git
+/// data in its `.repos`; a driver's are wherever the owner keeps them, and
+/// only their config is held to the allowlist.
+fn guarded(settings: &Settings, environment: &Environment, stopped_with_caller: bool) -> Workspace {
     let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
     let mut guarded = git::Guarded::new(repos, settings.git_vetting);
+    if stopped_with_caller {
+        guarded = guarded.stopped_with_caller();
+    }
     // A driver in a container chooses its worktrees' repositories, but only
     // among the folders of the environments in that container, which is all
     // of the box it can see: the box holds them there.
@@ -129,12 +180,7 @@ pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Works
             .collect();
         guarded = guarded.held_to(&folders);
     }
-    Workspace::new(config::for_root(
-        &environment.root,
-        environment.github_token_file.clone(),
-        environment.branch_prefix.clone(),
-    ))
-    .guarded(git::Git::Guarded(guarded))
+    Workspace::new(config_of(environment)).guarded(git::Git::Guarded(guarded))
 }
 
 /// Where GitHub's answers about merged commits are remembered, for cleanup
@@ -165,16 +211,20 @@ pub fn run_job(
         bail!("{} is not a folder", environment.root.display());
     }
     // And no job reaches into a driver's folders from a nucleus beside them.
-    let workspace = workspace(settings, environment)
+    let nucleus = workspace(settings, environment)
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(merges_file(&settings.state_dir));
+    let workspace = match nucleus {
+        Nucleus::Host(workspace) => workspace,
+        Nucleus::Contained(contained) => {
+            return run_contained(settings, environment, &contained, job, dry_run)
+        }
+    };
     let mut report = match job {
         Job::Refresh => {
             // A nucleus made before owner folders moves to them first.
             // One that fails says so, and the repos are fetched as they are.
-            // Not one a container writes: the move has git repair its
-            // repos' worktrees, which a session can point anywhere.
-            let moved = match dry_run || contained(settings, environment) {
+            let moved = match dry_run {
                 true => Vec::new(),
                 false => match workspace.move_to_owner_folders() {
                     Ok(moved) => moved.lines(),
@@ -201,6 +251,145 @@ pub fn run_job(
     report["environment"] = json!(environment.name);
     report["dry_run"] = json!(dry_run);
     Ok(report)
+}
+
+/// Run one job for an environment whose nucleus a container writes. Git
+/// runs only inside the container; what the host decides, it decides from
+/// the container's answer, its own store and `/proc`, and what GitHub says.
+/// The report names folders and fixed words, never a path or git's own.
+fn run_contained(
+    settings: &Settings,
+    environment: &Environment,
+    contained: &Contained,
+    job: Job,
+    dry_run: bool,
+) -> Result<Value> {
+    let mut report = match job {
+        // PART 2: refresh and snapshot inside the container (`nucleated
+        // repos --do refresh|snapshot`). Until then nothing is done, and
+        // never on the host.
+        Job::Refresh | Job::Snapshot => bail!("{}: {NOT_YET}", job.name()),
+        Job::Cleanup => {
+            let runner = driver::Runner::of_this_box()
+                .ok_or_else(|| anyhow!("{}", could_not_know(Condition::Absent)))?;
+            let census = contained
+                .census(&runner, settings, None, false, CENSUS_LIMITS)
+                .map_err(|condition| anyhow!("{}", could_not_know(condition)))?;
+            let store = Store::new(&settings.state_dir);
+            let sharing = sharing_nucleus(settings, environment);
+            let sessions = environment.root.join(".worktrees");
+            let min_age = settings.housekeeping.cleanup_min_age;
+            let mut report = Vec::new();
+            for folder in census.folders.iter().filter(|folder| !folder.gone) {
+                let kept =
+                    keep_reason_contained(contained, &sharing, &store, &sessions, folder, min_age);
+                let mut entry = json!({ "session": folder.folder });
+                match kept {
+                    Some(reason) => {
+                        entry["action"] = json!("kept");
+                        entry["reason"] = json!(reason);
+                    }
+                    None if dry_run => entry["action"] = json!("would_remove"),
+                    // PART 2: the removal itself, inside the container
+                    // (`nucleated repos --do remove`). Nothing is removed
+                    // until then, and never from the host.
+                    None => {
+                        entry["action"] = json!("failed");
+                        entry["reason"] = json!(NOT_YET);
+                    }
+                }
+                report.push(entry);
+            }
+            json!({ "sessions": report })
+        }
+    };
+    report["job"] = json!(job.name());
+    report["environment"] = json!(environment.name);
+    report["dry_run"] = json!(dry_run);
+    Ok(report)
+}
+
+/// Why a session folder a container writes must be kept, or nothing if it
+/// can go: [`keep_reason`]'s rule, from what the container said of it.
+fn keep_reason_contained(
+    contained: &Contained,
+    sharing: &[String],
+    store: &Store,
+    sessions: &Path,
+    folder: &repos::answer::Folder,
+    min_age: Duration,
+) -> Option<String> {
+    let host = &contained.host;
+    let agent_sessions = agent_sessions(store, sharing, &folder.folder);
+    if let Some(why) = in_use_because(&agent_sessions, &sessions.join(&folder.folder)) {
+        return Some(why.to_string());
+    }
+    if folder.unreadable {
+        return Some("a repo in it could not be read".to_string());
+    }
+    let key = |worktree: &repos::answer::Worktree| worktree.key.clone().unwrap_or_default();
+    // A repo the daemon will not run git in cannot be told saved.
+    for worktree in &folder.worktrees {
+        if let (Some(reason), true) = (worktree.refused, contained.enforcing()) {
+            let refused = git::Refused {
+                repo: worktree.repo.clone(),
+                reason,
+            };
+            return Some(format!("{}: {refused}", key(worktree)));
+        }
+    }
+    let mut facts = Vec::new();
+    for worktree in &folder.worktrees {
+        let Some(found) = &worktree.facts else {
+            return Some("a repo in it could not be read".to_string());
+        };
+        facts.push((worktree, found.taken()));
+    }
+    let merged =
+        |found: &crate::workspace::Facts| host.merged_on_github(found.slug.as_deref(), &found.head);
+    let mut unsaved = Vec::new();
+    for (worktree, found) in &facts {
+        let reasons = Unsaved::verdict(found, || merged(found)).reasons();
+        if !reasons.is_empty() {
+            unsaved.push(format!("{}: {}", key(worktree), reasons.join("; ")));
+        }
+    }
+    if folder.other_files {
+        unsaved.push("it holds other files".to_string());
+    }
+    // As `merged_and_done`: every worktree on the default branch or merged,
+    // and one merged at least; with none, nothing left in `.subworktrees`.
+    let done = match facts.is_empty() {
+        true => !folder.leftovers,
+        false => {
+            let mut merged_one = false;
+            let mut done = true;
+            for (_, found) in &facts {
+                if !found.on_default && merged(found) {
+                    merged_one = true;
+                } else if !found.on_default {
+                    done = false;
+                    break;
+                }
+            }
+            done && merged_one
+        }
+    };
+    if !(unsaved.is_empty() && done) {
+        let mut last_change = folder.touched_ms.unwrap_or(0);
+        for session in &agent_sessions {
+            last_change = last_change.max(session.last_event_ms);
+        }
+        for (worktree, _) in &facts {
+            let committed = worktree.last_commit_s.unwrap_or(u64::MAX / 1000);
+            last_change = last_change.max(committed.saturating_mul(1000));
+        }
+        let age_ms = unix_ms(SystemTime::now()).saturating_sub(last_change);
+        if age_ms < min_age.as_millis() as u64 {
+            return Some("it changed too recently".to_string());
+        }
+    }
+    unsaved.into_iter().next()
 }
 
 // ---- cleanup --------------------------------------------------------------

@@ -520,9 +520,13 @@ fn one_environments_hung_look_holds_up_no_other() {
     rig.sign_in(&mock.url);
     let pid_file = rig.home.dir.join("hung.pids");
     // `client-a`'s container hangs every look; `orca-b`'s answers at once.
+    // What else the daemon runs in there is run.
     rig.container_does(
         "agent-env-client-a",
-        &format!("echo $$ >> '{}'; exec sleep 60", pid_file.display()),
+        &format!(
+            "[ \"$2\" = look ] || exec \"$@\"\necho $$ >> '{}'; exec sleep 60",
+            pid_file.display()
+        ),
     );
     let podman = rig.looker().podman;
     let path = common::path_with(&rig.home, &[]);

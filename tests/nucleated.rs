@@ -739,11 +739,14 @@ fn a_nucleus_a_container_writes_is_left_in_the_flat_layout() {
     let rig = Rig::new();
     rig.configure_in_container("");
     rig.session("fix-login");
-    // One a refresh would move, were it not a container's.
+    // One a refresh would move, were it not a container's. The host moves
+    // nothing of it, whatever the refresh comes to.
     let flat = rig.flatten();
-    let report = housekeeping(&rig, &["refresh"]);
+    let out = run(rig.nucleated().args(["housekeeping", "run", "refresh"]), "");
+    let report = &stdout_json(&out)[0];
     assert!(report["moved"].is_null(), "{report}");
     assert!(flat.is_dir());
+    assert!(!rig.root.join(".repos/_/web.git").exists());
 }
 
 #[test]

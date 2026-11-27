@@ -22,6 +22,7 @@
 use crate::envelope::{rfc3339, unix_ms, valid_env_key};
 use crate::housekeeping;
 use crate::reporter;
+use crate::repos::{self, Nucleus};
 use crate::sessions::Store;
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{RepoInfo, Unsaved, Workspace};
@@ -108,7 +109,7 @@ pub fn valid_folder(value: &str) -> bool {
 }
 
 /// `^[0-9A-Za-z._/-]{1,140}$`
-fn valid_repo(value: &str) -> bool {
+pub(crate) fn valid_repo(value: &str) -> bool {
     (1..=140).contains(&value.len())
         && value
             .chars()
@@ -136,7 +137,7 @@ fn js_space(c: char) -> bool {
 /// A branch as Watch takes one: at most 255 UTF-16 units, as JavaScript
 /// counts a string's length, with nothing in it that JavaScript's `\s`
 /// matches and no control character.
-fn reportable_branch(value: &str) -> bool {
+pub(crate) fn reportable_branch(value: &str) -> bool {
     value.encode_utf16().count() <= MAX_BRANCH
         && !value.chars().any(|c| js_space(c) || c.is_control())
 }
@@ -164,7 +165,7 @@ fn worktrees_of(workspace: &Workspace, path: &Path) -> anyhow::Result<Vec<(Strin
 /// The newest modification time, in Unix milliseconds, of any file that git
 /// tracks or would track in these worktrees. Nothing when git cannot list
 /// them, or when there are too many to look at.
-fn last_change(git: &git::Git, worktrees: &[&Path]) -> Option<u64> {
+pub(crate) fn last_change(git: &git::Git, worktrees: &[&Path]) -> Option<u64> {
     let mut newest = None;
     let mut seen = 0;
     for worktree in worktrees {
@@ -303,6 +304,84 @@ pub fn report(workspace: &Workspace, store: &Store, sharing: &[String]) -> Vec<W
         .filter_map(|(name, path)| folder(workspace, store, sharing, &name, &path))
         .take(MAX_FOLDERS)
         .collect()
+}
+
+/// As [`report`], for a nucleus a container writes, from what the container
+/// said of it: the folders it told of in full, at most [`MAX_FOLDERS`],
+/// GitHub asked here about the commits it names, and whether one is in use
+/// from this box's own store and processes.
+pub(crate) fn report_answer(
+    answer: &repos::answer::Answer,
+    host: &Workspace,
+    store: &Store,
+    sharing: &[String],
+    sessions: &Path,
+) -> Vec<Worktree> {
+    answer
+        .folders
+        .iter()
+        .filter(|told| !told.gone && !told.unreadable)
+        .filter_map(|told| folder_of_answer(told, host, store, sharing, sessions))
+        .take(MAX_FOLDERS)
+        .collect()
+}
+
+/// One folder a container told of, by [`folder`]'s rules: nothing when one
+/// of its worktrees could not be read or it holds more repos than Watch
+/// takes.
+fn folder_of_answer(
+    told: &repos::answer::Folder,
+    host: &Workspace,
+    store: &Store,
+    sharing: &[String],
+    sessions: &Path,
+) -> Option<Worktree> {
+    let agent_sessions = housekeeping::agent_sessions(store, sharing, &told.folder);
+    let path = sessions.join(&told.folder);
+    let in_use = housekeeping::in_use_because(&agent_sessions, &path).is_some();
+    let mut repos = Vec::new();
+    for worktree in &told.worktrees {
+        let facts = worktree.facts.as_ref()?.taken();
+        let unsaved = Unsaved::verdict(&facts, || {
+            host.merged_on_github(facts.slug.as_deref(), &facts.head)
+        });
+        let pulls = host.pull_requests_from(&facts);
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: worktree.label.clone(),
+                branch: worktree.branch.clone(),
+                uncommitted: unsaved.uncommitted,
+                unpushed_commits: u64::from(unsaved.unpushed).min(MAX_UNPUSHED),
+                merged_pull_request: pulls.merged,
+                open_pull_request: pulls.open,
+            },
+        );
+    }
+    if told.other_files {
+        add_repo(
+            &mut repos,
+            WorktreeRepo {
+                repo: told.folder.clone(),
+                branch: String::new(),
+                uncommitted: true,
+                unpushed_commits: 0,
+                merged_pull_request: None,
+                open_pull_request: None,
+            },
+        );
+    }
+    if repos.len() > MAX_REPOS {
+        return None;
+    }
+    Some(Worktree {
+        folder: told.folder.clone(),
+        in_use,
+        last_change_at: told
+            .last_change_ms
+            .map(|ms| rfc3339(UNIX_EPOCH + Duration::from_millis(ms))),
+        repos,
+    })
 }
 
 // ---- actions and their results --------------------------------------------
@@ -969,9 +1048,21 @@ fn run(settings: &Settings, environment: &Environment, action: &Action) -> Ended
     if environment.driver_owns_worktrees() {
         return ended(Outcome::Refused, "The box leaves this folder alone.");
     }
-    let workspace = housekeeping::workspace(settings, environment)
+    let nucleus = housekeeping::workspace(settings, environment)
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(housekeeping::merges_file(&settings.state_dir));
+    let workspace = match nucleus {
+        Nucleus::Host(workspace) => workspace,
+        // PART 2: Push and Clean up inside the container (`nucleated repos
+        // --do push|remove`). Until then nothing is done, and never on the
+        // host.
+        Nucleus::Contained(_) => {
+            return ended(
+                Outcome::Failed,
+                "This is not done yet for an environment in a container, so nothing was done.",
+            )
+        }
+    };
     let path = environment.root.join(".worktrees").join(&action.folder);
     if !path.exists() {
         return match action.kind {

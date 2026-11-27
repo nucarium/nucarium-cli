@@ -826,7 +826,9 @@ fn no_count_is_sent_while_orca_lists_a_worktree_that_is_in_none_of_its_folders()
 
     let beat = |settings: &nucleate::settings::Settings| {
         let _ = fs::remove_file(rig.home.state_dir().join("unsaved.json"));
-        Reporter::default().tick(settings, SystemTime::now());
+        Reporter::default()
+            .running_with(rig.looker())
+            .tick(settings, SystemTime::now());
         gate::tick(rig);
         mock.to(contract::HEARTBEATS).pop().unwrap().json()
     };
@@ -914,7 +916,9 @@ fn unsaved_work_in_orcas_worktrees_is_counted_with_orca_stopped_and_nothing_is_t
     assert_eq!(adapter.worktrees(environment), Some(expected.clone()));
 
     let before = fingerprint(&orca, &project, &expected);
-    Reporter::default().tick(&settings, SystemTime::now());
+    Reporter::default()
+        .running_with(rig.looker())
+        .tick(&settings, SystemTime::now());
     gate::tick(rig);
     let beat = mock.to(contract::HEARTBEATS)[0].json();
     let seen = &beat["environments"][1];
@@ -929,9 +933,24 @@ fn unsaved_work_in_orcas_worktrees_is_counted_with_orca_stopped_and_nothing_is_t
 
     // Every housekeeping job, run for real over the whole config, and asked
     // for by hand for Orca's environment: nothing of Orca's has moved.
+    // The login's own nucleus is the container's, and its jobs run in there.
+    rig.looker();
+    let path = common::path_with(&rig.home, &[]);
     for job in ["refresh", "cleanup", "snapshot"] {
-        let all = run(rig.nucleated().args(["housekeeping", "run", job]), "");
-        assert!(all.status.success(), "{job}: {}", stderr(&all));
+        let all = run(
+            rig.nucleated()
+                .env("PATH", &path)
+                .args(["housekeeping", "run", job]),
+            "",
+        );
+        let reports = stdout_json(&all);
+        let ran: Vec<&Value> = reports
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|report| &report["environment"])
+            .collect();
+        assert_eq!(ran, [&json!("client-a")], "{job}: {}", stderr(&all));
         let by_hand = run(
             rig.nucleated()
                 .args(["housekeeping", "run", job, "--env", "orca"]),
@@ -947,7 +966,9 @@ fn unsaved_work_in_orcas_worktrees_is_counted_with_orca_stopped_and_nothing_is_t
     fs::remove_dir_all(&more).unwrap();
     assert_eq!(adapter.worktrees(environment), None);
     fs::remove_file(rig.home.state_dir().join("unsaved.json")).unwrap();
-    Reporter::default().tick(&settings, SystemTime::now());
+    Reporter::default()
+        .running_with(rig.looker())
+        .tick(&settings, SystemTime::now());
     gate::tick(rig);
     let beat = mock.to(contract::HEARTBEATS).pop().unwrap().json();
     assert!(beat["environments"][1].get("unsaved").is_none());
@@ -1122,7 +1143,9 @@ fn no_content_orca_hands_over_reaches_the_wire_the_disk_or_the_status() {
     assert_eq!(spooled(rig, before), events(&[(&id('1'), "session_end")]));
 
     // The count of what the worktrees hold, the daemon, and what is shown.
-    Reporter::default().tick(&rig.settings(), SystemTime::now());
+    Reporter::default()
+        .running_with(rig.looker())
+        .tick(&rig.settings(), SystemTime::now());
     gate::tick(rig);
     // The heartbeat after the count, from the daemon that ticked last.
     let beat = gate::said(&mock);

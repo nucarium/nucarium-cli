@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use nucleate::driver::inside;
 use nucleate::envelope::rfc3339;
 use nucleate::settings::{self, Settings};
-use nucleate::{agent, config, config_sync, daemon, hook, housekeeping, pause, status};
+use nucleate::{agent, config, config_sync, daemon, hook, housekeeping, pause, repos, status};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -53,6 +53,34 @@ enum Command {
         /// What the last look left, as the daemon keeps it.
         #[arg(long, value_name = "JSON")]
         previous: Option<String>,
+    },
+    /// Git for the daemon, from inside an environment's container: what the
+    /// daemon runs there through `podman exec`. Prints one answer.
+    #[command(hide = true)]
+    Repos {
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+        /// What to do: census.
+        #[arg(long = "do", value_name = "OP")]
+        op: Option<String>,
+        /// How long it may take, in milliseconds.
+        #[arg(long, value_name = "MS")]
+        within: Option<u64>,
+        /// The daemon's clock, in Unix milliseconds.
+        #[arg(long, value_name = "MS")]
+        now: Option<u64>,
+        /// Tells this call from another, so that the daemon can end it.
+        #[arg(long)]
+        token: Option<String>,
+        /// The daemon's vetting mode: enforce or report.
+        #[arg(long, value_name = "MODE")]
+        vetting: Option<String>,
+        /// The one session folder to read.
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
+        /// Read the environment's driver's worktrees.
+        #[arg(long)]
+        driver: bool,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -253,7 +281,7 @@ fn show_status(settings: &Settings, json: bool) -> Result<()> {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
-        Command::Hook { .. } | Command::Look { .. } => {
+        Command::Hook { .. } | Command::Look { .. } | Command::Repos { .. } => {
             unreachable!("handled before anything can fail")
         }
         Command::Run => daemon::run(stop_flag())?,
@@ -388,6 +416,29 @@ fn main() -> ExitCode {
             within_ms: *within,
             now_ms: *now,
             previous: previous.as_deref(),
+        });
+        return ExitCode::SUCCESS;
+    }
+    // And so does a call of git for the daemon.
+    if let Command::Repos {
+        env,
+        op,
+        within,
+        now,
+        token: _,
+        vetting,
+        folder,
+        driver,
+    } = &cli.command
+    {
+        repos::inside::run(&repos::inside::Asked {
+            env: env.as_deref(),
+            op: op.as_deref(),
+            within_ms: *within,
+            now_ms: *now,
+            vetting: vetting.as_deref(),
+            folder: folder.as_deref(),
+            driver: *driver,
         });
         return ExitCode::SUCCESS;
     }

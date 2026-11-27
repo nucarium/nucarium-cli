@@ -246,6 +246,13 @@ fn valid_name(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// `owner/name` as a GitHub repo may be called.
+pub(crate) fn valid_slug(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(owner, name)| layout::valid_owner(owner) && valid_name(name))
+}
+
 fn valid_branch(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
