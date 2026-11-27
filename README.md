@@ -1512,9 +1512,11 @@ discard's backups go first to `refs/wip/<branch>-<action id>`, in a call of
 their own; the host then looks again at its own record of sessions and
 processes, and only then has the container remove what those backups hold. A
 container that is not running, or an answer that does not fit, leaves the
-count and the folders unknown, tells no outcome, fails the job or the action
-with a fixed sentence, and removes nothing. A job or an action that runs out
-of time is taken for what its answer says it did, and nothing more.
+count and the folders unknown, tells no outcome, and fails the job or the
+action with a fixed sentence; nothing is removed on such an answer, and where
+the container was already asked to remove a folder, the box says it could not
+tell whether it was removed. A job or an action that runs out of time is
+taken for what its answer says it did, and nothing more.
 
 Where the environment's network does not reach GitHub, its proxy refuses
 the fetch, the snapshot, the Push and the backup, and each says "The

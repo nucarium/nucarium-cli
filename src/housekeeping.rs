@@ -324,19 +324,26 @@ fn run_contained(
             });
             if !going.is_empty() {
                 let merged = contained.merged_among(facts);
-                let answer = contained
-                    .remove(
-                        inside,
-                        settings,
-                        &going,
-                        &merged,
-                        None,
-                        repos::Removing::All,
-                    )
-                    .map_err(not_known)?;
+                let removed = contained.remove(
+                    inside,
+                    settings,
+                    &going,
+                    &merged,
+                    None,
+                    repos::Removing::All,
+                );
                 for (folder, _) in &going {
-                    let removal = answer.removals.iter().find(|r| &r.folder == folder);
-                    report.push(removal_entry(folder, removal));
+                    report.push(match &removed {
+                        Ok(answer) => {
+                            let removal = answer.removals.iter().find(|r| &r.folder == folder);
+                            removal_entry(folder, removal)
+                        }
+                        // Asked to remove, and no answer: it may have.
+                        Err(_) => json!({
+                            "session": folder, "action": "failed",
+                            "reason": "the box could not tell whether it was removed",
+                        }),
+                    });
                 }
             }
             json!({ "sessions": report })

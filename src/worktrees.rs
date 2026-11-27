@@ -1537,7 +1537,8 @@ fn run_contained(
             let Some(_) = discard else {
                 return match remove(Removing::All) {
                     Ok(answer) => finish(answer, &[]),
-                    Err(condition) => not_known(condition),
+                    // Asked to remove, and no answer: it may have.
+                    Err(_) => ended(Outcome::Failed, repos::NOT_TOLD),
                 };
             };
             // With discard: the backups first, then, the host having looked
@@ -1580,7 +1581,7 @@ fn run_contained(
                 .collect();
             match remove(Removing::Backed(trees)) {
                 Ok(answer) => finish(answer, &pushed),
-                Err(condition) => with_backups(not_known(condition), &pushed),
+                Err(_) => with_backups(ended(Outcome::Failed, repos::NOT_TOLD), &pushed),
             }
         }
     }

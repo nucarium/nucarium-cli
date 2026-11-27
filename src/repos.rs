@@ -33,6 +33,10 @@ use std::time::{Duration, SystemTime};
 /// How long the host gives a census, and how long the census gives itself.
 pub const CENSUS_LIMITS: (Duration, Duration) = (Duration::from_secs(60), Duration::from_secs(55));
 
+/// What the host says when it asked the container to remove a folder and
+/// had no answer it could use: the removal may have begun.
+pub const NOT_TOLD: &str = "The box could not tell whether it was removed.";
+
 /// What the host says, wherever it says why, when an environment's network
 /// does not reach GitHub.
 pub const NO_NETWORK: &str =
