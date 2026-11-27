@@ -133,6 +133,14 @@ fn ask_for_outcome(rig: &Rig) {
     );
 }
 
+/// How many censuses the host has asked of the container.
+fn censuses(rig: &Rig) -> usize {
+    rig.podman_calls()
+        .iter()
+        .filter(|call| call.contains(" --do census "))
+        .count()
+}
+
 fn outcomes_spooled(rig: &Rig) -> usize {
     rig.spooled()
         .iter()
@@ -617,7 +625,10 @@ fn whatever_a_container_prints_in_place_of_an_answer_is_known_as_nothing() {
     for (what, does) in hostile {
         rig.container_does("agent-env-client-a", &does);
         let hangs = does.contains("sleep 60");
+        let asked_before = censuses(rig);
         let seen = heard(&boxed, &session, limit);
+        // Both were asked of the container: the count, and the outcome.
+        assert_eq!(censuses(rig), asked_before + 2, "{what}");
         if !hangs {
             ask_for_outcome(rig);
             boxed
@@ -655,7 +666,6 @@ fn whatever_a_container_prints_in_place_of_an_answer_is_known_as_nothing() {
             "{pid} is still running"
         );
     }
-    assert!(asked_inside(rig, "census"));
 
     // An answer about another folder than the one asked about tells of no
     // outcome, though it does for the whole nucleus.
@@ -772,6 +782,39 @@ fn no_string_a_container_hands_over_but_names_words_and_numbers_is_taken() {
         let nucleus = &serde_json::from_str::<Value>(&counts).unwrap()["nuclei"][0];
         assert!(nucleus["unsaved"].is_null(), "{field}: {nucleus}");
         assert!(nucleus.get("worktrees").is_none(), "{field}: {nucleus}");
+    }
+    // Checked as the host checks an answer about one session folder, for
+    // what that session left: each string marked in turn, where one that
+    // is not would give an outcome.
+    let mut about_one: Vec<(String, Value)> = Vec::new();
+    for field in ["op", "condition"] {
+        let mut one = crate::answer();
+        one[field] = json!(mark(field));
+        about_one.push((field.to_string(), one));
+    }
+    for field in ["folder", "stamp", "branch", "name"] {
+        let mut one = crate::answer();
+        one["folders"][0][field] = json!(mark(field));
+        about_one.push((format!("folders.{field}"), one));
+    }
+    let mut labelled = crate::answer();
+    labelled["folders"][0]["labels"] = json!([mark("labels")]);
+    about_one.push(("folders.labels".into(), labelled));
+    for field in ["key", "repo", "label", "branch", "refused", "subject"] {
+        let mut one = crate::answer();
+        one["folders"][0]["worktrees"][0][field] = json!(mark(field));
+        about_one.push((format!("worktrees.{field}"), one));
+    }
+    for field in ["head", "slug", "message"] {
+        let mut one = crate::answer();
+        one["folders"][0]["worktrees"][0]["facts"][field] = json!(mark(field));
+        about_one.push((format!("worktrees.facts.{field}"), one));
+    }
+    fs::write(&file, crate::answer().to_string()).unwrap();
+    assert!(outcome(&boxed, &session).is_some(), "the control");
+    for (field, answer) in &about_one {
+        assert!(answer.to_string().contains(MARK), "{field}");
+        fs::write(&file, answer.to_string()).unwrap();
         assert!(outcome(&boxed, &session).is_none(), "{field}");
     }
     assert_eq!(rig.spooled().len(), spooled);
