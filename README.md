@@ -1507,8 +1507,10 @@ committed (copying a worktree's index only when it is a plain file, into a
 folder of its own, and skipping a tree the host has recorded as pushed, whose
 record the host keeps), Watch's Push pushes a folder's branches, and
 `cleanup`'s removal and Watch's Clean up remove a folder only if it still
-stands as the host saw it and no process in the container works in it, a
-discard's backups going first to `refs/wip/<branch>-<action id>`. A
+stands as the host saw it and no process in the container works in it. A
+discard's backups go first to `refs/wip/<branch>-<action id>`, in a call of
+their own; the host then looks again at its own record of sessions and
+processes, and only then has the container remove what those backups hold. A
 container that is not running, or an answer that does not fit, leaves the
 count and the folders unknown, tells no outcome, fails the job or the action
 with a fixed sentence, and removes nothing. A job or an action that runs out
@@ -1516,7 +1518,9 @@ of time is taken for what its answer says it did, and nothing more.
 
 Where the environment's network does not reach GitHub, its proxy refuses
 the fetch, the snapshot, the Push and the backup, and each says "The
-environment's network does not reach GitHub, so nothing was sent."
+environment's network does not reach GitHub, so nothing was sent.", or, for
+one repo of several, that this repo's work was not sent. Any other failure
+of the proxy is GitHub not being reached.
 
 ## Assumptions
 
