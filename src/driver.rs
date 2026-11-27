@@ -575,15 +575,14 @@ fn claims_dir(state_dir: &Path, driver_environment: &str) -> PathBuf {
 /// A number made from a folder's path, so that a claim can say where its
 /// hook's session works without the folder's name being written anywhere.
 pub(crate) fn folder_number(folder: &Path) -> String {
-    // FNV-1a, written out so the hook and the daemon always agree.
-    let hash = folder
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    format!("{hash:016x}")
+    format!("{:016x}", fnv(folder.as_os_str().as_encoded_bytes()))
+}
+
+/// FNV-1a over `bytes`, written out so the hook and the daemon always agree.
+pub(crate) fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn resolved(folder: &Path) -> PathBuf {
