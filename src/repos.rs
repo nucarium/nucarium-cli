@@ -329,6 +329,9 @@ impl Contained {
             Removing::All => {}
             Removing::BackupOnly => more.push("--backup-only".to_string()),
             Removing::Backed(trees) => {
+                // Said outright, so that with no tree it removes only what
+                // holds nothing to back up, and never backs up itself.
+                more.push("--after-backup".to_string());
                 more.extend(trees.iter().map(|tree| format!("--backed={tree}")));
             }
         }

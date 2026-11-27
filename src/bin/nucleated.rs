@@ -105,6 +105,9 @@ enum Command {
         /// Only back up, and remove nothing.
         #[arg(long)]
         backup_only: bool,
+        /// Remove only what an earlier call backed up.
+        #[arg(long)]
+        after_backup: bool,
         /// A tree an earlier call backed up.
         #[arg(long, value_name = "TREE")]
         backed: Vec<String>,
@@ -467,6 +470,7 @@ fn main() -> ExitCode {
         discard,
         id,
         backup_only,
+        after_backup,
         backed,
         grace,
     } = &cli.command
@@ -487,6 +491,7 @@ fn main() -> ExitCode {
             discard: *discard,
             id: id.as_deref(),
             backup_only: *backup_only,
+            after_backup: *after_backup,
             backed,
             grace_ms: *grace,
         });

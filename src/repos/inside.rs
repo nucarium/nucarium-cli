@@ -129,6 +129,8 @@ pub struct Asked<'a> {
     /// A removal with discard that only backs up: the host looks again
     /// before the removal.
     pub backup_only: bool,
+    /// A removal with discard after its backups: of what they hold only.
+    pub after_backup: bool,
     /// The trees backed up by an earlier call: the removal goes ahead only
     /// where each repo's work is still one of them.
     pub backed: &'a [String],
@@ -1004,10 +1006,13 @@ fn remove(
         .filter(|tree| commit_id(tree))
         .cloned()
         .collect();
-    let stage = match (asked.backup_only, asked.backed.is_empty()) {
-        (true, _) => Stage::BackupOnly,
-        (false, false) => Stage::Backed(&backed),
-        (false, true) => Stage::All,
+    // A discard is two calls, the backups and then the removal of what
+    // they hold; never one that backs up and removes.
+    let stage = match (asked.backup_only, asked.after_backup, discard.is_some()) {
+        (true, false, true) => Stage::BackupOnly,
+        (false, true, true) => Stage::Backed(&backed),
+        (false, false, false) => Stage::All,
+        _ => return Condition::BadReply,
     };
     for (name, expect) in asked.folders.iter().zip(asked.expect) {
         if time_is_up() {
