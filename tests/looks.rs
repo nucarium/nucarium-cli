@@ -107,7 +107,16 @@ fn answer(sessions: Value) -> Value {
     })
 }
 
+/// Whether a process is still running. A process that was killed and is
+/// waiting for its parent to collect it (a zombie) runs nothing, so it does
+/// not count: on Linux its state in `/proc` says so.
 fn alive(pid: &str) -> bool {
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next());
+        return !matches!(state, Some("Z" | "X"));
+    }
     std::process::Command::new("sh")
         .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
         .status()
