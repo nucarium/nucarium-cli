@@ -314,19 +314,19 @@ pub fn report(workspace: &Workspace, store: &Store, sharing: &[String]) -> Vec<W
 /// As [`report`], for a nucleus a container writes, from what the container
 /// said of it: the folders it told of in full, at most [`MAX_FOLDERS`],
 /// GitHub asked here about the commits it names, and whether one is in use
-/// from this box's own store and processes.
+/// from this box's own store and processes. `root` is the nucleus's.
 pub(crate) fn report_answer(
     answer: &repos::answer::Answer,
     host: &GitHub,
     store: &Store,
     sharing: &[String],
-    sessions: &Path,
+    root: &Path,
 ) -> Vec<Worktree> {
     answer
         .folders
         .iter()
         .filter(|told| !told.gone && !told.unreadable)
-        .filter_map(|told| folder_of_answer(told, host, store, sharing, sessions))
+        .filter_map(|told| folder_of_answer(told, host, store, sharing, root))
         .take(MAX_FOLDERS)
         .collect()
 }
@@ -339,11 +339,10 @@ fn folder_of_answer(
     host: &GitHub,
     store: &Store,
     sharing: &[String],
-    sessions: &Path,
+    root: &Path,
 ) -> Option<Worktree> {
     let agent_sessions = housekeeping::agent_sessions(store, sharing, &told.folder);
-    let path = sessions.join(&told.folder);
-    let in_use = housekeeping::in_use_because(&agent_sessions, &path).is_some();
+    let in_use = housekeeping::in_use_beneath(&agent_sessions, root, &told.folder).is_some();
     let mut repos = Vec::new();
     for worktree in &told.worktrees {
         let facts = worktree.facts.as_ref()?.taken();
@@ -1403,8 +1402,8 @@ fn run_contained(
             let store = Store::new(&settings.state_dir);
             let sharing = housekeeping::sharing_nucleus(settings, environment);
             let sessions = housekeeping::agent_sessions(&store, &sharing, &action.folder);
-            let path = environment.root.join(".worktrees").join(&action.folder);
-            if housekeeping::in_use_because(&sessions, &path).is_some() {
+            if housekeeping::in_use_beneath(&sessions, &environment.root, &action.folder).is_some()
+            {
                 return ended(Outcome::Refused, "A session is still using it.");
             }
             let discard = action.discard.then_some(action.id.as_str());

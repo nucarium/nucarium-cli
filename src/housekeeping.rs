@@ -279,14 +279,19 @@ fn run_contained(
                 .map_err(not_known)?;
             let store = Store::new(&settings.state_dir);
             let sharing = sharing_nucleus(settings, environment);
-            let sessions = environment.root.join(".worktrees");
             let min_age = settings.housekeeping.cleanup_min_age;
             let mut report = Vec::new();
             let mut going = Vec::new();
             let mut facts = Vec::new();
             for folder in census.folders.iter().filter(|folder| !folder.gone) {
-                let kept =
-                    keep_reason_contained(contained, &sharing, &store, &sessions, folder, min_age);
+                let kept = keep_reason_contained(
+                    contained,
+                    &sharing,
+                    &store,
+                    &environment.root,
+                    folder,
+                    min_age,
+                );
                 let mut entry = json!({ "session": folder.folder });
                 match (kept, folder.stamp.clone()) {
                     (Some(reason), _) => {
@@ -478,13 +483,13 @@ fn keep_reason_contained(
     contained: &Contained,
     sharing: &[String],
     store: &Store,
-    sessions: &Path,
+    root: &Path,
     folder: &repos::answer::Folder,
     min_age: Duration,
 ) -> Option<String> {
     let host = &contained.host;
     let agent_sessions = agent_sessions(store, sharing, &folder.folder);
-    if let Some(why) = in_use_because(&agent_sessions, &sessions.join(&folder.folder)) {
+    if let Some(why) = in_use_beneath(&agent_sessions, root, &folder.folder) {
         return Some(why.to_string());
     }
     if folder.unreadable {
@@ -599,6 +604,43 @@ pub(crate) fn agent_sessions(store: &Store, sharing: &[String], name: &str) -> V
 /// Why a session folder is in use, or nothing when it is not: an agent
 /// session that has not ended names it, or a process has its working
 /// directory inside it. Where the system cannot say, it might be.
+/// As [`in_use_because`], for the session folder `folder` of the nucleus
+/// at `root` that a container writes: only `root`, which the config names,
+/// is resolved. A link, or anything that is no folder, in the place of
+/// `.worktrees` or of the folder is never followed, and is taken for in use.
+pub(crate) fn in_use_beneath(
+    agent_sessions: &[Session],
+    root: &Path,
+    folder: &str,
+) -> Option<&'static str> {
+    if agent_sessions
+        .iter()
+        .any(|session| session.status != Status::Ended)
+    {
+        return Some("its agent session has not ended");
+    }
+    let cannot_say = Some("this system cannot say whether a process is working in it");
+    let Ok(root) = root.canonicalize() else {
+        return cannot_say;
+    };
+    let sessions = root.join(".worktrees");
+    let path = sessions.join(folder);
+    for place in [&sessions, &path] {
+        match fs::symlink_metadata(place) {
+            Ok(meta) if meta.is_dir() => {}
+            // Gone: nothing works in it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Ok(_) => return Some("it is not a plain folder"),
+            Err(_) => return cannot_say,
+        }
+    }
+    match in_use(&path) {
+        Some(false) => None,
+        Some(true) => Some("a process is working in it"),
+        None => cannot_say,
+    }
+}
+
 pub(crate) fn in_use_because(agent_sessions: &[Session], path: &Path) -> Option<&'static str> {
     // Two logins may share one nucleus, so the folder is live while an agent
     // session of any of them is working in it.
@@ -1311,6 +1353,37 @@ mod tests {
             "1 failed, 1 fetched"
         );
         assert_eq!(summarize(&json!({ "worktrees": [] })), "no worktrees");
+    }
+
+    #[test]
+    fn a_link_or_a_file_in_place_of_a_containers_folder_is_in_use_and_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nucleus");
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(root.join(".worktrees").join("real")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".worktrees").join("linked")).unwrap();
+        fs::write(root.join(".worktrees").join("file"), "x").unwrap();
+        for folder in ["linked", "file"] {
+            assert_eq!(
+                in_use_beneath(&[], &root, folder),
+                Some("it is not a plain folder"),
+                "{folder}"
+            );
+        }
+        assert_eq!(in_use_beneath(&[], &root, "gone"), None);
+        // A plain folder is as the box's processes say: on Linux, no process
+        // works in this one.
+        let plain = in_use_beneath(&[], &root, "real");
+        assert_eq!(plain.is_none(), cfg!(target_os = "linux"), "{plain:?}");
+        // The same for `.worktrees` itself.
+        let moved = dir.path().join("moved");
+        fs::rename(root.join(".worktrees"), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, root.join(".worktrees")).unwrap();
+        assert_eq!(
+            in_use_beneath(&[], &root, "real"),
+            Some("it is not a plain folder")
+        );
     }
 
     #[test]

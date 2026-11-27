@@ -470,13 +470,12 @@ impl Reporter {
             {
                 Ok(answer) => {
                     let (unsaved, refused) = Tally::of_answer(&answer, &contained).finish(Some(()));
-                    let sessions = environment.root.join(".worktrees");
                     let folders = worktrees::report_answer(
                         &answer,
                         &contained.host,
                         &store,
                         sharing,
-                        &sessions,
+                        &environment.root,
                     );
                     (unsaved, refused, Some(folders))
                 }
