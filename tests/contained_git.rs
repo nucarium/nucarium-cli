@@ -1110,6 +1110,24 @@ fn push_runs_inside_the_container_and_says_what_it_pushed() {
 }
 
 #[test]
+fn a_folder_whose_name_starts_with_a_dash_is_asked_about_as_a_folder() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    // A folder the container made, which `nucleate` would not name so.
+    let folder = rig.root.join(".worktrees").join("-x");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        folder.join(".workspace.json"),
+        r#"{"name":"-x","branch":"workspace/x","repos":{}}"#,
+    )
+    .unwrap();
+    let result = act_inside(&boxed, &action("-x", "push", false), None);
+    assert_eq!(result["outcome"], "refused", "{result}");
+    assert_eq!(result["detail"], "There is nothing to push.");
+}
+
+#[test]
 fn a_push_github_turns_down_is_said_in_the_hosts_words() {
     let boxed = boxed();
     let rig = &boxed.rig;

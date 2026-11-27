@@ -218,7 +218,7 @@ impl Contained {
     ) -> Result<Answer, Condition> {
         let mut more = Vec::new();
         if let Some(folder) = folder {
-            more.extend(["--folder".to_string(), folder.to_string()]);
+            more.push(format!("--folder={folder}"));
         }
         if driver {
             more.push("--driver".to_string());
@@ -268,7 +268,7 @@ impl Contained {
             more.push("--dry-run".to_string());
         }
         for tree in pushed {
-            more.extend(["--pushed".to_string(), tree.clone()]);
+            more.push(format!("--pushed={tree}"));
         }
         let asked = Asked {
             op: Op::Snapshot,
@@ -286,9 +286,10 @@ impl Contained {
         folder: &str,
         merged: &[String],
     ) -> Result<Answer, Condition> {
-        let mut more = vec!["--folder".to_string(), folder.to_string()];
+        // Each value joined to its flag: a folder may be named `-x`.
+        let mut more = vec![format!("--folder={folder}")];
         for sha in merged {
-            more.extend(["--merged".to_string(), sha.clone()]);
+            more.push(format!("--merged={sha}"));
         }
         let asked = Asked {
             op: Op::Push,
@@ -313,18 +314,13 @@ impl Contained {
     ) -> Result<Answer, Condition> {
         let mut more = Vec::new();
         for (folder, stamp) in folders {
-            more.extend([
-                "--folder".to_string(),
-                folder.clone(),
-                "--expect".to_string(),
-                stamp.clone(),
-            ]);
+            more.extend([format!("--folder={folder}"), format!("--expect={stamp}")]);
         }
         for sha in merged {
-            more.extend(["--merged".to_string(), sha.clone()]);
+            more.push(format!("--merged={sha}"));
         }
         if let Some(id) = discard {
-            more.extend(["--discard".to_string(), "--id".to_string(), id.to_string()]);
+            more.extend(["--discard".to_string(), format!("--id={id}")]);
         }
         let names: Vec<String> = folders.iter().map(|(folder, _)| folder.clone()).collect();
         let asked = Asked {
