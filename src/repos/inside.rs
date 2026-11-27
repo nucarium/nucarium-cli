@@ -259,6 +259,13 @@ fn one(asked: &Asked, op: Op) -> Condition {
     }
 }
 
+/// The workspace of an environment as `nucleated repos` sees it, inside
+/// the environment's container: git run guarded, as the daemon runs it on
+/// the host, and stopped with the call when its time is up.
+fn workspace_inside(settings: &Settings, environment: &Environment) -> Workspace {
+    super::guarded(settings, environment, true)
+}
+
 /// The folders an environment keeps work in, resolved: nothing outside them
 /// is read.
 fn held_to(environment: &Environment) -> Vec<PathBuf> {
@@ -300,8 +307,8 @@ fn census(
     folder: Option<&str>,
     driver: bool,
 ) -> Condition {
-    let workspace = housekeeping::workspace_inside(settings, environment)
-        .leaving_alone(driver::protected_roots(settings));
+    let workspace =
+        workspace_inside(settings, environment).leaving_alone(driver::protected_roots(settings));
     let held = held_to(environment);
     if driver {
         return census_driver(&workspace, environment, &held);
@@ -658,8 +665,8 @@ fn refresh(
     dry_run: bool,
     move_only: bool,
 ) -> Condition {
-    let workspace = housekeeping::workspace_inside(settings, environment)
-        .leaving_alone(driver::protected_roots(settings));
+    let workspace =
+        workspace_inside(settings, environment).leaving_alone(driver::protected_roots(settings));
     if !dry_run {
         match workspace.move_to_owner_folders() {
             Ok(moved) => building(|answer| {
@@ -729,8 +736,8 @@ fn snapshot(
     dry_run: bool,
     pushed: &[String],
 ) -> Condition {
-    let workspace = housekeeping::workspace_inside(settings, environment)
-        .leaving_alone(driver::protected_roots(settings));
+    let workspace =
+        workspace_inside(settings, environment).leaving_alone(driver::protected_roots(settings));
     let Some(scratch) = Scratch::new() else {
         return Condition::Error;
     };
@@ -897,7 +904,7 @@ fn push(
     folder: &str,
     merged: &[String],
 ) -> Condition {
-    let workspace = housekeeping::workspace_inside(settings, environment)
+    let workspace = workspace_inside(settings, environment)
         .leaving_alone(driver::protected_roots(settings))
         .knowing_merged(merged);
     let why = |word: Word| {
@@ -946,7 +953,7 @@ fn remove(
     asked: &Asked,
     discard: Option<&str>,
 ) -> Condition {
-    let workspace = housekeeping::workspace_inside(settings, environment)
+    let workspace = workspace_inside(settings, environment)
         .leaving_alone(driver::protected_roots(settings))
         .knowing_merged(asked.merged);
     let Some(scratch) = Scratch::new() else {

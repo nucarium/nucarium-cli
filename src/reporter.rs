@@ -28,7 +28,7 @@ use crate::repos::{self, Contained};
 use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
-use crate::workspace::{Facts, RepoInfo, Unsaved, Workspace, SUBWORKTREES};
+use crate::workspace::{Facts, GitHub, RepoInfo, Unsaved, Workspace, SUBWORKTREES};
 use crate::worktrees::{self, Worktree};
 use crate::{driver, git, github, paths};
 use serde::{Deserialize, Serialize};
@@ -283,11 +283,7 @@ fn commits_made(workspace: &Workspace, info: &RepoInfo) -> Option<u32> {
 
 /// As [`open_pulls`], from what a container said of a worktree, GitHub
 /// asked here.
-fn open_pulls_of(
-    host: &Workspace,
-    facts: Option<&Facts>,
-    made: Option<u32>,
-) -> Option<Vec<String>> {
+fn open_pulls_of(host: &GitHub, facts: Option<&Facts>, made: Option<u32>) -> Option<Vec<String>> {
     if made == Some(0) {
         return Some(Vec::new());
     }
@@ -296,10 +292,10 @@ fn open_pulls_of(
         return None;
     }
     github::open_pulls(
-        host.github_api(),
+        host.api(),
         &github::remote_of(facts.slug.as_deref()),
         &facts.head,
-        host.github_token_file(),
+        host.token_file(),
     )
 }
 
@@ -514,7 +510,7 @@ impl Reporter {
             return (None, tally.refused);
         }
         let workspace = match self.workspace(settings, environment) {
-            repos::Nucleus::Host(workspace) => workspace,
+            repos::Nucleus::Host(workspace) => *workspace,
             repos::Nucleus::Contained(contained) => {
                 return match self.census(settings, &contained, None, true) {
                     Ok(answer) => Tally::of_answer(&answer, &contained).finish(Some(())),
@@ -644,7 +640,7 @@ impl Reporter {
             !name.is_empty() && !name.contains(['/', '\\']) && !matches!(*name, "." | "..")
         })?;
         let workspace = match self.workspace(settings, environment) {
-            repos::Nucleus::Host(workspace) => workspace,
+            repos::Nucleus::Host(workspace) => *workspace,
             repos::Nucleus::Contained(contained) => {
                 return self.outcome_of(settings, &contained, name, draft);
             }

@@ -1264,7 +1264,7 @@ fn move_to_owner_folders(settings: &Settings) {
             continue;
         }
         let workspace = match housekeeping::workspace(settings, environment) {
-            Nucleus::Host(workspace) => workspace,
+            Nucleus::Host(workspace) => *workspace,
             Nucleus::Contained(_) => {
                 let first = housekeeping::one_per_nucleus(settings)
                     .iter()

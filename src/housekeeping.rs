@@ -10,7 +10,6 @@
 //! a session through `nucleate`'s own all-or-nothing rule and adds conditions
 //! of its own on top; it never takes a shortcut around it.
 
-use crate::config;
 use crate::driver::{self, Condition};
 use crate::envelope::{rfc3339, unix_ms};
 use crate::git;
@@ -122,60 +121,9 @@ pub(crate) fn one_per_nucleus(settings: &Settings) -> Vec<&Environment> {
 
 /// The repositories of one environment as the daemon may get at them: on
 /// the host, git run guarded; or, where a container can write them, only
-/// through that container (see [`crate::repos`]), and never on the host.
+/// through that container, and never on the host (see [`repos::nucleus`]).
 pub(crate) fn workspace(settings: &Settings, environment: &Environment) -> Nucleus {
-    match container_of(settings, environment) {
-        Some((container, env)) => Nucleus::Contained(Contained {
-            container,
-            env,
-            vetting: settings.git_vetting,
-            host: Workspace::new(config_of(environment)).guarded(git::Git::Elsewhere),
-        }),
-        None => Nucleus::Host(guarded(settings, environment, false)),
-    }
-}
-
-/// The workspace of an environment as `nucleated repos` sees it, inside
-/// the environment's container: git run guarded, as the daemon runs it on
-/// the host, and stopped with the call when its time is up.
-pub(crate) fn workspace_inside(settings: &Settings, environment: &Environment) -> Workspace {
-    guarded(settings, environment, true)
-}
-
-fn config_of(environment: &Environment) -> config::Config {
-    config::for_root(
-        &environment.root,
-        environment.github_token_file.clone(),
-        environment.branch_prefix.clone(),
-    )
-}
-
-/// The workspace of one environment where git is run guarded, in
-/// repositories vetted first. A nucleus's repositories must keep their git
-/// data in its `.repos`; a driver's are wherever the owner keeps them, and
-/// only their config is held to the allowlist.
-fn guarded(settings: &Settings, environment: &Environment, stopped_with_caller: bool) -> Workspace {
-    let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
-    let mut guarded = git::Guarded::new(repos, settings.git_vetting);
-    if stopped_with_caller {
-        guarded = guarded.stopped_with_caller();
-    }
-    // A driver in a container chooses its worktrees' repositories, but only
-    // among the folders of the environments in that container, which is all
-    // of the box it can see: the box holds them there.
-    if let Some(container) = environment
-        .container()
-        .filter(|_| environment.driver_owns_worktrees())
-    {
-        let folders: Vec<PathBuf> = settings
-            .environments
-            .iter()
-            .filter(|other| other.container() == Some(container))
-            .flat_map(Environment::own_folders)
-            .collect();
-        guarded = guarded.held_to(&folders);
-    }
-    Workspace::new(config_of(environment)).guarded(git::Git::Guarded(guarded))
+    repos::nucleus(settings, environment)
 }
 
 /// Where GitHub's answers about merged commits are remembered, for cleanup
@@ -227,7 +175,7 @@ pub fn run_job_with(
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(merges_file(&settings.state_dir));
     let workspace = match nucleus {
-        Nucleus::Host(workspace) => workspace,
+        Nucleus::Host(workspace) => *workspace,
         Nucleus::Contained(contained) => {
             return run_contained(settings, environment, &contained, inside, job, dry_run)
         }

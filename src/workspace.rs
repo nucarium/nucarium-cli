@@ -288,6 +288,100 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// GitHub, as the host asks it about the commits of its repos: with its
+/// own token, and, when it is told where, with what GitHub said before
+/// remembered. It reads nothing of a repository.
+#[derive(Debug, Clone)]
+pub struct GitHub {
+    api: String,
+    token_file: Option<PathBuf>,
+    merges: Option<PathBuf>,
+}
+
+impl GitHub {
+    pub fn new(api: String, token_file: Option<PathBuf>) -> GitHub {
+        GitHub {
+            api,
+            token_file,
+            merges: None,
+        }
+    }
+
+    /// Remember GitHub's answers in `file`, as [`Workspace::remembering_merges`].
+    pub fn remembering_merges(mut self, file: PathBuf) -> GitHub {
+        self.merges = Some(file);
+        self
+    }
+
+    /// Ask a stand-in on this machine in place of GitHub. Any other address
+    /// is ignored.
+    pub fn asking_at(mut self, url: &str) -> GitHub {
+        if let Some(url) = github::stand_in(url) {
+            self.api = url;
+        }
+        self
+    }
+
+    pub fn api(&self) -> &str {
+        &self.api
+    }
+
+    pub fn token_file(&self) -> Option<&Path> {
+        self.token_file.as_deref()
+    }
+
+    /// Whether GitHub says the commit `sha` of the repo `slug` names is one
+    /// of a merged pull request's. No for a repo that is not on GitHub.
+    pub fn merged_on_github(&self, slug: Option<&str>, sha: &str) -> bool {
+        self.asked(&github::remote_of(slug), sha).merged
+    }
+
+    /// As [`Workspace::pull_requests`], from the facts git gave of it.
+    pub fn pull_requests_from(&self, facts: &Facts) -> PullRequests {
+        if facts.on_default || facts.slug.is_none() || (!facts.on_remote && facts.tracked) {
+            return PullRequests::default();
+        }
+        let asked = self.asked(&github::remote_of(facts.slug.as_deref()), &facts.head);
+        PullRequests {
+            merged: asked.merged_pull.filter(|_| asked.merged),
+            open: asked.open_pull,
+        }
+    }
+
+    /// What GitHub said about a commit of the repo at `remote`: remembered
+    /// when told where, asked again after an hour unless it was merged, and
+    /// asked afresh each time otherwise.
+    fn asked(&self, remote: &str, sha: &str) -> Asked {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let ask = || {
+            let found = github::lookup(&self.api, remote, sha, self.token_file.as_deref())
+                .unwrap_or_default();
+            Asked {
+                merged: found.merged,
+                at_s: now_s,
+                merged_pull: found.merged_pull,
+                open_pull: found.open_pull,
+            }
+        };
+        let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(remote)) else {
+            return ask();
+        };
+        let key = format!("{owner}/{repo}@{sha}");
+        match read_merges(file).get(&key) {
+            Some(answer) if answer.merged => return answer.clone(),
+            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => {
+                return answer.clone()
+            }
+            _ => {}
+        }
+        let answer = ask();
+        remember_merge(file, key, answer.clone());
+        answer
+    }
+}
+
 impl Workspace {
     /// A workspace that runs git as `nucleate` does: guarded, with every
     /// repository's git data held to the nucleus's `.repos`, and a repository
@@ -1117,19 +1211,6 @@ impl Workspace {
         self.asked_remote(&github::remote_of(slug), sha).merged
     }
 
-    /// As [`Workspace::pull_requests`], from the facts found inside a
-    /// container.
-    pub fn pull_requests_from(&self, facts: &Facts) -> PullRequests {
-        if facts.on_default || facts.slug.is_none() || (!facts.on_remote && facts.tracked) {
-            return PullRequests::default();
-        }
-        let asked = self.asked_remote(&github::remote_of(facts.slug.as_deref()), &facts.head);
-        PullRequests {
-            merged: asked.merged_pull.filter(|_| asked.merged),
-            open: asked.open_pull,
-        }
-    }
-
     /// True when a worktree's branch tracks a branch of its own on a remote,
     /// one that still exists: the commits ahead of it are then the ones not
     /// pushed. The remote's default branch is not such a branch. A session's
@@ -1207,38 +1288,16 @@ impl Workspace {
                 ..Asked::default()
             };
         }
-        let now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        let ask = || {
-            let found = github::lookup(
-                &self.config.github_api,
-                remote,
-                sha,
-                self.config.github_token_file.as_deref(),
-            )
-            .unwrap_or_default();
-            Asked {
-                merged: found.merged,
-                at_s: now_s,
-                merged_pull: found.merged_pull,
-                open_pull: found.open_pull,
-            }
-        };
-        let (Some(file), Some((owner, repo))) = (&self.merges, github::slug(remote)) else {
-            return ask();
-        };
-        let key = format!("{owner}/{repo}@{sha}");
-        match read_merges(file).get(&key) {
-            Some(answer) if answer.merged => return answer.clone(),
-            Some(answer) if now_s.saturating_sub(answer.at_s) < ASK_AGAIN_AFTER_S => {
-                return answer.clone()
-            }
-            _ => {}
+        self.github().asked(remote, sha)
+    }
+
+    /// GitHub as this workspace asks it.
+    fn github(&self) -> GitHub {
+        GitHub {
+            api: self.config.github_api.clone(),
+            token_file: self.config.github_token_file.clone(),
+            merges: self.merges.clone(),
         }
-        let answer = ask();
-        remember_merge(file, key, answer.clone());
-        answer
     }
 
     fn remove_one(&self, name: &str, info: &RepoInfo, force: bool) -> Result<()> {

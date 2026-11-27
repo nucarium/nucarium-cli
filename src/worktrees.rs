@@ -27,7 +27,7 @@ use crate::repos::answer::Word;
 use crate::repos::{self, could_not_know, transfer, Contained, Inside, Nucleus};
 use crate::sessions::Store;
 use crate::settings::{self, Environment, Settings};
-use crate::workspace::{RepoInfo, Unsaved, Workspace};
+use crate::workspace::{GitHub, RepoInfo, Unsaved, Workspace};
 use crate::{driver, git, paths, usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -317,7 +317,7 @@ pub fn report(workspace: &Workspace, store: &Store, sharing: &[String]) -> Vec<W
 /// from this box's own store and processes.
 pub(crate) fn report_answer(
     answer: &repos::answer::Answer,
-    host: &Workspace,
+    host: &GitHub,
     store: &Store,
     sharing: &[String],
     sessions: &Path,
@@ -336,7 +336,7 @@ pub(crate) fn report_answer(
 /// takes.
 fn folder_of_answer(
     told: &repos::answer::Folder,
-    host: &Workspace,
+    host: &GitHub,
     store: &Store,
     sharing: &[String],
     sessions: &Path,
@@ -1246,7 +1246,7 @@ fn run(
         .leaving_alone(driver::protected_roots(settings))
         .remembering_merges(housekeeping::merges_file(&settings.state_dir));
     let workspace = match nucleus {
-        Nucleus::Host(workspace) => workspace,
+        Nucleus::Host(workspace) => *workspace,
         Nucleus::Contained(contained) => {
             return match inside {
                 Some(inside) => run_contained(settings, environment, &contained, inside, action),

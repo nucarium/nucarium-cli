@@ -13,8 +13,9 @@
 //!
 //! [`Nucleus`] is how every caller gets at an environment's repositories,
 //! so none can run git on the host for a container's by mistake: the
-//! container's side has no git to run, and its host side runs git as
-//! [`git::Git::Elsewhere`], which fails before anything is started.
+//! container's side has no workspace at all, and its host side is GitHub
+//! alone. The only workspace for a container's repositories is made inside
+//! the container, by [`inside`].
 
 pub mod answer;
 pub mod inside;
@@ -22,8 +23,9 @@ pub mod transfer;
 
 use crate::driver::{Call, Condition, Runner};
 use crate::git;
-use crate::settings::Settings;
-use crate::workspace::Workspace;
+use crate::settings::{Environment, Settings};
+use crate::workspace::{GitHub, Workspace};
+use crate::{config, housekeeping};
 use answer::{Answer, Asked, Op};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -46,10 +48,65 @@ pub fn could_not_know(condition: Condition) -> &'static str {
     }
 }
 
+/// The repositories of one environment as the daemon may get at them: on
+/// the host, git run guarded; or, where a container can write them, only
+/// through that container, and never on the host. Its host side asks only
+/// GitHub, and reads nothing of a repository.
+pub(crate) fn nucleus(settings: &Settings, environment: &Environment) -> Nucleus {
+    let config = config_of(environment);
+    match housekeeping::container_of(settings, environment) {
+        Some((container, env)) => Nucleus::Contained(Contained {
+            container,
+            env,
+            vetting: settings.git_vetting,
+            host: GitHub::new(config.github_api, config.github_token_file),
+        }),
+        None => Nucleus::Host(Box::new(guarded(settings, environment, false))),
+    }
+}
+
+fn config_of(environment: &Environment) -> config::Config {
+    config::for_root(
+        &environment.root,
+        environment.github_token_file.clone(),
+        environment.branch_prefix.clone(),
+    )
+}
+
+/// The workspace of one environment where git is run guarded, in
+/// repositories vetted first. A nucleus's repositories must keep their git
+/// data in its `.repos`; a driver's are wherever the owner keeps them, and
+/// only their config is held to the allowlist. Private to this module and
+/// [`inside`]: the host gets a workspace only through [`nucleus`], which
+/// gives none for a container's repositories.
+fn guarded(settings: &Settings, environment: &Environment, stopped_with_caller: bool) -> Workspace {
+    let repos = (!environment.driver_owns_worktrees()).then(|| environment.root.join(".repos"));
+    let mut guarded = git::Guarded::new(repos, settings.git_vetting);
+    if stopped_with_caller {
+        guarded = guarded.stopped_with_caller();
+    }
+    // A driver in a container chooses its worktrees' repositories, but only
+    // among the folders of the environments in that container, which is all
+    // of the box it can see: the box holds them there.
+    if let Some(container) = environment
+        .container()
+        .filter(|_| environment.driver_owns_worktrees())
+    {
+        let folders: Vec<PathBuf> = settings
+            .environments
+            .iter()
+            .filter(|other| other.container() == Some(container))
+            .flat_map(Environment::own_folders)
+            .collect();
+        guarded = guarded.held_to(&folders);
+    }
+    Workspace::new(config_of(environment)).guarded(git::Git::Guarded(guarded))
+}
+
 /// An environment's repositories, as the daemon may get at them.
 pub enum Nucleus {
     /// On the host, where nothing else writes them: git runs here, guarded.
-    Host(Workspace),
+    Host(Box<Workspace>),
     /// Written by a container: git runs in there.
     Contained(Contained),
 }
@@ -59,7 +116,7 @@ impl Nucleus {
     /// [`Workspace::leaving_alone`].
     pub fn leaving_alone(self, folders: Vec<PathBuf>) -> Nucleus {
         match self {
-            Nucleus::Host(workspace) => Nucleus::Host(workspace.leaving_alone(folders)),
+            Nucleus::Host(workspace) => Nucleus::Host(Box::new(workspace.leaving_alone(folders))),
             Nucleus::Contained(contained) => Nucleus::Contained(contained),
         }
     }
@@ -67,7 +124,7 @@ impl Nucleus {
     /// Remember GitHub's answers, as [`Workspace::remembering_merges`].
     pub fn remembering_merges(self, file: PathBuf) -> Nucleus {
         match self {
-            Nucleus::Host(workspace) => Nucleus::Host(workspace.remembering_merges(file)),
+            Nucleus::Host(workspace) => Nucleus::Host(Box::new(workspace.remembering_merges(file))),
             Nucleus::Contained(mut contained) => {
                 contained.host = contained.host.remembering_merges(file);
                 Nucleus::Contained(contained)
@@ -78,9 +135,9 @@ impl Nucleus {
     /// Ask a stand-in for GitHub, as [`Workspace::asking_github_at`].
     pub fn asking_github_at(self, url: &str) -> Nucleus {
         match self {
-            Nucleus::Host(workspace) => Nucleus::Host(workspace.asking_github_at(url)),
+            Nucleus::Host(workspace) => Nucleus::Host(Box::new(workspace.asking_github_at(url))),
             Nucleus::Contained(mut contained) => {
-                contained.host = contained.host.asking_github_at(url);
+                contained.host = contained.host.asking_at(url);
                 Nucleus::Contained(contained)
             }
         }
@@ -98,9 +155,9 @@ pub struct Contained {
     /// The daemon's vetting mode, which the container's config does not
     /// hold.
     pub vetting: git::Vetting,
-    /// The host's side: its GitHub sign-in and what GitHub said before. Its
-    /// git is [`git::Git::Elsewhere`].
-    pub host: Workspace,
+    /// The host's side: GitHub, with the host's own token and what it said
+    /// before. Nothing of the repositories.
+    pub host: GitHub,
 }
 
 impl Contained {
