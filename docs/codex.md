@@ -2,74 +2,102 @@
 
 `agent = "codex"` in an `[[environment]]` table. The adapter is
 `src/agent/codex.rs`; its tests and its part of the privacy gate are in
-`tests/codex.rs`.
+`tests/codex.rs`. Tested with Codex CLI 0.172.0.
 
 ```toml
 [[environment]]
-name = "codex-client-a"
+name = "client-a"
 root = "/home/agent/client-a"
 agent = "codex"
 # That login's CODEX_HOME.
 config_dir = "/home/agent/.codex-client-a"
-# unit = "codex-server@codex-client-a.service"
+# unit = "codex-server@client-a.service"
 ```
 
-`nucleated hooks print --env codex-client-a` prints the block to register,
-and every command in it names `--agent codex`.
+`nucleated hooks print --env client-a` prints the hooks file to
+register, and every command in it names `--agent codex`. To a Watch that
+takes the field, the environment's heartbeat names its agent, `codex`.
 
 Codex has lifecycle hooks of the same shape as Claude Code's, so it is an
 agent adapter, not a driver: Codex calls `nucleated hook`, and the daemon
 asks Codex nothing. No file under `CODEX_HOME` is read, no socket is opened
 and no `codex` process is started, at a heartbeat or at any other time.
 
-## What was read
+## What it was built from
 
-The adapter is written from Codex's own source and documentation, and from
-nothing else:
-
-- openai/codex `main` at commit `39c29c3bb620f91e84a3bb266bb496dfb697c101`
-  (2026-11-19). The files that matter are `codex-rs/hooks/src/schema.rs` and
+- Codex's source at tag `rust-v0.172.0`: `codex-rs/hooks/src/schema.rs` and
   `codex-rs/hooks/schema/generated/` (hook payloads),
   `codex-rs/protocol/src/hooks.rs` and `codex-rs/config/src/hook_config.rs`
-  (the hooks file), `codex-rs/hooks/src/engine/discovery.rs` (where hooks
-  load from, trust, time limits) and `codex-rs/utils/home-dir` (`CODEX_HOME`).
+  (the hooks file), `codex-rs/hooks/src/engine/` (where hooks load from,
+  trust, time limits, matchers) and `codex-rs/utils/home-dir` (`CODEX_HOME`).
+- Codex 0.172.0 run in a container environment, signed in, under `codex
+  exec`, the terminal UI and `codex app-server`, with the vendor's model and
+  with a stand-in model. Its hook payloads are the fixtures under
+  `tests/fixtures/codex/`, scrubbed, with the sentinel written into every
+  field that can carry content. `PreCompact`, `PostCompact`,
+  `SubagentStart`, `SubagentStop` and the `SessionStart` sources other than
+  `startup` never fired; their fixtures are written from the generated
+  schemas at that tag. One session was started from the ChatGPT phone app.
+- The hooks file as `nucleated hooks print --agent codex` writes it, run as
+  `/etc/codex/hooks.json` with this adapter on 0.172.0: a question in Plan
+  mode recorded `input_prompt` and then `activity`, a shell call started no
+  `PreToolUse` hook, and `codex exec --ephemeral` recorded nothing.
 - The hooks, auth, remote-connections and CLI reference pages under
-  <https://learn.chatgpt.com/docs/>, fetched 2026-11-20.
+  <https://learn.chatgpt.com/docs/>.
 
-That commit is not a release, and the pages carry no version. Before the
-gate is trusted for a Codex release, check that release's payload fields
-against the list in `tests/codex.rs`.
+Codex releases every few days. Before the gate is trusted for a later
+release, check that release's payload fields against the fixtures.
 
 ## Registering the hooks
 
 `nucleated hooks print` writes the whole of a Codex `hooks.json`. Its only
 top-level key is `hooks`, because Codex refuses a hooks file with a key it
-does not know. There are two places to put it.
+does not know.
 
-**Per login.** Write the output of `nucleated hooks print --env <name>` to
-that login's `$CODEX_HOME/hooks.json` (`~/.codex/hooks.json` when
-`CODEX_HOME` is not set). Codex does not run a hook from a user's own file
-until its owner has reviewed it: open Codex as that login, run `/hooks` and
-approve them. The approval is tied to the hook's exact text, so it is asked
-for again whenever the command changes. Until then Codex skips the hooks
-without saying so, and the environment shows as alive with no sessions.
+**Box-wide, pinned on.** Write the output of `nucleated hooks print
+--agent codex` to `/etc/codex/hooks.json`, as root, and pin hooks on in
+`/etc/codex/requirements.toml`:
 
-**Box-wide.** Write the output of `nucleated hooks print --agent codex` to
-`/etc/codex/hooks.json`, as root. Hooks from the system file run without a
-review, for every Codex user on the box. The commands name no environment,
-so a hook is placed by its login's `CODEX_HOME`: set `config_dir` on every
-Codex environment to that login's `CODEX_HOME`, and start each login's Codex
-with `CODEX_HOME` set. That hooks from the system file need no review was
-read from Codex's source; its documentation says only that managed hooks are
-trusted by policy.
+```toml
+[features]
+hooks = true
+```
+
+Hooks from the system file run under `exec`, the terminal UI and sessions a
+server hosts, and skip Codex's own review of hooks. Without the pin,
+`[features] hooks = false` in the login's own `config.toml` silences every
+hook with no error, and the environment shows alive with no sessions. With
+it, neither that line nor `-c features.hooks=false` turns them off. Codex
+did not rewrite the three `/etc/codex` files in any run.
+
+The commands name no environment, so a hook is placed by its login's
+`CODEX_HOME`: set `config_dir` on every Codex environment to that login's
+`CODEX_HOME`, and start each login's Codex with `CODEX_HOME` set. Codex runs
+a hook in the session's folder with its server's environment, `CODEX_HOME`
+included.
+
+**Per login.** `nucleated hooks print --env <name>` to that login's
+`$CODEX_HOME/hooks.json`. `codex exec` skips hooks from a login's own file,
+and the terminal UI asks "Hooks need review" at every start until its owner
+runs `/hooks` and approves them, again whenever a command changes. Until
+then nothing is reported.
 
 `nucleated` writes neither file itself, writes nothing into `config.toml`,
-and never uses `--dangerously-bypass-hook-trust`. If the login also keeps a
-`[hooks]` table in `config.toml`, Codex warns that one layer has hooks in two
-forms; keep them in `hooks.json`.
+and never uses `--dangerously-bypass-hook-trust`. Keep hooks in
+`hooks.json`, not in a `[hooks]` table in `config.toml`.
 
-Hooks are on by default in Codex. `[features] hooks = false` in its config
-turns them off, and then nothing is reported.
+**Folder trust.** Codex asks "Trust this folder?" for a git checkout, not
+for a plain folder, and no hook says it is asking. Until a folder is
+trusted, `codex exec` runs there with a read-only sandbox. Trust the folder
+the server starts in ahead of time, in `/etc/codex/config.toml`:
+
+```toml
+[projects."/home/agent/client-a"]
+trust_level = "trusted"
+```
+
+It takes effect for hosted sessions with no server restart. Trusting a
+parent folder does not cover a checkout beneath it.
 
 ## Which login a hook belongs to
 
@@ -79,115 +107,129 @@ environment whose nucleus holds the session's folder; else the only Codex
 environment there is. Two Codex logins that share a nucleus can be told
 apart only by the first two. A hook that cannot be placed records nothing.
 
-Codex runs a hook with its session's own environment, so `CODEX_HOME` is
-there whenever Codex itself was started with it.
-
 ## What is read, and what each event becomes
 
-From every hook's standard input the adapter reads `session_id` and `cwd`.
-From `SessionStart` it also reads `source`. It reads nothing else: the
-parser names those three keys and skips every other value without keeping
-it. The event is the one named on the command line, not the payload's
-`hook_event_name`.
+From every hook's standard input the adapter reads `session_id` and `cwd`,
+and whether `transcript_path` is null. From `SessionStart` it also reads
+`source`, and from `PreToolUse` `tool_name`. It reads nothing else: the
+parser names those keys and skips every other value without keeping it. The event is the one named on the
+command line, not the payload's `hook_event_name`.
 
 `session_id` is sent. `cwd` is used on the box to find the session's repos
-and branch and is never sent. `source` is compared with one word and
-dropped.
+and branch and is never sent. `source` and `tool_name` are each compared
+with one word and dropped. A `transcript_path` that is not null is skipped
+unread.
 
 | Codex event | Reported as |
 |---|---|
+| Any event whose `transcript_path` is null | nothing |
 | `SessionStart` | `session_start`, unless `source` is `compact`: then nothing |
 | `UserPromptSubmit` | `user_prompt_submit` |
+| `PreToolUse` for `request_user_input` | `input_prompt`: a question to the owner |
 | `PermissionRequest` | `permission_prompt` |
 | `PostToolUse` | `activity` |
 | `Stop` | `stop` |
 | `Interrupt` | `stop` |
 | `SessionEnd` | `session_end` |
-| `PreToolUse`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `PreModelRequest`, `PostModelRequest`, anything else | nothing; no command is registered for these |
+| `PreToolUse` for any other tool, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `PreModelRequest`, `PostModelRequest`, anything else | nothing; no command is registered for these |
+
+`PreToolUse` is registered with the matcher `request_user_input`, so Codex
+starts no hook for any other tool. Codex calls that tool to ask its owner a
+question, in Plan mode among others, and asks for no approval while it
+waits. The question's `PostToolUse` puts the session back to working.
 
 `Interrupt` is the owner stopping a turn. Codex runs no `Stop` for a turn
 that was interrupted, so without it the session would look as if it were
 still working.
 
-All but `SessionStart` and `SessionEnd` are registered to run in the
-background. Codex always runs `SessionEnd` in the foreground and gives it,
-and `Interrupt`, at most three seconds; the entry point gives up after two.
+All but `SessionStart` and `SessionEnd` run in the background. Codex always
+runs `SessionEnd` in the foreground and gives it, and `Interrupt`, at most
+three seconds; the entry point gives up after two.
 
 `SessionStart` is registered without `async`, so Codex waits for it. Codex
 runs it when a session's first turn begins, just ahead of that turn's
 `UserPromptSubmit`, and the box orders a session's events by the time each
 hook process took. With both in the background the two could be recorded
 either way round, and a session whose start landed second would show as idle
-through a turn that was running. Codex's hooks page says it waits for a hook
-that is not `async` before continuing what triggered it, so the start is
-always recorded first. The wait is the time it takes to write one small
-file, and never more than the entry point's two seconds. If you registered
-an earlier block that had `"async": true` on `SessionStart`, print the block
-again and replace it; Codex asks for the review again because the text
-changed. A payload that is cut
-short, empty, not JSON, not an object, or has no `session_id` records
-nothing, and the hook still exits 0 without printing.
+through a turn that was running. The wait is the time it takes to write one
+small file, and never more than the entry point's two seconds. If you
+registered an earlier file, print it again and replace it.
 
-Fields that sit beside the three and are skipped unread: `transcript_path`,
-`agent_transcript_path`, `prompt`, `last_assistant_message`, `tool_name`,
-`tool_use_id`, `tool_input`, `tool_response`, `model`, `turn_id`,
-`permission_mode`, `agent_id`, `agent_type`, `stop_hook_active`, `reason`,
-`trigger`, and on the model-request events `status`, `error`, `kind`,
-`request_id`, `response_id`, `thread_id`, `token_usage` and
+A payload that is cut short, empty, not JSON, not an object, or has no
+`session_id` records nothing, and the hook still exits 0 without printing.
+
+Fields beside those that are skipped unread: `transcript_path` (but
+whether it is null), `agent_transcript_path`, `prompt`, `last_assistant_message`, `tool_name`
+(but on `PreToolUse`), `tool_use_id`, `tool_input`, `tool_response`, `model`,
+`turn_id`, `permission_mode`, `agent_id`, `agent_type`, `stop_hook_active`,
+`reason`, `trigger`, and on the model-request events `status`, `error`,
+`kind`, `request_id`, `response_id`, `thread_id`, `token_usage` and
 `attempt_number`. The gate in `tests/codex.rs` puts a sentinel in every one
 of them for every event and finds it nowhere afterwards.
 
-## What Codex gives the box no way to report
+## How a session shows
 
-Each of these was looked for in the hooks, in the files Codex documents and
-in its CLI reference. Where nothing was found, nothing is reported.
+A session first shows at its first prompt: a hosted session's
+`SessionStart` comes with its first prompt, not when a client opens it.
 
-| Not reported | Why |
+| What happens in Codex | What Watch shows |
 |---|---|
-| A turn that failed (`stop_failure`) | No hook runs when a turn ends in an error. `PostModelRequest` can say `failed`, but about one attempt that may be retried, and its `error` is a sentence. |
-| A usage limit and when it resets | No hook carries a machine-readable error kind or a reset time. The limit message is prose with the time in words, and is not parsed. |
-| Waiting on input other than an approval | Only approval has a hook. There is none for a question to the owner or an MCP elicitation. |
-| When the login expires | Codex documents no expiry. The one file that might hold one is the credentials file, which `nucleated` does not read, and the credentials may be in the system keyring. |
-| The installed version | No documented file holds it. `version.json` in `CODEX_HOME` is the newest release Codex has seen offered. Asking would mean starting `codex`. |
-| A link that opens the session on a phone | No documented address opens a Codex session in the ChatGPT app. No vendor session id is sent beside `session_id`. |
+| A prompt | working |
+| An approval asked for | needs input |
+| The approval given | working, at the tool's `PostToolUse` |
+| Esc at the approval | idle: Codex ends the turn and runs `Interrupt` |
+| A decline that lets the turn go on, sent by a client over Codex's protocol | needs input until `Stop`: no `PostToolUse` runs for a declined tool |
+| A question to the owner | needs input, then working when it is answered |
+| The turn finishes | idle |
+| A client quits | nothing: the session goes on |
+| The server stops, or 30 idle minutes pass with no client | ended |
 
-A failed turn, a usage limit and waiting on input do exist as machine-
-readable state in Codex's app-server protocol. That is a connection the
-daemon would have to hold open to a server Codex labels experimental, and
-its stream carries message and tool content as well. It is not used.
+`PermissionRequest` runs before the approval is settled, also when an
+automatic reviewer settles it with nobody waiting, so a "needs input" can
+clear a moment later. Tool hooks inside a subagent carry the root session's
+id, so a subagent's tool use counts as the session's activity. A CLI killed
+by a signal runs no `SessionEnd`.
 
-What follows from the gaps:
+**The title session.** On a server, with the vendor's model, a session's
+first prompt starts a second, hidden session that writes the task's title.
+It never shows. Its hooks carry `transcript_path: null`, and nothing from a
+hook with a null `transcript_path` is recorded. `codex exec --ephemeral`
+sends the same, so an ephemeral `exec` never shows either. A session
+started from the phone app carries a `transcript_path` and shows.
 
-- A turn that fails fires no hook, so its session stays "working" until the
-  next prompt or until `SessionEnd`. Codex runs `SessionEnd` when a
-  conversation is archived or deleted, when Codex closes normally, or after
-  30 minutes idle with no client connected.
-- `PermissionRequest` runs before the approval is settled, including when an
-  automatic reviewer settles it with nobody waiting. A "needs input" can
-  clear a moment later on the next `PostToolUse`.
-- A denied approval runs no `PostToolUse`, so the session can stay in "needs
-  input" until its next tool call or `Stop`.
-- Tool hooks inside a subagent carry the root session's id, so a subagent's
-  tool use counts as the session's activity.
-- `Interrupt`, `SessionEnd` and the model-request events were read from
-  `main`. Whether an older Codex release tolerates a hooks file that names
-  an event it does not have was not checked.
+## What Codex never reports
+
+| Not reported | Why | What Watch shows instead |
+|---|---|---|
+| A turn that failed | No hook runs when a turn ends in an error. `PostModelRequest` says `failed` once per attempt, with nothing on the last, and its `error` is a sentence | working until the next prompt or `SessionEnd`, and stuck once Watch's quiet limit passes |
+| A usage limit and when it resets | No hook carries an error kind or a reset time. The turn fails | as a failed turn |
+| A login that expired | No hook says so, and Codex documents no expiry. A server signed out stays up | the environment alive; each turn as a failed turn |
+| An MCP server asking the owner something | No hook runs for it | working |
+| The installed version | No documented file holds it. Asking would mean starting `codex` | no version |
+| A link that opens the session on a phone | No documented address opens a Codex session in the ChatGPT app | what an alert opens today |
+
+These states do exist in Codex's app-server protocol, but its stream
+carries message and tool content as well. It is not read.
 
 ## The agent server
 
 `server_alive` is what the environment's `unit` or `check` says, as for any
 agent. `contrib/systemd/codex-server@.service` is an example user unit, one
-instance per login, that runs `codex remote-control --no-daemon` with that
-login's `CODEX_HOME`. Codex's reference labels `remote-control` and the app
-server experimental. Codex's own managed daemon (`codex remote-control
-start`) is a detached process systemd does not supervise, so a unit cannot
-stand for it; use `check` with a command of your own if you run that.
+instance per login, that runs `codex app-server --listen unix://
+--remote-control` in the folder new sessions should start in, with that
+login's `CODEX_HOME`. A session a client starts without naming a folder
+runs in the server's folder.
 
-Active means the process is up, not that a phone is paired. OpenAI's
-remote-connections page says phone setup starts from the desktop app and
-cannot be done from the CLI, while the CLI reference documents `codex
-remote-control pair`; whether a headless Linux box can be paired with the
-phone app is not established.
+That is the form a phone can be paired with: `codex remote-control pair`,
+run against it as the same login, prints a code to type into the ChatGPT
+phone app. `codex remote-control --no-daemon` cannot be paired. Ctrl-C and
+SIGTERM end the server in under a tenth of a second, exit 0, and run
+`SessionEnd` for its open sessions.
+
+Signed out, the server stays up, so active does not mean signed in, and
+active does not mean a phone is paired. Phone access needs a ChatGPT plan
+from Plus up; an API-key login passes `codex login status` and cannot use
+it. Codex labels the app server and remote control experimental.
 
 ## When Codex is absent or broken
 

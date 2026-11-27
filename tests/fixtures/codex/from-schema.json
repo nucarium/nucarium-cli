@@ -1,0 +1,152 @@
+{
+ "recorded": "Codex never fired these when they were recorded. Written from Codex's generated hook schemas at rust-v0.172.0: every field each one requires, and agent_id and agent_type where they are optional.",
+ "events": [
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "source": "startup"
+   }
+  },
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "source": "resume"
+   }
+  },
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "source": "clear"
+   }
+  },
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "source": "compact"
+   }
+  },
+  {
+   "event": "SessionStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SessionStart",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "source": "fork"
+   }
+  },
+  {
+   "event": "PreCompact",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PreCompact",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "trigger": "manual"
+   }
+  },
+  {
+   "event": "PreCompact",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PreCompact",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "trigger": "auto"
+   }
+  },
+  {
+   "event": "PostCompact",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PostCompact",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "trigger": "manual"
+   }
+  },
+  {
+   "event": "PostCompact",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "PostCompact",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "trigger": "auto"
+   }
+  },
+  {
+   "event": "SubagentStart",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SubagentStart",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default"
+   }
+  },
+  {
+   "event": "SubagentStop",
+   "payload": {
+    "session_id": "00000000-0000-7000-8000-000000000099",
+    "transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_transcript_path-00000000-0000-7000-8000-000000000099.jsonl",
+    "cwd": "{cwd}",
+    "hook_event_name": "SubagentStop",
+    "turn_id": "ZZLEAKZZ turn_id the user typed this",
+    "agent_id": "ZZLEAKZZ agent_id the user typed this",
+    "agent_type": "ZZLEAKZZ agent_type the user typed this",
+    "model": "ZZLEAKZZ model the user typed this",
+    "permission_mode": "default",
+    "stop_hook_active": false,
+    "agent_transcript_path": "/home/agent/.codex-client-a/sessions/2026/11/26/rollout-ZZLEAKZZ_agent_transcript_path.jsonl",
+    "last_assistant_message": "ZZLEAKZZ last_assistant_message the user typed this"
+   }
+  }
+ ]
+}

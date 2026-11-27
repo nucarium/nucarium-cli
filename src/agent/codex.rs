@@ -4,10 +4,13 @@
 //! Everything that knows what a Codex hook payload looks like is in this
 //! file. Codex's hooks carry a session id and a working folder beside the
 //! prompt, the last message and the tool input and output. Only the first two
-//! are read, and on `SessionStart` the short word that says why it started.
+//! are read, on `SessionStart` the short word that says why it started, and
+//! on `PreToolUse` the tool's name, compared with one name and dropped. Of
+//! `transcript_path` only whether it is null is read: Codex's hidden title
+//! session has no transcript, and is not reported.
 //!
 //! What Codex gives no hook for is not reported: a turn that fails, a usage
-//! limit and when it resets, waiting on anything but an approval, when a
+//! limit and when it resets, an MCP server asking the owner something, when a
 //! login expires, the installed version. `docs/codex.md` says where each of
 //! those was looked for.
 
@@ -36,31 +39,85 @@ struct Common {
     session_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
 }
 
-/// `SessionStart`, the one hook a third field is read from.
+/// `SessionStart`, the one hook `source` is read from.
 #[derive(Deserialize)]
 struct SessionStart {
     #[serde(default, deserialize_with = "short_string")]
     session_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
     /// `startup`, `resume`, `clear`, `compact` or `fork`.
     #[serde(default, deserialize_with = "short_string")]
     source: Option<String>,
 }
 
+/// `PreToolUse`, read only for the tool's name.
+#[derive(Deserialize)]
+struct PreToolUse {
+    #[serde(default, deserialize_with = "short_string")]
+    session_id: Option<String>,
+    #[serde(default, deserialize_with = "short_string")]
+    cwd: Option<String>,
+    /// Whether `transcript_path` is null. See [`no_transcript`].
+    #[serde(
+        default,
+        rename = "transcript_path",
+        deserialize_with = "no_transcript"
+    )]
+    no_transcript: bool,
+    #[serde(default, deserialize_with = "short_string")]
+    tool_name: Option<String>,
+}
+
+/// Whether a field is null, without reading what it holds when it is not.
+/// For a `bool`, with `#[serde(default, deserialize_with = "no_transcript")]`:
+/// a field that is not there is `false`.
+///
+/// Codex sends `transcript_path: null` for a session it keeps no transcript
+/// for (codex-rs/hooks/src/schema.rs at `rust-v0.172.0`). That is the hidden
+/// session a hosted session's first prompt starts to write the task's title,
+/// and `codex exec --ephemeral`, which runs to its end without asking anyone
+/// anything. Neither is a session to show.
+fn no_transcript<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Option::<serde::de::IgnoredAny>::deserialize(deserializer).map(|value| value.is_none())
+}
+
 impl Codex {
     const COMMAND: &'static str = "nucleated hook";
 
-    /// The events to register, each with its time limit in seconds and
-    /// whether it runs in the background.
+    /// The tool Codex calls to put a question to its owner, in Plan mode
+    /// among others. Codex 0.172.0 ran no `PermissionRequest` while it
+    /// waited, only this tool's `PreToolUse` and, once it was answered, its
+    /// `PostToolUse`.
+    const QUESTION_TOOL: &'static str = "request_user_input";
+
+    /// The events to register, each with its time limit in seconds, whether
+    /// it runs in the background, and the matcher that limits it to some
+    /// tools.
     ///
     /// Codex caps `Interrupt` and `SessionEnd` at three seconds and always
     /// runs `SessionEnd` in the foreground
     /// (codex-rs/hooks/src/engine/discovery.rs); the entry point gives up
-    /// after two. None is given a matcher, so each runs for every tool and
-    /// every source.
+    /// after two. Only `PreToolUse` has a matcher: it runs for the question
+    /// tool alone, as Codex matches a name made of letters, digits and `_`
+    /// exactly (codex-rs/hooks/src/engine/matcher.rs). Every other event runs
+    /// for every tool and every source.
     ///
     /// `SessionStart` runs in the foreground. Codex runs it when a session's
     /// first turn begins, just ahead of that turn's `UserPromptSubmit`, and
@@ -73,14 +130,15 @@ impl Codex {
     /// before the prompt's hook is started at all. The wait is the time the
     /// entry point takes to write one small file, and at most its two
     /// seconds.
-    const REGISTERED: &'static [(&'static str, u64, bool)] = &[
-        ("SessionStart", 5, false),
-        ("UserPromptSubmit", 5, true),
-        ("PermissionRequest", 5, true),
-        ("PostToolUse", 5, true),
-        ("Stop", 5, true),
-        ("Interrupt", 3, true),
-        ("SessionEnd", 3, false),
+    const REGISTERED: &'static [(&'static str, u64, bool, Option<&'static str>)] = &[
+        ("SessionStart", 5, false, None),
+        ("UserPromptSubmit", 5, true, None),
+        ("PreToolUse", 5, true, Some(Self::QUESTION_TOOL)),
+        ("PermissionRequest", 5, true, None),
+        ("PostToolUse", 5, true, None),
+        ("Stop", 5, true, None),
+        ("Interrupt", 3, true, None),
+        ("SessionEnd", 3, false, None),
     ];
 }
 
@@ -97,7 +155,7 @@ impl Agent for Codex {
             .map(|c| c.to_ascii_lowercase())
             .collect();
         let common = |payload: &mut dyn Read| read_object::<Common>(payload);
-        let (kind, session_id, cwd) = match event.as_str() {
+        let (kind, session_id, cwd, no_transcript) = match event.as_str() {
             "sessionstart" => {
                 let hook: SessionStart = read_object(payload)?;
                 // A compaction restarts the session's context, not the
@@ -105,22 +163,58 @@ impl Agent for Codex {
                 if hook.source.as_deref() == Some("compact") {
                     return None;
                 }
-                (EventType::SessionStart, hook.session_id, hook.cwd)
+                (
+                    EventType::SessionStart,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             "userpromptsubmit" => {
                 let hook = common(payload)?;
-                (EventType::UserPromptSubmit, hook.session_id, hook.cwd)
+                (
+                    EventType::UserPromptSubmit,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
+            }
+            // Codex is about to put a question to its owner. Any other tool
+            // says nothing about the session: a hooks file registered with no
+            // matcher must not make every command a wait.
+            "pretooluse" => {
+                let hook: PreToolUse = read_object(payload)?;
+                if hook.tool_name.as_deref() != Some(Self::QUESTION_TOOL) {
+                    return None;
+                }
+                (
+                    EventType::InputPrompt,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // A tool ran, so the agent is working: this is how a session
-            // leaves "needs input" after an approval is given.
+            // leaves "needs input" after an approval is given or a question
+            // is answered.
             "posttooluse" => {
                 let hook = common(payload)?;
-                (EventType::Activity, hook.session_id, hook.cwd)
+                (
+                    EventType::Activity,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // Codex is about to ask for an approval.
             "permissionrequest" => {
                 let hook = common(payload)?;
-                (EventType::PermissionPrompt, hook.session_id, hook.cwd)
+                (
+                    EventType::PermissionPrompt,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             // A turn that finished, or one the owner cut short. Either way
             // the agent is idle. Codex runs no `Stop` for an interrupted
@@ -128,18 +222,32 @@ impl Agent for Codex {
             // were still working.
             "stop" | "interrupt" => {
                 let hook = common(payload)?;
-                (EventType::Stop, hook.session_id, hook.cwd)
+                (
+                    EventType::Stop,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
             "sessionend" => {
                 let hook = common(payload)?;
-                (EventType::SessionEnd, hook.session_id, hook.cwd)
+                (
+                    EventType::SessionEnd,
+                    hook.session_id,
+                    hook.cwd,
+                    hook.no_transcript,
+                )
             }
-            // `PreToolUse`, the compaction, subagent and model-request
-            // events, and any name Codex adds later. `PostModelRequest` can
-            // say an attempt failed, but an attempt is not a turn and its
-            // `error` is a sentence, so it is not a failed stop.
+            // The compaction, subagent and model-request events, and any
+            // name Codex adds later. `PostModelRequest` can say an attempt
+            // failed, but an attempt is not a turn and its `error` is a
+            // sentence, so it is not a failed stop.
             _ => return None,
         };
+        // The title session, or an ephemeral `exec`: not a session to show.
+        if no_transcript {
+            return None;
+        }
         Some(Lifecycle {
             event: kind,
             session_id: session_id?,
@@ -169,7 +277,7 @@ impl Agent for Codex {
     /// `hooks`.
     fn hooks_block(&self, env: Option<&str>) -> Value {
         let mut hooks = serde_json::Map::new();
-        for (event, timeout, background) in Self::REGISTERED {
+        for (event, timeout, background, matcher) in Self::REGISTERED {
             let mut command = format!("{} {event} --agent {}", Self::COMMAND, self.name());
             if let Some(env) = env {
                 command.push_str(&format!(" --env {env}"));
@@ -179,7 +287,11 @@ impl Agent for Codex {
             if *background {
                 handler["async"] = json!(true);
             }
-            hooks.insert(event.to_string(), json!([{ "hooks": [handler] }]));
+            let mut group = json!({ "hooks": [handler] });
+            if let Some(matcher) = matcher {
+                group["matcher"] = json!(matcher);
+            }
+            hooks.insert(event.to_string(), json!([group]));
         }
         json!({ "hooks": hooks })
     }
@@ -215,6 +327,45 @@ mod tests {
         json!({ "session_id": "s1", "cwd": "/home/agent/work" })
     }
 
+    /// What `PreToolUse` carries when Codex is about to ask its owner a
+    /// question.
+    fn question() -> Value {
+        let mut payload = base();
+        payload["tool_name"] = json!("request_user_input");
+        payload
+    }
+
+    #[test]
+    fn only_the_question_tool_makes_a_pre_tool_use_a_wait() {
+        let asked = lifecycle("PreToolUse", question()).unwrap();
+        assert_eq!(asked.event, EventType::InputPrompt);
+        assert_eq!(asked.session_id, "s1");
+        assert_eq!(asked.cwd, Some(PathBuf::from("/home/agent/work")));
+        // Any other tool, or a name that is near it but not it, is nothing.
+        for name in [
+            json!("Bash"),
+            json!("apply_patch"),
+            json!("mcp__server__request_user_input"),
+            json!("Request_User_Input"),
+            json!("request_user_input "),
+            json!(""),
+            json!(["request_user_input"]),
+            json!({ "name": "request_user_input" }),
+            Value::Null,
+        ] {
+            let mut payload = base();
+            payload["tool_name"] = name.clone();
+            assert_eq!(kind("PreToolUse", payload), None, "{name}");
+        }
+        assert_eq!(kind("PreToolUse", base()), None);
+        // The tool's name decides nothing on any other event.
+        assert_eq!(kind("PostToolUse", question()), Some(EventType::Activity));
+        assert_eq!(
+            kind("PermissionRequest", question()),
+            Some(EventType::PermissionPrompt)
+        );
+    }
+
     #[test]
     fn each_hook_event_becomes_its_lifecycle_event() {
         let started = |source: &str| {
@@ -232,6 +383,7 @@ mod tests {
             Some(EventType::UserPromptSubmit)
         );
         assert_eq!(kind("PostToolUse", base()), Some(EventType::Activity));
+        assert_eq!(kind("PreToolUse", question()), Some(EventType::InputPrompt));
         assert_eq!(
             kind("PermissionRequest", base()),
             Some(EventType::PermissionPrompt)
@@ -261,6 +413,50 @@ mod tests {
             "",
         ] {
             assert_eq!(kind(event, base()), None, "{event}");
+        }
+    }
+
+    #[test]
+    fn a_session_codex_keeps_no_transcript_for_is_never_reported() {
+        let untranscribed = |event: &str| {
+            let mut payload = if event == "PreToolUse" {
+                question()
+            } else {
+                base()
+            };
+            payload["transcript_path"] = Value::Null;
+            payload["permission_mode"] = json!("bypassPermissions");
+            payload
+        };
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+            "Interrupt",
+            "SessionEnd",
+        ] {
+            assert_eq!(kind(event, untranscribed(event)), None, "{event}");
+            // A transcript of any shape, or none named at all, is a session.
+            let named = if event == "PreToolUse" {
+                question()
+            } else {
+                base()
+            };
+            assert!(kind(event, named.clone()).is_some(), "{event}");
+            for path in [
+                json!("/home/agent/.codex/sessions/rollout.jsonl"),
+                json!(""),
+                json!({ "path": "/x" }),
+                json!(["/x"]),
+                json!(false),
+            ] {
+                let mut payload = named.clone();
+                payload["transcript_path"] = path.clone();
+                assert!(kind(event, payload).is_some(), "{event}: {path}");
+            }
         }
     }
 
@@ -374,6 +570,7 @@ mod tests {
         let registered = [
             "SessionStart",
             "UserPromptSubmit",
+            "PreToolUse",
             "PermissionRequest",
             "PostToolUse",
             "Stop",
@@ -384,20 +581,34 @@ mod tests {
         for event in registered {
             let groups = hooks[event].as_array().unwrap();
             assert_eq!(groups.len(), 1);
-            // No matcher: every tool, every source.
-            assert_eq!(groups[0].as_object().unwrap().len(), 1);
+            // No matcher but on `PreToolUse`: every tool, every source.
+            let matcher = groups[0].get("matcher").and_then(Value::as_str);
+            assert_eq!(
+                groups[0].as_object().unwrap().len(),
+                1 + usize::from(matcher.is_some())
+            );
+            assert_eq!(
+                matcher,
+                (event == "PreToolUse").then_some("request_user_input")
+            );
             let handler = &groups[0]["hooks"][0];
             assert_eq!(handler["type"], "command");
             assert_eq!(
                 handler["command"],
                 format!("nucleated hook {event} --agent codex")
             );
-            // Every event registered is one the adapter turns into something.
-            assert!(kind(event, base()).is_some(), "{event}");
+            // Every event registered is one the adapter turns into something,
+            // for what its matcher lets through.
+            let mut payload = base();
+            if let Some(matcher) = matcher {
+                payload["tool_name"] = json!(matcher);
+            }
+            assert!(kind(event, payload).is_some(), "{event}");
         }
         assert_eq!(hooks["Stop"][0]["hooks"][0]["async"], true);
         assert_eq!(hooks["Interrupt"][0]["hooks"][0]["async"], true);
         assert_eq!(hooks["UserPromptSubmit"][0]["hooks"][0]["async"], true);
+        assert_eq!(hooks["PreToolUse"][0]["hooks"][0]["async"], true);
         // Codex runs SessionEnd in the foreground whatever it is told, and
         // caps it and Interrupt at three seconds.
         assert!(hooks["SessionEnd"][0]["hooks"][0].get("async").is_none());

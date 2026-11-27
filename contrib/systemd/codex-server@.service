@@ -1,7 +1,7 @@
 # An example, not something nucleated installs or starts.
 #
-# One Codex login's agent server, as a systemd user unit, so that nucleated
-# has something to report as alive: `systemctl --user is-active
+# One Codex login's server, as a systemd user unit, so that nucleated has
+# something to report as alive: `systemctl --user is-active
 # codex-server@client-a.service` is what the heartbeat asks. The instance
 # name is the environment's name.
 #
@@ -16,18 +16,25 @@
 #   config_dir = "/home/agent/.codex-client-a"
 #   unit = "codex-server@client-a.service"
 #
-# This rests on a Codex command its own reference labels experimental:
-# `codex remote-control --no-daemon` runs an app server in the foreground
-# until it is stopped. A Codex update may change or remove it. Codex's own
-# managed daemon (`codex remote-control start`) is a detached process that
-# systemd does not supervise, so it cannot stand behind this unit. OpenAI
-# documents no systemd setup for Codex.
+# `codex app-server --listen unix:// --remote-control` runs Codex's server in
+# the foreground, with its control socket in CODEX_HOME, so that
+# `codex remote-control pair`, run as the same login, can print a code for
+# the ChatGPT phone app. Tested with Codex 0.172.0, which labels the app
+# server and remote control experimental.
 #
-# Active means the process is up. It does not mean a phone is paired or
-# connected: nucleated does not ask Codex anything.
+# Signed out, the server stays up and no phone can reach it, so the unit
+# starts it only for a ChatGPT login and otherwise stops, with no restart.
+# An API-key login passes `codex login status` and cannot use remote
+# control. After signing in:
+#
+#   CODEX_HOME=~/.codex-client-a codex login --device-auth
+#   systemctl --user restart codex-server@client-a.service
+#
+# Active means the server is up and was signed in when it started. It does
+# not mean a phone is paired: nucleated does not ask Codex anything.
 
 [Unit]
-Description=Codex agent server for %i
+Description=Codex server for %i
 After=network-online.target
 Wants=network-online.target
 
@@ -37,13 +44,15 @@ Type=simple
 # and it is how nucleated tells one login's hooks from another's: keep it the
 # same as the environment's `config_dir`.
 Environment=CODEX_HOME=%h/.codex-%i
-# The environment's nucleus.
+# The folder a session starts in when its client names none: the
+# environment's nucleus. Trust it in /etc/codex/config.toml.
 WorkingDirectory=%h/%i
 # Put the folder `codex` is installed in on this unit's PATH, or write its
-# full path here.
-ExecStart=/usr/bin/env codex remote-control --no-daemon
+# full path here. 78 is "not signed in with ChatGPT": no restart for it.
+ExecStart=/bin/sh -c 'codex login status 2>&1 | grep -qx "Logged in using ChatGPT" || { echo "%i: not signed in with ChatGPT" >&2; exit 78; }; exec codex app-server --listen unix:// --remote-control'
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 NoNewPrivileges=yes
 
 [Install]
