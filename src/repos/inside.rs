@@ -16,9 +16,9 @@
 //! [`crate::driver::cut_off`]).
 
 use super::answer::{
-    valid_label, valid_name, valid_wip_ref, Answer, Backup, Facts, Fetched, Folder, Holding, Op,
-    Outcome, Pushed, Removal, Repo, SnapAction, Snapshot, Word, Worktree, MAX_ANSWER, MAX_COUNT,
-    MAX_FOLDERS, MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
+    valid_label, valid_name, valid_record, valid_wip_ref, Answer, Backup, Facts, Fetched, Folder,
+    Holding, Op, Outcome, Pushed, Removal, Repo, SnapAction, Snapshot, Word, Worktree, MAX_ANSWER,
+    MAX_COUNT, MAX_FOLDERS, MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
 };
 use super::transfer;
 use crate::driver::{self, Condition};
@@ -741,8 +741,17 @@ fn snapshot(
     let Some(scratch) = Scratch::new() else {
         return Condition::Error;
     };
-    let pushed: BTreeSet<&str> = pushed.iter().map(String::as_str).collect();
-    let already = |tree: &str| pushed.contains(tree);
+    // What the host recorded as pushed, by repo and branch.
+    let pushed: std::collections::BTreeMap<&str, &str> = pushed
+        .iter()
+        .filter_map(|pair| pair.rsplit_once('='))
+        .filter(|(name, tree)| valid_record(name) && commit_id(tree))
+        .collect();
+    let repo_now = std::cell::RefCell::new(String::new());
+    let already = |branch: &str, tree: &str| {
+        let name = format!("{}-{}", repo_now.borrow(), branch.replace('/', "-"));
+        pushed.get(name.as_str()) == Some(&tree)
+    };
     let how = housekeeping::Snapping {
         index_dir: &scratch.0,
         plain_index: true,
@@ -779,6 +788,7 @@ fn snapshot(
             building(|answer| answer.unreadable = true);
             continue;
         }
+        *repo_now.borrow_mut() = item.repo.clone();
         let worktrees = match workspace.worktrees(&item.bare) {
             Ok(worktrees) => worktrees,
             Err(error) => {

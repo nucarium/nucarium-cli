@@ -341,6 +341,15 @@ pub struct Backup {
     pub reference: String,
 }
 
+/// The name a snapshot is recorded by, `<repo>-<branch>`: at most 200 of
+/// `[A-Za-z0-9._-]`.
+pub fn valid_record(name: &str) -> bool {
+    (1..=200).contains(&name.len())
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
 /// `refs/wip/` and a name of `[A-Za-z0-9._-]{1,240}`.
 pub fn valid_wip_ref(reference: &str) -> bool {
     reference.strip_prefix("refs/wip/").is_some_and(|name| {
@@ -549,6 +558,8 @@ pub struct Asked<'a> {
     pub folders: &'a [String],
     /// The action whose backups a removal may push, when it may.
     pub discard: Option<&'a str>,
+    /// Nothing was to be done, only said.
+    pub dry_run: bool,
 }
 
 impl<'a> Asked<'a> {
@@ -560,6 +571,7 @@ impl<'a> Asked<'a> {
             driver: false,
             folders: &[],
             discard: None,
+            dry_run: false,
         }
     }
 }
@@ -750,6 +762,12 @@ impl Answer {
             })
             && self.snapshots.len() <= MAX_WORKTREES
             && self.snapshots.iter().all(Snapshot::fits)
+            // A dry run pushes nothing, and a real one says what it pushed.
+            && self.snapshots.iter().all(|snapped| match snapped.action {
+                SnapAction::Snapshot => !asked.dry_run,
+                SnapAction::WouldSnapshot => asked.dry_run,
+                _ => true,
+            })
             && self.pushes.len() <= MAX_FOLDER_REPOS
             && self
                 .pushes
@@ -817,6 +835,7 @@ mod tests {
         driver: false,
         folders: &[],
         discard: None,
+        dry_run: false,
     };
 
     fn checked(value: &Value, asked: &Asked) -> Result<Answer, Condition> {
@@ -959,6 +978,7 @@ mod tests {
             driver: false,
             folders: &[],
             discard: None,
+            dry_run: false,
         };
         let mut one = good();
         one["folders"] = json!([good()["folders"][0].clone()]);

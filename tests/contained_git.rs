@@ -984,6 +984,15 @@ fn age(path: &Path) {
         .success());
 }
 
+/// The tree the host has recorded as snapshotted for `name`,
+/// `<repo>-<branch>`.
+fn recorded(rig: &Rig, name: &str) -> Option<String> {
+    let file = rig.home.state_dir().join("snapshots/client-a.json");
+    let text = fs::read_to_string(file).ok()?;
+    let recorded: Value = serde_json::from_str(&text).unwrap();
+    recorded[name].as_str().map(str::to_string)
+}
+
 /// A session whose worktree holds a file not committed that a snapshot
 /// would push.
 fn with_work(rig: &Rig, name: &str) -> PathBuf {
@@ -1065,19 +1074,62 @@ fn a_snapshot_is_pushed_from_inside_and_what_the_host_recorded_is_not_pushed_aga
         &rig.upstream,
         &["rev-parse", "refs/wip/workspace-fix-login^{tree}"],
     );
-    let kept = fs::read_to_string(
-        rig.home
-            .state_dir()
-            .join("snapshots/client-a/web-workspace-fix-login"),
-    )
-    .unwrap();
-    assert_eq!(kept.trim(), pushed);
+    assert_eq!(recorded(rig, "web-workspace-fix-login").unwrap(), pushed);
 
     let out = boxed.job("snapshot", &[], None);
     let report = &stdout_json(&out)[0];
     assert_eq!(report["worktrees"][0]["action"], "skipped");
     assert_eq!(report["worktrees"][0]["reason"], "already snapshotted");
     assert_eq!(boxed.host_git(), Vec::<String>::new());
+
+    // The record is one file, and it does not grow without end.
+    let file = rig.home.state_dir().join("snapshots/client-a.json");
+    let many: serde_json::Map<String, Value> = (0..5_000)
+        .map(|n| (format!("old-{n:05}"), json!(pushed.clone())))
+        .collect();
+    fs::write(&file, Value::Object(many).to_string()).unwrap();
+    fs::write(rig.root.join(".worktrees/fix-login/web/more.txt"), "more\n").unwrap();
+    age(&rig.root.join(".worktrees/fix-login/web/more.txt"));
+    let out = boxed.job("snapshot", &[], None);
+    assert_eq!(stdout_json(&out)[0]["worktrees"][0]["action"], "snapshot");
+    let kept: serde_json::Map<String, Value> =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(kept.len() <= 4096, "{}", kept.len());
+    assert!(kept.contains_key("web-workspace-fix-login"));
+}
+
+#[test]
+fn a_tree_recorded_for_one_branch_does_not_stop_the_same_tree_on_another() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    with_work(rig, "one");
+    let other = rig.session("two");
+    let out = boxed.job("snapshot", &[], None);
+    assert_eq!(stdout_json(&out)[0]["worktrees"][0]["action"], "snapshot");
+    // The same work on another branch makes the same tree, which is that
+    // branch's to snapshot all the same.
+    fs::write(other.join("notes.txt"), "work\n").unwrap();
+    age(&other.join("notes.txt"));
+    let out = boxed.job("snapshot", &[], None);
+    let report = &stdout_json(&out)[0];
+    let two = report["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["folder"] == "two")
+        .cloned()
+        .unwrap();
+    assert_eq!(two["action"], "snapshot", "{report}");
+    assert_eq!(
+        git(
+            &rig.upstream,
+            &["rev-parse", "refs/wip/workspace-one^{tree}"]
+        ),
+        git(
+            &rig.upstream,
+            &["rev-parse", "refs/wip/workspace-two^{tree}"]
+        )
+    );
 }
 
 #[test]
@@ -1399,7 +1451,7 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
     let boxed = boxed();
     let rig = &boxed.rig;
     with_work(rig, "fix-login");
-    let keys = rig.home.state_dir().join("snapshots/client-a");
+    let keys = rig.home.state_dir().join("snapshots/client-a.json");
     let fetched = |repo: &str| json!([{ "repo": repo, "ok": true }]);
     for (what, answer) in [
         (
@@ -1465,6 +1517,18 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
             ),
         ),
         (
+            "would_snapshot in a run that was to push",
+            write_answer(
+                "snapshot",
+                "ok",
+                "snapshots",
+                json!([{
+                    "repo": "web", "branch": "workspace/fix-login", "action": "would_snapshot",
+                    "tree": tree, "ref": "refs/wip/workspace-fix-login",
+                }]),
+            ),
+        ),
+        (
             "a tree that is no tree",
             write_answer(
                 "snapshot",
@@ -1479,12 +1543,31 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
     ] {
         answers(rig, "snapshot", &answer);
         assert!(job_inside(&boxed, Job::Snapshot, None).is_err(), "{what}");
-        assert!(gate::leaks_on_disk(&keys).is_empty());
-        assert!(
-            fs::read_dir(&keys).map_or(true, |mut files| files.next().is_none()),
-            "{what}"
-        );
+        assert!(!keys.exists(), "{what}");
     }
+    // A dry run that says it pushed something is no answer, and nothing of
+    // it is recorded.
+    answers(
+        rig,
+        "snapshot",
+        &write_answer(
+            "snapshot",
+            "ok",
+            "snapshots",
+            snapshot("refs/wip/workspace-fix-login"),
+        ),
+    );
+    let settings = rig.settings();
+    let environment = settings.environment("client-a").unwrap();
+    let dry = nucleate::housekeeping::run_job_with(
+        &settings,
+        environment,
+        Job::Snapshot,
+        true,
+        Some(&inside(&boxed, None)),
+    );
+    assert!(dry.is_err(), "{dry:?}");
+    assert!(!keys.exists());
     // Cut short, what it says it pushed is recorded, and the run is not good.
     answers(
         rig,
@@ -1497,12 +1580,14 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
         ),
     );
     assert!(job_inside(&boxed, Job::Snapshot, None).is_err());
-    let kept = fs::read_to_string(keys.join("web-workspace-fix-login")).unwrap();
-    assert_eq!(kept.trim(), tree);
+    assert_eq!(
+        recorded(rig, "web-workspace-fix-login").as_deref(),
+        Some(tree)
+    );
     // One that could not read, or did not look at, some of the nucleus is
     // recorded for what it did, and the run is not good.
     for flag in ["unreadable", "left_out"] {
-        fs::remove_dir_all(&keys).unwrap();
+        fs::remove_file(&keys).unwrap();
         let mut answer = write_answer(
             "snapshot",
             "ok",
@@ -1516,7 +1601,7 @@ fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_th
             format!("{error:#}").contains("could not read all"),
             "{flag}: {error:#}"
         );
-        assert!(keys.join("web-workspace-fix-login").is_file(), "{flag}");
+        assert!(recorded(rig, "web-workspace-fix-login").is_some(), "{flag}");
     }
     assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
 }

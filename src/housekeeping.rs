@@ -262,11 +262,14 @@ fn run_contained(
             report
         }
         Job::Snapshot => {
-            let keys = settings.state_dir.join("snapshots").join(&environment.name);
+            let file = settings
+                .state_dir
+                .join("snapshots")
+                .join(format!("{}.json", environment.name));
             let answer = contained
-                .snapshot(inside, settings, dry_run, &pushed_trees(&keys))
+                .snapshot(inside, settings, dry_run, &pushed_pairs(&recorded(&file)))
                 .map_err(not_known)?;
-            let report = json!({ "worktrees": snapshot_report(&answer, &keys)? });
+            let report = json!({ "worktrees": snapshot_report(&answer, &file)? });
             all_done(&answer)?;
             report
         }
@@ -357,28 +360,40 @@ fn fetched_report(answer: &repos::answer::Answer) -> Vec<Value> {
         .collect()
 }
 
-/// The trees the host has recorded as snapshotted, in its keys files.
-fn pushed_trees(keys: &Path) -> Vec<String> {
-    let mut trees: Vec<String> = fs::read_dir(keys)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-        .filter_map(|entry| paths::read_plain(&entry.path(), 256).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|tree| crate::reporter::commit_id(tree))
-        .collect();
-    trees.sort();
-    trees.dedup();
-    trees.truncate(repos::answer::MAX_WORKTREES);
-    trees
+/// The most snapshots recorded for one environment in a container.
+const MAX_RECORDED: usize = repos::answer::MAX_WORKTREES;
+
+/// What the host has recorded as snapshotted for an environment in a
+/// container: one small file, `<repo>-<branch>` to the tree pushed, held to
+/// [`MAX_RECORDED`].
+fn recorded(file: &Path) -> BTreeMap<String, String> {
+    let mut recorded: BTreeMap<String, String> = paths::read_plain(file, 1024 * 1024)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    recorded
+        .retain(|name, tree| repos::answer::valid_record(name) && crate::reporter::commit_id(tree));
+    while recorded.len() > MAX_RECORDED {
+        recorded.pop_first();
+    }
+    recorded
+}
+
+/// What the container is told of them: `<repo>-<branch>=<tree>`.
+fn pushed_pairs(recorded: &BTreeMap<String, String>) -> Vec<String> {
+    recorded
+        .iter()
+        .map(|(name, tree)| format!("{name}={tree}"))
+        .collect()
 }
 
 /// A snapshot's worktrees, as the report says them, with each tree pushed
-/// recorded in its keys file.
-fn snapshot_report(answer: &repos::answer::Answer, keys: &Path) -> Result<Vec<Value>> {
+/// recorded in `file`.
+fn snapshot_report(answer: &repos::answer::Answer, file: &Path) -> Result<Vec<Value>> {
     use repos::answer::SnapAction;
     let mut report = Vec::new();
+    let mut record = recorded(file);
+    let mut changed = false;
     for snapped in &answer.snapshots {
         let action = match snapped.action {
             SnapAction::Snapshot => "snapshot",
@@ -409,12 +424,18 @@ fn snapshot_report(answer: &repos::answer::Answer, keys: &Path) -> Result<Vec<Va
             // Named as on the host: the ref's checked name holds nothing
             // but letters, digits and `._-`.
             let name = format!("{}-{}", snapped.repo, dashed(&snapped.branch));
-            if name.len() <= 200 {
-                paths::create_private_dir(keys)?;
-                fs::write(keys.join(name), format!("{tree}\n"))?;
+            if repos::answer::valid_record(&name) {
+                record.insert(name, tree.clone());
+                changed = true;
             }
         }
         report.push(entry);
+    }
+    if changed {
+        while record.len() > MAX_RECORDED {
+            record.pop_first();
+        }
+        paths::write_private(file, serde_json::to_string(&record)?.as_bytes())?;
     }
     Ok(report)
 }
@@ -800,8 +821,8 @@ pub(crate) struct Snapping<'a> {
     pub index_dir: &'a Path,
     /// Copy the index only when it is a plain file, never through a link.
     pub plain_index: bool,
-    /// Whether a tree was pushed already.
-    pub already: &'a dyn Fn(&str) -> bool,
+    /// Whether a tree was pushed already for this branch.
+    pub already: &'a dyn Fn(&str, &str) -> bool,
     /// Whether a ref may be pushed to.
     pub usable: &'a dyn Fn(&str) -> bool,
     pub dry_run: bool,
@@ -839,7 +860,7 @@ pub(crate) fn snapshot_core(git: &git::Git, worktree: &Path, how: &Snapping) -> 
     if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
         return Ok(Snapped::Skipped(Word::NothingUncommitted));
     }
-    if (how.already)(&tree) {
+    if (how.already)(&branch, &tree) {
         return Ok(Snapped::Skipped(Word::AlreadySnapshotted));
     }
     if how.dry_run {
@@ -896,9 +917,9 @@ fn snapshot_one(
     };
     paths::create_private_dir(keys)?;
     let key = |branch: &str| keys.join(format!("{repo}-{}", dashed(branch)));
-    let branch_now = git.tree(worktree, &["branch", "--show-current"])?;
-    let already =
-        |tree: &str| fs::read_to_string(key(&branch_now)).is_ok_and(|pushed| pushed.trim() == tree);
+    let already = |branch: &str, tree: &str| {
+        fs::read_to_string(key(branch)).is_ok_and(|pushed| pushed.trim() == tree)
+    };
     let how = Snapping {
         index_dir: keys,
         plain_index: false,

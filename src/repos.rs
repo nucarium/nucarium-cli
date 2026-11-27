@@ -255,7 +255,8 @@ impl Contained {
     }
 
     /// Push what each worktree has not committed to its hidden ref, but not
-    /// a tree in `pushed`, which the host has recorded as pushed already.
+    /// a tree `pushed` records as pushed already for that repo and branch:
+    /// `<repo>-<branch>=<tree>`.
     pub fn snapshot(
         &self,
         inside: &Inside,
@@ -272,6 +273,7 @@ impl Contained {
         }
         let asked = Asked {
             op: Op::Snapshot,
+            dry_run,
             ..Asked::census()
         };
         self.ask(inside, settings, more, &asked)
