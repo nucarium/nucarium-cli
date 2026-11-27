@@ -676,9 +676,10 @@ fn push_why(word: Word, network: bool) -> &'static str {
         Word::Rejected => "the branch on GitHub has commits this one does not",
         Word::SignIn => "GitHub did not accept the box's sign-in",
         Word::NoNetwork if network => "the environment's network does not reach GitHub",
-        // On the host, a proxy that would not go to GitHub is GitHub not
-        // being reached, as it always has been said.
-        Word::Unreachable | Word::NoNetwork => "GitHub could not be reached",
+        // On the host, a proxy's 403 reads as it always has: its 403 was
+        // taken for GitHub's own refusal of the sign-in.
+        Word::NoNetwork => "GitHub did not accept the box's sign-in",
+        Word::Unreachable => "GitHub could not be reached",
         Word::Refused => "GitHub refused it",
         Word::BadBranch => "its branch has a name that cannot be pushed safely",
         Word::CannotRun => "git cannot be run there",
@@ -1855,6 +1856,16 @@ mod tests {
         );
         let denied = push_failure("remote: Permission to octo/api.git denied", "octo/api");
         assert!(denied.ends_with("did not accept the box's sign-in."));
+        // A host environment's proxy refusing GitHub reads as it always
+        // has.
+        assert_eq!(
+            push_failure(
+                "fatal: unable to access 'https://github.com/octo/api.git/': \
+                 CONNECT tunnel failed, response 403",
+                "api"
+            ),
+            "api was not pushed: GitHub did not accept the box's sign-in."
+        );
         let other = push_failure(
             "fatal: '/srv/repos/api' does not appear to be a git repository",
             "api",
