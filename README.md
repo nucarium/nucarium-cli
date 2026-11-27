@@ -1486,6 +1486,24 @@ with the overrides above: hooks, the file-system monitor and an attributes
 file stay off, and any other program its config, or a submodule's, names can
 run.
 
+**An environment in a container.** For an environment in a container, and for
+one on the host that shares its nucleus with one, the daemon runs no git on
+the host at all: the container can write those repos, and what git reads in
+them could lead it out of the environment. It runs the box's own `nucleated
+repos` inside the container with one `podman exec`, as it takes a driver's
+look, with the same check and overrides there, and takes back one small
+answer held to fixed shapes and caps: repo and folder names, branches, commit
+ids, counts and fixed words, and never a path, a file's name or contents, or a
+commit's subject. GitHub is still asked from the host, with the host's own
+token, about the commits the answer names. The count of unsaved work, the
+session folders a heartbeat reports, what a stopped session left behind, and
+what `cleanup` would remove all come from that answer. A container that is
+not running, or an answer that does not fit, leaves the count and the folders
+unknown and tells no outcome, and `cleanup` fails with a fixed sentence and
+removes nothing. `refresh`, `snapshot`, `cleanup`'s removal, and Watch's Push
+and Clean up are not done yet for such an environment: each says so and does
+nothing, and none is done on the host in its place.
+
 ## Assumptions
 
 Choices this repository makes where the product spec leaves room:
