@@ -1,4 +1,6 @@
-//! Ending, from the box, a look the host gave up on.
+//! Ending, from the box, a look the host gave up on, or a call of
+//! `nucleated repos`, which runs git for the host inside a container and is
+//! ended the same way.
 //!
 //! A look runs in its container through `podman exec`. When the host's
 //! deadline passes first, the daemon stops its `podman exec`, but that is
@@ -14,7 +16,7 @@
 //!
 //! A process is taken for the look only when it is in the container's own
 //! process namespace and its command line is the box's own program, then
-//! `look`, then the look's token. Then everything it started, however deep,
+//! `look` or `repos`, then the look's token. Then everything it started, however deep,
 //! in that namespace or one made inside it.
 //!
 //! A process id names whatever holds it now, and an id freed is soon given
@@ -131,7 +133,7 @@ impl Process {
         let args = &self.args;
         args.len() >= 4
             && args[0] == program.as_os_str().as_bytes()
-            && args[1] == b"look"
+            && matches!(args[1].as_slice(), b"look" | b"repos")
             && args
                 .windows(2)
                 .any(|pair| pair[0] == b"--token" && pair[1] == token.as_bytes())
@@ -332,6 +334,14 @@ mod tests {
             token,
         ];
         assert!(look(&ours));
+        // `nucleated repos`, git for the host inside the container, is
+        // ended the same way.
+        let mut repos = ours;
+        repos[1] = "repos";
+        assert!(look(&repos));
+        let mut other_word = ours;
+        other_word[1] = "hook";
+        assert!(!look(&other_word));
         // Another look's token, another program, the client that started it,
         // or the token where it is not the token.
         let mut other = ours;

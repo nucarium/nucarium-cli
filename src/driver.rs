@@ -256,6 +256,17 @@ pub enum Condition {
 }
 
 impl Condition {
+    /// Why a call into a container brought nothing back, in these words.
+    pub fn of(failure: Failure) -> Condition {
+        match failure {
+            Failure::Late => Condition::Timeout,
+            // No `podman`, no container running, or nothing that could be
+            // started in it: there is nothing there to be asked.
+            Failure::Absent | Failure::Failed => Condition::Absent,
+            Failure::TooMuch | Failure::NoAnswer => Condition::BadReply,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Condition::Ok => "ok",
@@ -1248,6 +1259,18 @@ pub fn apply(
     written as usize
 }
 
+/// One call of the box's own `nucleated`: `nucleated <word> --env <env>`
+/// and `more`, inside `container` or, with none, on the host. The host
+/// gives it the first of `limits`, and tells it the second.
+pub(crate) struct Call<'a> {
+    pub container: Option<&'a str>,
+    pub env: &'a str,
+    pub word: &'a str,
+    pub more: &'a [String],
+    pub limits: (Duration, Duration),
+    pub max: u64,
+}
+
 /// How the host has a look taken: the box's own `nucleated`, and `podman`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Runner {
@@ -1276,13 +1299,13 @@ impl Runner {
         })
     }
 
-    /// The command for one look at `environment`: inside its container
-    /// through one `podman exec` of the box's own `nucleated`, or, for an
-    /// environment on the host, that program itself with the daemon's
-    /// config. The arguments are the look's own fixed ones, the
-    /// environment's config name, numbers, and what the last look left.
-    fn command(&self, settings: &Settings, environment: &Environment, args: &[String]) -> Command {
-        match environment.container() {
+    /// The command for one call of `nucleated <word>` for an environment:
+    /// inside its container through one `podman exec` of the box's own
+    /// `nucleated`, or, with no container, that program itself with the
+    /// daemon's config. The arguments are the call's own fixed ones, the
+    /// environment's config name, numbers, and fixed words.
+    fn command(&self, settings: &Settings, container: Option<&str>, args: &[String]) -> Command {
+        match container {
             Some(container) => {
                 let mut command = Command::new(&self.podman);
                 command
@@ -1300,6 +1323,47 @@ impl Runner {
         }
     }
 
+    /// Make one [`Call`] of `nucleated`, and read what it prints with
+    /// `read`, at most `call.max` bytes of it. It is told its own time, the
+    /// host's clock and a token of its own. One given up on is over for the
+    /// host at once; what is left of it in the container is ended from the
+    /// box (see [`cut_off`]), and `podman exec` then returns by itself,
+    /// which is what lets the engine forget the exec.
+    pub(crate) fn inside<T>(
+        &self,
+        settings: &Settings,
+        call: Call,
+        now: SystemTime,
+        read: impl FnOnce(&mut dyn std::io::Read) -> Option<T>,
+    ) -> Result<T, Failure> {
+        let token = token(now);
+        let (outer, inner) = call.limits;
+        let mut args = vec![
+            call.word.to_string(),
+            "--env".to_string(),
+            call.env.to_string(),
+            "--within".to_string(),
+            inner.as_millis().to_string(),
+            "--now".to_string(),
+            unix_ms(now).to_string(),
+            "--token".to_string(),
+            token.clone(),
+        ];
+        args.extend(call.more.iter().cloned());
+        let mut command = self.command(settings, call.container, &args);
+        match call.container {
+            Some(container) => {
+                let (runner, container) = (self.clone(), container.to_string());
+                let ending = bounded::Ending {
+                    end: Box::new(move || runner.end(&container, &token)),
+                    grace: END_GRACE,
+                };
+                bounded::try_stream_ending(&mut command, outer, call.max, read, ending)
+            }
+            None => bounded::try_stream(&mut command, outer, call.max, read),
+        }
+    }
+
     /// Take one look at `environment`'s driver and hold its answer to what
     /// the host takes. "Could not know" is one of the fixed words.
     fn ask(
@@ -1310,7 +1374,6 @@ impl Runner {
         memory: &Memory,
         now: SystemTime,
     ) -> Result<Answer, Condition> {
-        let token = token(now);
         // As much of the last look as an adapter may use: words and numbers.
         let previous = Memory {
             driver: driver.to_string(),
@@ -1320,49 +1383,22 @@ impl Runner {
             facts: memory.facts.clone(),
             ..Memory::default()
         };
-        let args = [
-            "look".to_string(),
-            "--env".to_string(),
-            environment.name.clone(),
-            "--within".to_string(),
-            INNER_LIMIT.as_millis().to_string(),
-            "--now".to_string(),
-            unix_ms(now).to_string(),
-            "--token".to_string(),
-            token.clone(),
+        let more = [
             "--previous".to_string(),
             serde_json::to_string(&previous).unwrap_or_default(),
         ];
-        let mut command = self.command(settings, environment, &args);
-        let read = |out: &mut dyn std::io::Read| answer::read(out);
-        let heard = match environment.container() {
-            Some(container) => {
-                // A look given up on is over for the host at once. What is
-                // left of it in the container is ended from the box, and
-                // `podman exec` then returns by itself, which is what lets
-                // the engine forget the exec.
-                let (runner, container) = (self.clone(), container.to_string());
-                let ending = bounded::Ending {
-                    end: Box::new(move || runner.end(&container, &token)),
-                    grace: END_GRACE,
-                };
-                bounded::try_stream_ending(
-                    &mut command,
-                    LOOK_LIMIT,
-                    answer::MAX_ANSWER,
-                    read,
-                    ending,
-                )
-            }
-            None => bounded::try_stream(&mut command, LOOK_LIMIT, answer::MAX_ANSWER, read),
+        let call = Call {
+            container: environment.container(),
+            env: &environment.name,
+            word: "look",
+            more: &more,
+            limits: (LOOK_LIMIT, INNER_LIMIT),
+            max: answer::MAX_ANSWER,
         };
+        let heard = self.inside(settings, call, now, |out| answer::read(out));
         match heard {
             Ok(answer) => answer.check(driver),
-            Err(Failure::Late) => Err(Condition::Timeout),
-            // No `podman`, no container running, or nothing that could be
-            // started in it: the driver is not there to be asked.
-            Err(Failure::Absent | Failure::Failed) => Err(Condition::Absent),
-            Err(Failure::TooMuch | Failure::NoAnswer) => Err(Condition::BadReply),
+            Err(failure) => Err(Condition::of(failure)),
         }
     }
 
