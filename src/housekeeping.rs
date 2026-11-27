@@ -15,7 +15,8 @@ use crate::driver::{self, Condition};
 use crate::envelope::{rfc3339, unix_ms};
 use crate::git;
 use crate::paths;
-use crate::repos::{self, could_not_know, Contained, Nucleus, CENSUS_LIMITS, NOT_YET};
+use crate::repos::answer::Word;
+use crate::repos::{self, could_not_know, transfer, Contained, Inside, Nucleus};
 use crate::sessions::{Session, Status, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{RepoInfo, Unsaved, Workspace};
@@ -98,12 +99,6 @@ pub(crate) fn container_of(
                 .container()
                 .map(|container| (container.to_string(), other.name.clone()))
         })
-}
-
-/// Whether a container can write this environment's nucleus: it runs in
-/// one, or shares its nucleus with one that does.
-pub(crate) fn contained(settings: &Settings, environment: &Environment) -> bool {
-    container_of(settings, environment).is_some()
 }
 
 /// One environment per nucleus: where two logins share a nucleus, a job over
@@ -196,6 +191,23 @@ pub fn run_job(
     job: Job,
     dry_run: bool,
 ) -> Result<Value> {
+    run_job_with(
+        settings,
+        environment,
+        job,
+        dry_run,
+        Inside::of_this_box().as_ref(),
+    )
+}
+
+/// As [`run_job`], with git for a container run through `inside`.
+pub fn run_job_with(
+    settings: &Settings,
+    environment: &Environment,
+    job: Job,
+    dry_run: bool,
+    inside: Option<&Inside>,
+) -> Result<Value> {
     // Asked for by hand or not, no job runs where a driver owns the worktrees.
     if let Some(owner) = environment
         .driver_adapter()
@@ -217,7 +229,7 @@ pub fn run_job(
     let workspace = match nucleus {
         Nucleus::Host(workspace) => workspace,
         Nucleus::Contained(contained) => {
-            return run_contained(settings, environment, &contained, job, dry_run)
+            return run_contained(settings, environment, &contained, inside, job, dry_run)
         }
     };
     let mut report = match job {
@@ -253,52 +265,96 @@ pub fn run_job(
     Ok(report)
 }
 
+/// What a job for a container says when the container did not finish in
+/// its time: what it did not list was not done.
+const TOO_LONG: &str = "The environment took too long, so the rest was not done.";
+
 /// Run one job for an environment whose nucleus a container writes. Git
 /// runs only inside the container; what the host decides, it decides from
 /// the container's answer, its own store and `/proc`, and what GitHub says.
-/// The report names folders and fixed words, never a path or git's own.
+/// The report names repos, folders and fixed words, never a path or git's
+/// own.
 fn run_contained(
     settings: &Settings,
     environment: &Environment,
     contained: &Contained,
+    inside: Option<&Inside>,
     job: Job,
     dry_run: bool,
 ) -> Result<Value> {
+    let inside = inside.ok_or_else(|| anyhow!("{}", could_not_know(Condition::Absent)))?;
+    let not_known = |condition| anyhow!("{}", could_not_know(condition));
     let mut report = match job {
-        // PART 2: refresh and snapshot inside the container (`nucleated
-        // repos --do refresh|snapshot`). Until then nothing is done, and
-        // never on the host.
-        Job::Refresh | Job::Snapshot => bail!("{}: {NOT_YET}", job.name()),
+        Job::Refresh => {
+            let answer = contained
+                .refresh(inside, settings, dry_run, false)
+                .map_err(not_known)?;
+            let mut report = json!({ "repos": fetched_report(&answer) });
+            if answer.why.is_some() {
+                report["moved"] = json!("moving repos to owner folders failed");
+            } else if answer.moved > 0 {
+                report["moved"] = json!(answer.moved);
+            }
+            if !answer.complete {
+                bail!("{TOO_LONG}");
+            }
+            report
+        }
+        Job::Snapshot => {
+            let keys = settings.state_dir.join("snapshots").join(&environment.name);
+            let answer = contained
+                .snapshot(inside, settings, dry_run, &pushed_trees(&keys))
+                .map_err(not_known)?;
+            let report = json!({ "worktrees": snapshot_report(&answer, &keys)? });
+            if !answer.complete {
+                bail!("{TOO_LONG}");
+            }
+            report
+        }
         Job::Cleanup => {
-            let runner = driver::Runner::of_this_box()
-                .ok_or_else(|| anyhow!("{}", could_not_know(Condition::Absent)))?;
             let census = contained
-                .census(&runner, settings, None, false, CENSUS_LIMITS)
-                .map_err(|condition| anyhow!("{}", could_not_know(condition)))?;
+                .census(inside, settings, None, false)
+                .map_err(not_known)?;
             let store = Store::new(&settings.state_dir);
             let sharing = sharing_nucleus(settings, environment);
             let sessions = environment.root.join(".worktrees");
             let min_age = settings.housekeeping.cleanup_min_age;
             let mut report = Vec::new();
+            let mut going = Vec::new();
+            let mut facts = Vec::new();
             for folder in census.folders.iter().filter(|folder| !folder.gone) {
                 let kept =
                     keep_reason_contained(contained, &sharing, &store, &sessions, folder, min_age);
                 let mut entry = json!({ "session": folder.folder });
-                match kept {
-                    Some(reason) => {
+                match (kept, folder.stamp.clone()) {
+                    (Some(reason), _) => {
                         entry["action"] = json!("kept");
                         entry["reason"] = json!(reason);
                     }
-                    None if dry_run => entry["action"] = json!("would_remove"),
-                    // PART 2: the removal itself, inside the container
-                    // (`nucleated repos --do remove`). Nothing is removed
-                    // until then, and never from the host.
-                    None => {
-                        entry["action"] = json!("failed");
-                        entry["reason"] = json!(NOT_YET);
+                    (None, _) if dry_run => entry["action"] = json!("would_remove"),
+                    (None, Some(stamp)) => {
+                        going.push((folder.folder.clone(), stamp));
+                        facts.extend(folder.worktrees.iter().filter_map(|w| w.facts.as_ref()));
+                        continue;
+                    }
+                    (None, None) => {
+                        entry["action"] = json!("kept");
+                        entry["reason"] = json!("a repo in it could not be read");
                     }
                 }
                 report.push(entry);
+            }
+            // The last word is the container's: each folder only if it
+            // still stands as it was looked at, all of it or none of it.
+            if !going.is_empty() {
+                let merged = contained.merged_among(facts);
+                let answer = contained
+                    .remove(inside, settings, &going, &merged, None)
+                    .map_err(not_known)?;
+                for (folder, _) in &going {
+                    let removal = answer.removals.iter().find(|r| &r.folder == folder);
+                    report.push(removal_entry(folder, removal));
+                }
             }
             json!({ "sessions": report })
         }
@@ -307,6 +363,133 @@ fn run_contained(
     report["environment"] = json!(environment.name);
     report["dry_run"] = json!(dry_run);
     Ok(report)
+}
+
+/// Why a fetch failed, in a few plain words.
+fn fetch_failure(word: Word) -> &'static str {
+    match word {
+        Word::NoNetwork => repos::NO_NETWORK,
+        Word::TimedOut => "the fetch took too long",
+        Word::SignIn => "GitHub did not accept the box's sign-in",
+        Word::Unreachable => "GitHub could not be reached",
+        Word::Refused => "GitHub refused it",
+        _ => "git could not fetch it",
+    }
+}
+
+/// A refresh's repos, as the report says them.
+fn fetched_report(answer: &repos::answer::Answer) -> Vec<Value> {
+    answer
+        .fetched
+        .iter()
+        .map(|fetched| match fetched.refused {
+            Some(refused) => json!({
+                "repo": fetched.repo, "ok": false,
+                "action": "refused", "reason": refused.as_str(),
+            }),
+            None => {
+                let mut entry = json!({ "repo": fetched.repo, "ok": fetched.ok });
+                if !fetched.ok {
+                    entry["error"] = json!(fetch_failure(fetched.failure.unwrap_or(Word::Git)));
+                }
+                entry
+            }
+        })
+        .collect()
+}
+
+/// The trees the host has recorded as snapshotted, in its keys files.
+fn pushed_trees(keys: &Path) -> Vec<String> {
+    let mut trees: Vec<String> = fs::read_dir(keys)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|entry| paths::read_plain(&entry.path(), 256).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|tree| crate::reporter::commit_id(tree))
+        .collect();
+    trees.sort();
+    trees.dedup();
+    trees.truncate(repos::answer::MAX_WORKTREES);
+    trees
+}
+
+/// A snapshot's worktrees, as the report says them, with each tree pushed
+/// recorded in its keys file.
+fn snapshot_report(answer: &repos::answer::Answer, keys: &Path) -> Result<Vec<Value>> {
+    use repos::answer::SnapAction;
+    let mut report = Vec::new();
+    for snapped in &answer.snapshots {
+        let action = match snapped.action {
+            SnapAction::Snapshot => "snapshot",
+            SnapAction::WouldSnapshot => "would_snapshot",
+            SnapAction::Skipped => "skipped",
+            SnapAction::Refused => "refused",
+            SnapAction::Failed => "failed",
+        };
+        let mut entry = json!({ "repo": snapped.repo, "action": action });
+        if let Some(folder) = &snapped.folder {
+            entry["folder"] = json!(folder);
+        }
+        if !snapped.branch.is_empty() && snapped.action != SnapAction::Skipped {
+            entry["branch"] = json!(snapped.branch);
+        }
+        if let Some(reference) = &snapped.reference {
+            entry["ref"] = json!(reference);
+        }
+        if let Some(word) = snapped.reason {
+            entry["reason"] = json!(match (snapped.action, word.refusal()) {
+                (SnapAction::Refused, Some(refused)) => refused.as_str(),
+                (SnapAction::Failed, _) if word == Word::NoNetwork => repos::NO_NETWORK,
+                (SnapAction::Failed, _) => "the push was refused",
+                _ => skipped_because(word),
+            });
+        }
+        if let (SnapAction::Snapshot, Some(tree)) = (snapped.action, &snapped.tree) {
+            // Named as on the host: the ref's checked name holds nothing
+            // but letters, digits and `._-`.
+            let name = format!("{}-{}", snapped.repo, dashed(&snapped.branch));
+            if name.len() <= 200 {
+                paths::create_private_dir(keys)?;
+                fs::write(keys.join(name), format!("{tree}\n"))?;
+            }
+        }
+        report.push(entry);
+    }
+    Ok(report)
+}
+
+/// How a removal inside the container came out, for one folder cleanup
+/// decided could go, as the report says it.
+fn removal_entry(folder: &str, removal: Option<&repos::answer::Removal>) -> Value {
+    use repos::answer::Outcome;
+    let entry = |action: &str, reason: Option<&str>| {
+        let mut entry = json!({ "session": folder, "action": action });
+        if let Some(reason) = reason {
+            entry["reason"] = json!(reason);
+        }
+        entry
+    };
+    let Some(removal) = removal else {
+        return entry("failed", Some("it took too long, so it was not removed"));
+    };
+    let why = match removal.why {
+        Some(Word::InUse) => "a process is working in it",
+        Some(Word::Changed) => "it changed since it was looked at",
+        Some(Word::Unsaved) => "it holds work that is not on GitHub",
+        Some(Word::OtherFiles) => "it holds other files",
+        Some(Word::LeftAlone) => "the box leaves it alone",
+        Some(Word::NotASession) => "it is not a session folder",
+        Some(Word::NotRemoved) => "it could not be removed",
+        _ => "a repo in it could not be read",
+    };
+    match removal.outcome {
+        Outcome::Removed => entry("removed", None),
+        Outcome::Gone => entry("kept", Some("it is gone")),
+        Outcome::Kept => entry("kept", Some(why)),
+        Outcome::Failed => entry("failed", Some(why)),
+    }
 }
 
 /// Why a session folder a container writes must be kept, or nothing if it
@@ -396,7 +579,7 @@ fn keep_reason_contained(
 
 /// Whether any process has a working directory inside `dir`. `None` where the
 /// system cannot say, which callers must read as "it might".
-fn in_use(dir: &Path) -> Option<bool> {
+pub(crate) fn in_use(dir: &Path) -> Option<bool> {
     let entries = fs::read_dir("/proc").ok()?;
     let mut saw_a_process = false;
     for entry in entries.flatten() {
@@ -630,6 +813,113 @@ fn dashed(branch: &str) -> String {
     branch.replace('/', "-")
 }
 
+/// What a snapshot came to for one worktree.
+pub(crate) enum Snapped {
+    /// Nothing was pushed, for this reason.
+    Skipped(Word),
+    /// It would have pushed `tree` to `reference`.
+    Would {
+        branch: String,
+        reference: String,
+        tree: String,
+    },
+    /// It pushed `tree` to `reference`.
+    Done {
+        branch: String,
+        reference: String,
+        tree: String,
+    },
+    /// The push failed, and git said this, which goes no further than a
+    /// word made from it.
+    Failed { branch: String, stderr: String },
+}
+
+/// How a snapshot is taken: where its copy of the index goes, which trees
+/// are pushed already, and which refs may be pushed to.
+pub(crate) struct Snapping<'a> {
+    /// A private folder for the copy of a worktree's index.
+    pub index_dir: &'a Path,
+    /// Copy the index only when it is a plain file, never through a link.
+    pub plain_index: bool,
+    /// Whether a tree was pushed already.
+    pub already: &'a dyn Fn(&str) -> bool,
+    /// Whether a ref may be pushed to.
+    pub usable: &'a dyn Fn(&str) -> bool,
+    pub dry_run: bool,
+    pub now: SystemTime,
+}
+
+/// Snapshot one worktree: push what it has not committed, as a commit on
+/// no branch, to its hidden ref, unless that is nothing, it is being
+/// written to, or it is pushed already.
+pub(crate) fn snapshot_core(git: &git::Git, worktree: &Path, how: &Snapping) -> Result<Snapped> {
+    let branch = git.tree(worktree, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Ok(Snapped::Skipped(Word::NotOnABranch));
+    }
+    let (ok, status, error) = git.tree_raw(worktree, &["status", "--porcelain", "-z"], &[])?;
+    if !ok {
+        bail!("git status failed: {error}");
+    }
+    let changed = changed_paths(&status);
+    if changed.is_empty() {
+        return Ok(Snapped::Skipped(Word::NothingUncommitted));
+    }
+    let mut budget = 20_000;
+    if changed
+        .iter()
+        .any(|path| recently_written(&worktree.join(path), how.now, &mut budget))
+    {
+        return Ok(Snapped::Skipped(Word::BeingWrittenTo));
+    }
+    let reference = wip_ref(&branch);
+    if !(how.usable)(&reference) {
+        return Ok(Snapped::Skipped(Word::BadBranch));
+    }
+    let tree = working_tree(git, worktree, how.index_dir, &branch, how.plain_index)?;
+    if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
+        return Ok(Snapped::Skipped(Word::NothingUncommitted));
+    }
+    if (how.already)(&tree) {
+        return Ok(Snapped::Skipped(Word::AlreadySnapshotted));
+    }
+    if how.dry_run {
+        return Ok(Snapped::Would {
+            branch,
+            reference,
+            tree,
+        });
+    }
+    let commit = wip_commit(git, worktree, &tree, &branch, how.now)?;
+    let refspec = format!("{commit}:{reference}");
+    let pushed = transfer::push(git, worktree, &["-q", "--force", "origin", &refspec], None)?;
+    if !pushed.ok {
+        return Ok(Snapped::Failed {
+            branch,
+            stderr: pushed.stderr,
+        });
+    }
+    Ok(Snapped::Done {
+        branch,
+        reference,
+        tree,
+    })
+}
+
+/// The words a snapshot's report has used for why it skipped a worktree.
+pub(crate) fn skipped_because(word: Word) -> &'static str {
+    match word {
+        Word::NotOnABranch => "not on a branch",
+        Word::NothingUncommitted => "nothing uncommitted",
+        Word::BeingWrittenTo => "being written to",
+        Word::AlreadySnapshotted => "already snapshotted",
+        Word::OwnedByADriver => "owned by a driver",
+        Word::NotOurs => "not under this nucleus's .worktrees",
+        Word::BadBranch => "its branch has a name that cannot be used",
+        _ => "it could not be read",
+    }
+}
+
 fn snapshot_one(
     git: &git::Git,
     worktree: &Path,
@@ -645,54 +935,40 @@ fn snapshot_one(
         }
         entry
     };
-    let skipped = |reason: &str| Ok(entry("skipped", json!({ "reason": reason })));
-    let branch = git.tree(worktree, &["branch", "--show-current"])?;
-    if branch.is_empty() {
-        return skipped("not on a branch");
-    }
-    let (ok, status, error) = git.tree_raw(worktree, &["status", "--porcelain", "-z"], &[])?;
-    if !ok {
-        bail!("git status failed: {error}");
-    }
-    let changed = changed_paths(&status);
-    if changed.is_empty() {
-        return skipped("nothing uncommitted");
-    }
-    let mut budget = 20_000;
-    if changed
-        .iter()
-        .any(|path| recently_written(&worktree.join(path), now, &mut budget))
-    {
-        return skipped("being written to");
-    }
-
-    let tree = working_tree(git, worktree, keys, &branch)?;
-    if tree == git.tree(worktree, &["rev-parse", "HEAD^{tree}"])? {
-        return skipped("nothing uncommitted");
-    }
-    let reference = wip_ref(&branch);
-    let key = keys.join(format!("{repo}-{}", dashed(&branch)));
-    if fs::read_to_string(&key).is_ok_and(|pushed| pushed.trim() == tree) {
-        return skipped("already snapshotted");
-    }
-    if dry_run {
-        return Ok(entry(
+    paths::create_private_dir(keys)?;
+    let key = |branch: &str| keys.join(format!("{repo}-{}", dashed(branch)));
+    let branch_now = git.tree(worktree, &["branch", "--show-current"])?;
+    let already =
+        |tree: &str| fs::read_to_string(key(&branch_now)).is_ok_and(|pushed| pushed.trim() == tree);
+    let how = Snapping {
+        index_dir: keys,
+        plain_index: false,
+        already: &already,
+        usable: &|_| true,
+        dry_run,
+        now,
+    };
+    Ok(match snapshot_core(git, worktree, &how)? {
+        Snapped::Skipped(word) => entry("skipped", json!({ "reason": skipped_because(word) })),
+        Snapped::Would {
+            branch, reference, ..
+        } => entry(
             "would_snapshot",
             json!({ "branch": branch, "ref": reference }),
-        ));
-    }
-    let commit = wip_commit(git, worktree, &tree, &branch, now)?;
-    if !push_wip(git, worktree, &commit, &reference)? {
-        return Ok(entry(
+        ),
+        Snapped::Failed { branch, .. } => entry(
             "failed",
             json!({ "branch": branch, "reason": "the push was refused" }),
-        ));
-    }
-    fs::write(&key, format!("{tree}\n"))?;
-    Ok(entry(
-        "snapshot",
-        json!({ "branch": branch, "ref": reference }),
-    ))
+        ),
+        Snapped::Done {
+            branch,
+            reference,
+            tree,
+        } => {
+            fs::write(key(&branch), format!("{tree}\n"))?;
+            entry("snapshot", json!({ "branch": branch, "ref": reference }))
+        }
+    })
 }
 
 /// Where uncommitted work on `branch` is pushed: a ref that is not a branch.
@@ -703,16 +979,23 @@ pub(crate) fn wip_ref(branch: &str) -> String {
 /// The tree of a worktree as it stands, its uncommitted and untracked files
 /// included and its ignored ones not. It is built in a copy of the index, in
 /// `keys`, so neither the session's index nor its branch is touched.
+///
+/// With `plain`, the index is copied only when it is a plain file, read
+/// never through a link: inside a container, whose worktree's git folder
+/// the container writes.
 pub(crate) fn working_tree(
     git: &git::Git,
     worktree: &Path,
     keys: &Path,
     branch: &str,
+    plain: bool,
 ) -> Result<String> {
     let git_dir = PathBuf::from(git.tree(worktree, &["rev-parse", "--absolute-git-dir"])?);
     paths::create_private_dir(keys)?;
     let index = keys.join(format!(".index.{}.{}", std::process::id(), dashed(branch)));
-    if git_dir.join("index").is_file() {
+    if plain {
+        copy_plain(&git_dir.join("index"), &index)?;
+    } else if git_dir.join("index").is_file() {
         fs::copy(git_dir.join("index"), &index)?;
     }
     let with_index: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", index.as_os_str())];
@@ -729,6 +1012,22 @@ pub(crate) fn working_tree(
     })();
     let _ = fs::remove_file(&index);
     built
+}
+
+/// Copy `from`, when it is a plain file, to a new file `to`, reading it
+/// never through a link and never a pipe or a device. Nothing is copied
+/// when there is no such file.
+fn copy_plain(from: &Path, to: &Path) -> Result<()> {
+    let Ok(looked) = paths::look_regular(from) else {
+        return Ok(());
+    };
+    let mut source = paths::open_looked(from, &looked)?;
+    let mut copy = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut source, &mut copy)?;
+    Ok(())
 }
 
 /// A commit of `tree` on top of `HEAD`, made without moving the branch.
@@ -766,27 +1065,6 @@ pub(crate) fn wip_commit(
         bail!("git commit-tree failed: {error}");
     }
     Ok(String::from_utf8_lossy(&commit).trim().to_string())
-}
-
-/// Push `commit` to `reference` on the remote, over whatever is there. True
-/// when the remote took it.
-pub(crate) fn push_wip(
-    git: &git::Git,
-    worktree: &Path,
-    commit: &str,
-    reference: &str,
-) -> Result<bool> {
-    let pushed = git.try_tree(
-        worktree,
-        &[
-            "push",
-            "-q",
-            "--force",
-            "origin",
-            &format!("{commit}:{reference}"),
-        ],
-    )?;
-    Ok(pushed.ok)
 }
 
 fn snapshot(

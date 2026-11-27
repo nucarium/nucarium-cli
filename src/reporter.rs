@@ -24,7 +24,7 @@
 use crate::driver::Runner;
 use crate::envelope::{unix_ms, valid_env_key, valid_session_id, Draft, Envelope, EventType};
 use crate::housekeeping;
-use crate::repos::{self, Contained, CENSUS_LIMITS};
+use crate::repos::{self, Contained};
 use crate::sessions::{Session, Store};
 use crate::settings::{self, Environment, Settings};
 use crate::spool::{Record, Spool};
@@ -349,7 +349,7 @@ pub struct Reporter {
     /// `podman` unless told otherwise.
     runner: Option<Runner>,
     /// How long the host gives a container to answer, when not as long as
-    /// [`CENSUS_LIMITS`] says.
+    /// [`repos::CENSUS_LIMITS`] says.
     census_limit: Option<Duration>,
 }
 
@@ -395,11 +395,11 @@ impl Reporter {
         let Some(runner) = runner else {
             return Err(driver::Condition::Absent);
         };
-        let limits = self
-            .census_limit
-            .map(|outer| (outer, outer.mul_f64(11.0 / 12.0)))
-            .unwrap_or(CENSUS_LIMITS);
-        contained.census(&runner, settings, folder, driver, limits)
+        let inside = repos::Inside {
+            runner,
+            patience: self.census_limit,
+        };
+        contained.census(&inside, settings, folder, driver)
     }
 
     /// One look: report the outcomes that are due, then count unsaved work if

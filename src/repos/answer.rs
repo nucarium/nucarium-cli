@@ -53,17 +53,121 @@ pub enum Op {
     /// Read what every worktree holds, or one session folder's. Nothing is
     /// changed, nothing is fetched, GitHub is not asked.
     Census,
+    /// Move repos to their owner folders, then fetch each one.
+    Refresh,
+    /// Push what is not committed to a hidden ref.
+    Snapshot,
+    /// Push one session folder's branches: Watch's Push.
+    Push,
+    /// Remove session folders: cleanup's removal, and Watch's Clean up.
+    Remove,
 }
+
+const OPS: [Op; 5] = [Op::Census, Op::Refresh, Op::Snapshot, Op::Push, Op::Remove];
 
 impl Op {
     pub fn as_str(self) -> &'static str {
         match self {
             Op::Census => "census",
+            Op::Refresh => "refresh",
+            Op::Snapshot => "snapshot",
+            Op::Push => "push",
+            Op::Remove => "remove",
         }
     }
 
     pub fn parse(word: &str) -> Option<Op> {
-        [Op::Census].into_iter().find(|op| op.as_str() == word)
+        OPS.into_iter().find(|op| op.as_str() == word)
+    }
+
+    /// Whether it changes anything. One that does and is cut short says
+    /// what it did; what it does not list was not done.
+    pub fn writes(self) -> bool {
+        self != Op::Census
+    }
+}
+
+/// Why something was done or not done, or why it failed: one fixed word.
+/// Nothing git, GitHub or a repository said is ever passed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Word {
+    /// Its git config sets a key Nucarium does not allow.
+    Config,
+    /// A git pointer in it leads outside the nucleus's repos.
+    Pointer,
+    /// It could not be read.
+    Unreadable,
+    /// It holds a submodule.
+    Submodule,
+    NotOnABranch,
+    NothingUncommitted,
+    BeingWrittenTo,
+    AlreadySnapshotted,
+    OwnedByADriver,
+    /// Not under the nucleus's `.worktrees`.
+    NotOurs,
+    /// The environment's network does not reach GitHub: its proxy refused.
+    NoNetwork,
+    TimedOut,
+    /// The branch on GitHub has commits this one does not.
+    Rejected,
+    /// GitHub did not accept the sign-in.
+    SignIn,
+    /// GitHub could not be reached.
+    Unreachable,
+    /// GitHub refused it.
+    Refused,
+    /// Git failed for some other reason.
+    Git,
+    /// Git could not be run there.
+    CannotRun,
+    /// Its branch has a name that cannot be used safely.
+    BadBranch,
+    /// It holds another git repository, which cannot be backed up.
+    NestedRepo,
+    /// The folder is gone.
+    Gone,
+    /// The folder is no session folder.
+    NotASession,
+    /// The box leaves the folder alone.
+    LeftAlone,
+    /// A process is working in the folder.
+    InUse,
+    /// The folder changed since the host looked at it.
+    Changed,
+    /// It holds work that is not on GitHub.
+    Unsaved,
+    /// It holds files outside its repos.
+    OtherFiles,
+    /// A backup could not be made.
+    NotMade,
+    /// A backup could not be pushed.
+    NotPushed,
+    /// It could not be removed.
+    NotRemoved,
+}
+
+impl Word {
+    /// The word for a refusal by the vetting.
+    pub fn of(reason: Reason) -> Word {
+        match reason {
+            Reason::Config => Word::Config,
+            Reason::Pointer => Word::Pointer,
+            Reason::Unreadable => Word::Unreadable,
+            Reason::Submodule => Word::Submodule,
+        }
+    }
+
+    /// The vetting's refusal this word is, if it is one.
+    pub fn refusal(self) -> Option<Reason> {
+        match self {
+            Word::Config => Some(Reason::Config),
+            Word::Pointer => Some(Reason::Pointer),
+            Word::Unreadable => Some(Reason::Unreadable),
+            Word::Submodule => Some(Reason::Submodule),
+            _ => None,
+        }
     }
 }
 
@@ -97,6 +201,154 @@ pub struct Answer {
     /// driver's worktrees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loose: Vec<Worktree>,
+    /// Refresh: how many repos were moved to their owner folders.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub moved: u32,
+    /// Why the whole of it was not done, or, for a refresh, why the move
+    /// failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<Word>,
+    /// Refresh: each repo fetched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fetched: Vec<Fetched>,
+    /// Snapshot: each worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshots: Vec<Snapshot>,
+    /// Push: each repo of the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pushes: Vec<Pushed>,
+    /// Remove: each folder, as it came out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removals: Vec<Removal>,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
+}
+
+/// One repo a refresh fetched, or did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fetched {
+    pub repo: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Word>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<Reason>,
+}
+
+/// What a snapshot did with one worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapAction {
+    Snapshot,
+    WouldSnapshot,
+    Skipped,
+    Refused,
+    Failed,
+}
+
+/// One worktree a snapshot looked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    /// The repo it is a worktree of, as its folder has it.
+    pub repo: String,
+    /// The session folder it is in, if it is in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// Its branch, blank when there is none to name.
+    #[serde(default)]
+    pub branch: String,
+    pub action: SnapAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Word>,
+    /// The tree that was pushed, or would be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The ref it was pushed to, or would be.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+}
+
+/// One repo of a folder Push looked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pushed {
+    /// The name it is reported by.
+    pub repo: String,
+    /// Commits pushed.
+    #[serde(default)]
+    pub pushed: u32,
+    #[serde(default)]
+    pub uncommitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Word>,
+}
+
+/// How a removal came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Removed,
+    /// Not removed, for `why`.
+    Kept,
+    Failed,
+    /// It was gone already.
+    Gone,
+}
+
+/// One folder a removal was asked about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Removal {
+    pub folder: String,
+    pub outcome: Outcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<Word>,
+    /// The repo `why` is about, by the name it is reported by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// What its repos hold that is not on GitHub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holding: Vec<Holding>,
+    /// It holds files outside its repos.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub other_files: bool,
+    /// The backups pushed before it was removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backed_up: Vec<Backup>,
+}
+
+/// What one repo of a folder holds that is not on GitHub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Holding {
+    pub repo: String,
+    #[serde(default)]
+    pub unpushed: u32,
+    #[serde(default)]
+    pub uncommitted: bool,
+}
+
+/// One backup pushed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Backup {
+    pub repo: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+/// `refs/wip/` and a name of `[A-Za-z0-9._-]{1,240}`.
+pub fn valid_wip_ref(reference: &str) -> bool {
+    reference.strip_prefix("refs/wip/").is_some_and(|name| {
+        (1..=240).contains(&name.len())
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    })
 }
 
 /// One of the nucleus's repos.
@@ -293,6 +545,78 @@ pub struct Asked<'a> {
     pub folder: Option<&'a str>,
     /// A driver's worktrees were asked about, which are in no folder.
     pub driver: bool,
+    /// The session folders a removal was asked about.
+    pub folders: &'a [String],
+    /// The action whose backups a removal may push, when it may.
+    pub discard: Option<&'a str>,
+}
+
+impl<'a> Asked<'a> {
+    /// A census of the whole nucleus.
+    pub fn census() -> Asked<'a> {
+        Asked {
+            op: Op::Census,
+            folder: None,
+            driver: false,
+            folders: &[],
+            discard: None,
+        }
+    }
+}
+
+impl Snapshot {
+    fn fits(&self) -> bool {
+        let pushes = matches!(
+            self.action,
+            SnapAction::Snapshot | SnapAction::WouldSnapshot
+        );
+        valid_name(&self.repo)
+            && self.folder.as_deref().is_none_or(valid_folder)
+            && (self.branch.is_empty() || reportable_branch(&self.branch))
+            && self.tree.as_deref().is_none_or(commit_id)
+            && (self.action != SnapAction::Snapshot || self.tree.is_some())
+            && match &self.reference {
+                // The one ref a snapshot of this branch goes to.
+                Some(reference) => {
+                    pushes
+                        && valid_wip_ref(reference)
+                        && *reference == crate::housekeeping::wip_ref(&self.branch)
+                }
+                None => !pushes,
+            }
+            && match self.action {
+                SnapAction::Skipped | SnapAction::Refused | SnapAction::Failed => {
+                    self.reason.is_some()
+                }
+                _ => self.reason.is_none(),
+            }
+            && (self.action != SnapAction::Refused
+                || self.reason.is_some_and(|word| word.refusal().is_some()))
+    }
+}
+
+impl Removal {
+    fn fits(&self, discard: Option<&str>) -> bool {
+        let ours = |reference: &str| {
+            discard.is_some_and(|id| {
+                valid_wip_ref(reference) && reference.ends_with(&format!("-{id}"))
+            })
+        };
+        valid_folder(&self.folder)
+            && self.repo.as_deref().is_none_or(valid_label)
+            && self.holding.len() <= MAX_FOLDER_REPOS
+            && self
+                .holding
+                .iter()
+                .all(|held| valid_label(&held.repo) && held.unpushed <= MAX_COUNT)
+            && self.backed_up.len() <= MAX_FOLDER_REPOS
+            && self
+                .backed_up
+                .iter()
+                .all(|backup| valid_label(&backup.repo) && ours(&backup.reference))
+            && (self.outcome != Outcome::Kept || self.why.is_some())
+            && (self.outcome != Outcome::Removed || self.why.is_none())
+    }
 }
 
 impl Answer {
@@ -308,6 +632,12 @@ impl Answer {
             repos: Vec::new(),
             folders: Vec::new(),
             loose: Vec::new(),
+            moved: 0,
+            why: None,
+            fetched: Vec::new(),
+            snapshots: Vec::new(),
+            pushes: Vec::new(),
+            removals: Vec::new(),
         }
     }
 
@@ -327,8 +657,26 @@ impl Answer {
         if self.version != VERSION {
             return Err(Condition::Unsupported);
         }
-        if self.condition != Condition::Ok {
+        // A write cut short says what it did; anything else that says why
+        // nothing could be done says only that.
+        let cut_short = asked.op.writes() && self.condition == Condition::Timeout;
+        if self.condition != Condition::Ok && !cut_short {
             return Err(self.condition);
+        }
+        if self.op != asked.op {
+            return Err(Condition::BadReply);
+        }
+        if asked.op.writes() {
+            return self.check_write(asked, cut_short);
+        }
+        let census_only = self.moved == 0
+            && self.why.is_none()
+            && self.fetched.is_empty()
+            && self.snapshots.is_empty()
+            && self.pushes.is_empty()
+            && self.removals.is_empty();
+        if !census_only {
+            return Err(Condition::BadReply);
         }
         let names: BTreeSet<&str> = self.folders.iter().map(|f| f.folder.as_str()).collect();
         let shape = match (asked.folder, asked.driver) {
@@ -354,6 +702,70 @@ impl Answer {
             true => Ok(self),
             false => Err(Condition::BadReply),
         }
+    }
+}
+
+impl Answer {
+    /// A write's answer: only its own part, every field in line.
+    fn check_write(mut self, asked: &Asked, cut_short: bool) -> Result<Answer, Condition> {
+        let mut parts = 0;
+        parts += usize::from(!self.fetched.is_empty() || self.moved > 0);
+        parts += usize::from(!self.snapshots.is_empty());
+        parts += usize::from(!self.pushes.is_empty());
+        parts += usize::from(!self.removals.is_empty());
+        let own = match asked.op {
+            Op::Refresh => {
+                self.snapshots.is_empty() && self.pushes.is_empty() && self.removals.is_empty()
+            }
+            Op::Snapshot => {
+                self.fetched.is_empty()
+                    && self.moved == 0
+                    && self.pushes.is_empty()
+                    && self.removals.is_empty()
+            }
+            Op::Push => {
+                self.fetched.is_empty()
+                    && self.moved == 0
+                    && self.snapshots.is_empty()
+                    && self.removals.is_empty()
+            }
+            Op::Remove => {
+                self.fetched.is_empty()
+                    && self.moved == 0
+                    && self.snapshots.is_empty()
+                    && self.pushes.is_empty()
+            }
+            Op::Census => false,
+        };
+        let folders: BTreeSet<&str> = self.removals.iter().map(|r| r.folder.as_str()).collect();
+        let fits = own
+            && parts <= 1
+            && self.repos.is_empty()
+            && self.folders.is_empty()
+            && self.loose.is_empty()
+            && self.moved <= MAX_COUNT
+            && self.fetched.len() <= MAX_REPOS
+            && self.fetched.iter().all(|fetched| {
+                valid_name(&fetched.repo) && !(fetched.ok && fetched.failure.is_some())
+            })
+            && self.snapshots.len() <= MAX_WORKTREES
+            && self.snapshots.iter().all(Snapshot::fits)
+            && self.pushes.len() <= MAX_FOLDER_REPOS
+            && self
+                .pushes
+                .iter()
+                .all(|pushed| valid_label(&pushed.repo) && pushed.pushed <= MAX_COUNT)
+            && folders.len() == self.removals.len()
+            && self.removals.iter().all(|removal| {
+                asked.folders.contains(&removal.folder) && removal.fits(asked.discard)
+            });
+        if !fits {
+            return Err(Condition::BadReply);
+        }
+        if cut_short {
+            self.complete = false;
+        }
+        Ok(self)
     }
 }
 
@@ -403,6 +815,8 @@ mod tests {
         op: Op::Census,
         folder: None,
         driver: false,
+        folders: &[],
+        discard: None,
     };
 
     fn checked(value: &Value, asked: &Asked) -> Result<Answer, Condition> {
@@ -543,6 +957,8 @@ mod tests {
             op: Op::Census,
             folder: Some("fix-login"),
             driver: false,
+            folders: &[],
+            discard: None,
         };
         let mut one = good();
         one["folders"] = json!([good()["folders"][0].clone()]);

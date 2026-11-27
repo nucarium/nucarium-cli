@@ -75,12 +75,33 @@ enum Command {
         /// The daemon's vetting mode: enforce or report.
         #[arg(long, value_name = "MODE")]
         vetting: Option<String>,
-        /// The one session folder to read.
+        /// A session folder to read, push or remove.
         #[arg(long, value_name = "NAME")]
-        folder: Option<String>,
+        folder: Vec<String>,
+        /// Each folder's stamp as the daemon last saw it, in order.
+        #[arg(long, value_name = "STAMP")]
+        expect: Vec<String>,
         /// Read the environment's driver's worktrees.
         #[arg(long)]
         driver: bool,
+        /// Report what would be done, and do none of it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only move repos to their owner folders.
+        #[arg(long)]
+        move_only: bool,
+        /// A tree the daemon has recorded as snapshotted.
+        #[arg(long, value_name = "TREE")]
+        pushed: Vec<String>,
+        /// A commit GitHub said was merged.
+        #[arg(long, value_name = "SHA")]
+        merged: Vec<String>,
+        /// Unsaved work may go once it is backed up.
+        #[arg(long)]
+        discard: bool,
+        /// The Clean up whose backups those are.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
     },
     /// Print what Watch would show, read from this box.
     Status {
@@ -428,7 +449,14 @@ fn main() -> ExitCode {
         token: _,
         vetting,
         folder,
+        expect,
         driver,
+        dry_run,
+        move_only,
+        pushed,
+        merged,
+        discard,
+        id,
     } = &cli.command
     {
         repos::inside::run(&repos::inside::Asked {
@@ -437,8 +465,15 @@ fn main() -> ExitCode {
             within_ms: *within,
             now_ms: *now,
             vetting: vetting.as_deref(),
-            folder: folder.as_deref(),
+            folders: folder,
+            expect,
             driver: *driver,
+            dry_run: *dry_run,
+            move_only: *move_only,
+            pushed,
+            merged,
+            discard: *discard,
+            id: id.as_deref(),
         });
         return ExitCode::SUCCESS;
     }

@@ -351,7 +351,7 @@ fn verdict(report: &Value, name: &str) -> Value {
 /// would remove can only be shown where there is one.
 #[cfg(target_os = "linux")]
 #[test]
-fn cleanup_decides_from_inside_and_github_and_removes_nothing_from_the_host() {
+fn cleanup_decides_from_inside_and_github() {
     let boxed = boxed();
     let rig = &boxed.rig;
     rig.as_github("octo/web");
@@ -386,41 +386,13 @@ fn cleanup_decides_from_inside_and_github_and_removes_nothing_from_the_host() {
         "it changed too recently"
     );
 
-    // Run for real, nothing is removed yet, and it says so.
+    // Run for real, the container removes what the host decided could go.
     let out = boxed.job("cleanup", &[], Some(&github));
     let report = &stdout_json(&out)[0];
-    assert_eq!(verdict(report, "merged")["action"], "failed");
-    assert!(rig.root.join(".worktrees").join("merged").is_dir());
+    assert_eq!(verdict(report, "merged")["action"], "removed");
+    assert!(!rig.root.join(".worktrees").join("merged").exists());
+    assert!(rig.root.join(".worktrees").join("pushed").is_dir());
     assert_eq!(boxed.host_git(), Vec::<String>::new());
-}
-
-#[test]
-fn no_job_runs_git_on_the_host_for_a_container_and_none_removes_or_pushes_anything() {
-    let boxed = boxed();
-    let rig = &boxed.rig;
-    three_folders(rig);
-    let dirty = rig.root.join(".worktrees").join("dirty");
-    fs::write(dirty.join("web").join("more.txt"), "more\n").unwrap();
-    for job in ["refresh", "cleanup", "snapshot"] {
-        let out = boxed.job(job, &[], None);
-        let report = &stdout_json(&out)[0];
-        if job == "cleanup" {
-            assert!(out.status.success(), "{}", stderr(&out));
-            for entry in report["sessions"].as_array().unwrap() {
-                assert_ne!(entry["action"], "removed", "{report}");
-            }
-        }
-        // Nothing the report says is a path.
-        assert!(
-            !report.to_string().contains(rig.root.to_str().unwrap()),
-            "{report}"
-        );
-    }
-    assert_eq!(boxed.host_git(), Vec::<String>::new());
-    for name in ["dirty", "ahead", "pushed"] {
-        assert!(rig.root.join(".worktrees").join(name).is_dir(), "{name}");
-    }
-    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
 }
 
 // ---- what the host takes from the container --------------------------------

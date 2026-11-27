@@ -16,20 +16,24 @@
 //! [`crate::driver::cut_off`]).
 
 use super::answer::{
-    valid_label, valid_name, Answer, Facts, Folder, Op, Repo, Worktree, MAX_ANSWER, MAX_FOLDERS,
-    MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
+    valid_label, valid_name, valid_wip_ref, Answer, Backup, Facts, Fetched, Folder, Holding, Op,
+    Outcome, Pushed, Removal, Repo, SnapAction, Snapshot, Word, Worktree, MAX_ANSWER, MAX_COUNT,
+    MAX_FOLDERS, MAX_FOLDER_REPOS, MAX_LABELS, MAX_WORKTREES,
 };
+use super::transfer;
 use crate::driver::{self, Condition};
 use crate::envelope::{unix_ms, valid_branch};
+use crate::housekeeping::Snapped;
 use crate::reporter::commit_id;
 use crate::settings::{self, Environment, Settings};
 use crate::workspace::{Manifest, RepoInfo, Workspace, SUBWORKTREES};
+use crate::worktrees::{clean_up_core, Cleaned, Cleaning, Committing};
 use crate::worktrees::{last_change, reportable_branch, valid_folder};
 use crate::{bounded, git, housekeeping, paths};
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 /// The least time a call is given, whatever it is asked for.
@@ -90,6 +94,7 @@ fn fit(mut answer: Answer) -> Answer {
 }
 
 /// What the host asked of this call.
+#[derive(Default)]
 pub struct Asked<'a> {
     /// The environment whose container this is, by its config name.
     pub env: Option<&'a str>,
@@ -102,14 +107,72 @@ pub struct Asked<'a> {
     /// The daemon's vetting mode: `enforce` or `report`. The config in a
     /// container has none of its own.
     pub vetting: Option<&'a str>,
-    /// The one session folder asked about.
-    pub folder: Option<&'a str>,
+    /// The session folders asked about: the one a census or a Push reads,
+    /// or each a removal removes.
+    pub folders: &'a [String],
+    /// For a removal, each folder's stamp as the host last saw it.
+    pub expect: &'a [String],
     /// A driver's worktrees are asked about, not a nucleus's.
     pub driver: bool,
+    /// Report what would be done, and do none of it.
+    pub dry_run: bool,
+    /// A refresh that only moves repos to their owner folders.
+    pub move_only: bool,
+    /// The trees the host has recorded as snapshotted.
+    pub pushed: &'a [String],
+    /// The commits GitHub said were merged, as the host asked it.
+    pub merged: &'a [String],
+    /// A removal that may drop unsaved work once it is backed up.
+    pub discard: bool,
+    /// The Clean up whose backups those are.
+    pub id: Option<&'a str>,
+}
+
+/// Whether the time is up, and whether a removal is under way, which the
+/// time's being up waits for.
+#[derive(Default)]
+struct Clock {
+    up: bool,
+    committing: bool,
+}
+
+static CLOCK: Mutex<Clock> = Mutex::new(Clock {
+    up: false,
+    committing: false,
+});
+static TURN: Condvar = Condvar::new();
+/// The longest the time's being up waits for a removal under way.
+const COMMIT_GRACE: Duration = Duration::from_secs(8);
+
+fn clock() -> std::sync::MutexGuard<'static, Clock> {
+    CLOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Start a removal, unless the time is up.
+fn begin() -> bool {
+    let mut clock = clock();
+    if clock.up {
+        return false;
+    }
+    clock.committing = true;
+    true
+}
+
+/// A removal begun is over, and what came of it is in the answer.
+fn release() {
+    clock().committing = false;
+    TURN.notify_all();
+}
+
+fn time_is_up() -> bool {
+    clock().up
 }
 
 /// Run one call and print its answer. Never fails, always prints one answer,
-/// always exits 0 within the time it was given.
+/// always exits 0 within the time it was given, and a little more for a
+/// removal under way.
 pub fn run(asked: &Asked) {
     let within = asked
         .within_ms
@@ -123,12 +186,24 @@ pub fn run(asked: &Asked) {
     *answer_so_far() = Some(Answer::nothing(op, Condition::Ok));
     std::thread::spawn(move || {
         std::thread::sleep(within);
-        bounded::stop_all();
+        let mut held = clock();
+        held.up = true;
+        let waited = std::time::Instant::now();
+        while held.committing && waited.elapsed() < COMMIT_GRACE {
+            held = TURN
+                .wait_timeout(held, COMMIT_GRACE)
+                .map(|(held, _)| held)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+        }
+        drop(held);
+        // What it did is taken before anything is stopped, so that what
+        // stopping does is not taken for something it did.
         let partial = answer_so_far().take().map(|mut answer| {
             answer.condition = Condition::Timeout;
             answer.complete = false;
             fit(answer)
         });
+        bounded::stop_all();
         say(&partial.unwrap_or_else(|| Answer::nothing(op, Condition::Timeout)));
         std::process::exit(0);
     });
@@ -157,8 +232,30 @@ fn one(asked: &Asked, op: Op) -> Condition {
     let Some(environment) = asked.env.and_then(|name| settings.environment(name)) else {
         return Condition::Absent;
     };
+    let folder = asked.folders.first().map(String::as_str);
     match op {
-        Op::Census => census(&settings, environment, asked.folder, asked.driver),
+        Op::Census => census(&settings, environment, folder, asked.driver),
+        Op::Refresh => refresh(&settings, environment, asked.dry_run, asked.move_only),
+        Op::Snapshot => snapshot(&settings, environment, asked.dry_run, asked.pushed),
+        Op::Push => match folder {
+            Some(folder) if valid_folder(folder) => {
+                push(&settings, environment, folder, asked.merged)
+            }
+            _ => Condition::BadReply,
+        },
+        Op::Remove => {
+            let discard = match (asked.discard, asked.id) {
+                (false, _) => None,
+                (true, Some(id)) if crate::worktrees::valid_id(id) => Some(id),
+                (true, _) => return Condition::BadReply,
+            };
+            let fits = asked.folders.len() == asked.expect.len()
+                && asked.folders.iter().all(|folder| valid_folder(folder));
+            if !fits {
+                return Condition::BadReply;
+            }
+            remove(&settings, environment, asked, discard)
+        }
     }
 }
 
@@ -521,6 +618,466 @@ fn folder_entry(
     folder.last_change_ms = last_change(workspace.git(), &paths);
     folder.stamp = Some(format!("{:016x}", driver::fnv(&stamped)));
     (folder, told)
+}
+
+// ---- the writes -----------------------------------------------------------
+
+/// A private folder of this call's own, for copies of indexes: made new,
+/// never one that was there, and removed when it is dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Option<Scratch> {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).ok()?;
+        let name = format!("nucleated-repos-{:016x}", u64::from_be_bytes(bytes));
+        let path = std::env::temp_dir().join(name);
+        std::fs::DirBuilder::new().mode(0o700).create(&path).ok()?;
+        Some(Scratch(path))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A word for what failed in a call that is a refusal by the vetting, or
+/// `otherwise`.
+fn word_of(error: &anyhow::Error, otherwise: Word) -> Word {
+    git::refusal(error).map_or(otherwise, |refused| Word::of(refused.reason))
+}
+
+/// Move the nucleus's repos to their owner folders, unless `dry_run`; then,
+/// unless `move_only`, fetch each one.
+fn refresh(
+    settings: &Settings,
+    environment: &Environment,
+    dry_run: bool,
+    move_only: bool,
+) -> Condition {
+    let workspace = housekeeping::workspace_inside(settings, environment)
+        .leaving_alone(driver::protected_roots(settings));
+    if !dry_run {
+        match workspace.move_to_owner_folders() {
+            Ok(moved) => building(|answer| {
+                answer.moved = u32::try_from(moved.moved.len())
+                    .unwrap_or(MAX_COUNT)
+                    .min(MAX_COUNT)
+            }),
+            Err(_) => building(|answer| answer.why = Some(Word::Git)),
+        }
+    }
+    if move_only {
+        building(|answer| answer.complete = true);
+        return Condition::Ok;
+    }
+    let git = workspace.git();
+    let available = workspace.available().unwrap_or_else(|_| {
+        building(|answer| answer.unreadable = true);
+        Vec::new()
+    });
+    for item in available {
+        if !valid_name(&item.repo) {
+            building(|answer| answer.unreadable = true);
+            continue;
+        }
+        let refused = git.enforcing().then(|| git.vet_bare(&item.bare)).flatten();
+        let fetched = match refused {
+            Some(refused) => Fetched {
+                repo: item.repo.clone(),
+                ok: false,
+                failure: None,
+                refused: Some(refused.reason),
+            },
+            None => {
+                let failure = match transfer::fetch(git, &item.bare) {
+                    Ok(Ok(())) => None,
+                    Ok(Err(word)) => Some(word),
+                    Err(error) => Some(word_of(&error, Word::CannotRun)),
+                };
+                Fetched {
+                    repo: item.repo.clone(),
+                    ok: failure.is_none(),
+                    failure,
+                    refused: None,
+                }
+            }
+        };
+        building(|answer| answer.fetched.push(fetched));
+    }
+    building(|answer| answer.complete = true);
+    Condition::Ok
+}
+
+/// The session folder a worktree is in, if it is in one of the nucleus's.
+fn folder_of(sessions: &Path, worktree: &Path) -> Option<String> {
+    let real = worktree.canonicalize().ok()?;
+    let below = real.strip_prefix(sessions).ok()?;
+    let first = below.components().next()?.as_os_str().to_str()?;
+    valid_folder(first).then(|| first.to_string())
+}
+
+/// Snapshot every worktree of the nucleus's own, as the host's snapshot job
+/// does, but with the copies of indexes in a folder of this call's own, and
+/// no tree the host has recorded as pushed pushed again.
+fn snapshot(
+    settings: &Settings,
+    environment: &Environment,
+    dry_run: bool,
+    pushed: &[String],
+) -> Condition {
+    let workspace = housekeeping::workspace_inside(settings, environment)
+        .leaving_alone(driver::protected_roots(settings));
+    let Some(scratch) = Scratch::new() else {
+        return Condition::Error;
+    };
+    let pushed: BTreeSet<&str> = pushed.iter().map(String::as_str).collect();
+    let already = |tree: &str| pushed.contains(tree);
+    let how = housekeeping::Snapping {
+        index_dir: &scratch.0,
+        plain_index: true,
+        already: &already,
+        usable: &valid_wip_ref,
+        dry_run,
+        now: std::time::SystemTime::now(),
+    };
+    let sessions = environment
+        .root
+        .join(".worktrees")
+        .canonicalize()
+        .unwrap_or_default();
+    let git = workspace.git();
+    let available = workspace.available().unwrap_or_else(|_| {
+        building(|answer| answer.unreadable = true);
+        Vec::new()
+    });
+    let mut room = MAX_WORKTREES;
+    let mut complete = true;
+    let entry = |repo: &str, folder: Option<String>, action, reason, branch: String| Snapshot {
+        repo: repo.to_string(),
+        folder,
+        branch: Some(branch)
+            .filter(|b| reportable_branch(b))
+            .unwrap_or_default(),
+        action,
+        reason,
+        tree: None,
+        reference: None,
+    };
+    'repos: for item in available {
+        if !valid_name(&item.repo) {
+            building(|answer| answer.unreadable = true);
+            continue;
+        }
+        let worktrees = match workspace.worktrees(&item.bare) {
+            Ok(worktrees) => worktrees,
+            Err(error) => {
+                if let Some(refused) = git::refusal(&error) {
+                    let one = entry(
+                        &item.repo,
+                        None,
+                        SnapAction::Refused,
+                        Some(Word::of(refused.reason)),
+                        String::new(),
+                    );
+                    building(|answer| answer.snapshots.push(one));
+                }
+                continue;
+            }
+        };
+        for worktree in worktrees.iter().filter(|worktree| worktree.is_dir()) {
+            if room == 0 {
+                complete = false;
+                break 'repos;
+            }
+            room -= 1;
+            let folder = folder_of(&sessions, worktree);
+            // A snapshot writes objects into the repository and pushes a
+            // ref: in a worktree that is not the nucleus's own, it is not
+            // made.
+            if workspace.leaves_alone(worktree) {
+                let word = match workspace.under_a_driver(worktree) {
+                    true => Word::OwnedByADriver,
+                    false => Word::NotOurs,
+                };
+                let one = entry(
+                    &item.repo,
+                    folder,
+                    SnapAction::Skipped,
+                    Some(word),
+                    String::new(),
+                );
+                building(|answer| answer.snapshots.push(one));
+                continue;
+            }
+            let one = match housekeeping::snapshot_core(git, worktree, &how) {
+                Ok(Snapped::Skipped(word)) => entry(
+                    &item.repo,
+                    folder,
+                    SnapAction::Skipped,
+                    Some(word),
+                    String::new(),
+                ),
+                Ok(Snapped::Would {
+                    branch,
+                    reference,
+                    tree,
+                }) => Snapshot {
+                    tree: Some(tree),
+                    reference: Some(reference),
+                    ..entry(&item.repo, folder, SnapAction::WouldSnapshot, None, branch)
+                },
+                Ok(Snapped::Done {
+                    branch,
+                    reference,
+                    tree,
+                }) => Snapshot {
+                    tree: Some(tree),
+                    reference: Some(reference),
+                    ..entry(&item.repo, folder, SnapAction::Snapshot, None, branch)
+                },
+                Ok(Snapped::Failed { branch, stderr }) => entry(
+                    &item.repo,
+                    folder,
+                    SnapAction::Failed,
+                    Some(transfer::word(&stderr)),
+                    branch,
+                ),
+                Err(error) => match git::refusal(&error) {
+                    Some(refused) => entry(
+                        &item.repo,
+                        folder,
+                        SnapAction::Refused,
+                        Some(Word::of(refused.reason)),
+                        String::new(),
+                    ),
+                    None => entry(
+                        &item.repo,
+                        folder,
+                        SnapAction::Failed,
+                        Some(Word::Git),
+                        String::new(),
+                    ),
+                },
+            };
+            building(|answer| answer.snapshots.push(one));
+        }
+    }
+    building(|answer| answer.complete = complete);
+    Condition::Ok
+}
+
+/// The session folder `name`, held open as an outcome holds it: the folder
+/// itself, or the word for why it cannot be had.
+fn session_folder(environment: &Environment, name: &str) -> Result<(paths::Dir, PathBuf), Word> {
+    let sessions = environment.root.join(".worktrees");
+    let held = paths::Dir::open(&sessions, false).map_err(|_| Word::Unreadable)?;
+    match held.at(name) {
+        Ok(session) => Ok((session, sessions.join(name))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Word::Gone),
+        Err(_) => Err(Word::Unreadable),
+    }
+}
+
+/// The name a repo goes by in a write's answer.
+fn reported(name: &str) -> String {
+    match valid_label(name) {
+        true => name.to_string(),
+        false => "repo".to_string(),
+    }
+}
+
+/// Watch's Push for one session folder.
+fn push(
+    settings: &Settings,
+    environment: &Environment,
+    folder: &str,
+    merged: &[String],
+) -> Condition {
+    let workspace = housekeeping::workspace_inside(settings, environment)
+        .leaving_alone(driver::protected_roots(settings))
+        .knowing_merged(merged);
+    let why = |word: Word| {
+        building(|answer| {
+            answer.why = Some(word);
+            answer.complete = true;
+        });
+        Condition::Ok
+    };
+    let (session, path) = match session_folder(environment, folder) {
+        Ok(found) => found,
+        Err(word) => return why(word),
+    };
+    if Workspace::load_manifest_in(&session, &path).is_err() {
+        return why(Word::NotASession);
+    }
+    let Ok(worktrees) = crate::worktrees::worktrees_of(&workspace, &path) else {
+        return why(Word::Unreadable);
+    };
+    let left_alone = workspace.leaves_alone(&path)
+        || worktrees
+            .iter()
+            .any(|(_, info)| workspace.leaves_alone(&info.path));
+    if left_alone {
+        return why(Word::LeftAlone);
+    }
+    crate::worktrees::push_each(&workspace, &worktrees, &mut |one| {
+        let pushed = Pushed {
+            repo: reported(&one.name),
+            pushed: one.pushed.min(MAX_COUNT),
+            uncommitted: one.uncommitted,
+            failure: one.failure,
+        };
+        building(|answer| answer.pushes.push(pushed));
+    });
+    building(|answer| answer.complete = true);
+    Condition::Ok
+}
+
+/// Remove each folder asked about, as cleanup and Watch's Clean up do,
+/// each only if it still stands as the host saw it, and none once the time
+/// is up. One begun is finished.
+fn remove(
+    settings: &Settings,
+    environment: &Environment,
+    asked: &Asked,
+    discard: Option<&str>,
+) -> Condition {
+    let workspace = housekeeping::workspace_inside(settings, environment)
+        .leaving_alone(driver::protected_roots(settings))
+        .knowing_merged(asked.merged);
+    let Some(scratch) = Scratch::new() else {
+        return Condition::Error;
+    };
+    for (name, expect) in asked.folders.iter().zip(asked.expect) {
+        if time_is_up() {
+            return Condition::Ok;
+        }
+        let removal = remove_one(&workspace, environment, name, expect, discard, &scratch.0);
+        let Some(removal) = removal else {
+            // Its removal was not started: the time was up.
+            release();
+            return Condition::Ok;
+        };
+        building(|answer| answer.removals.push(removal));
+        release();
+    }
+    if !time_is_up() {
+        let _ = workspace.prune_worktrees();
+        building(|answer| answer.complete = true);
+    }
+    Condition::Ok
+}
+
+fn remove_one(
+    workspace: &Workspace,
+    environment: &Environment,
+    name: &str,
+    expect: &str,
+    discard: Option<&str>,
+    keys: &Path,
+) -> Option<Removal> {
+    let came = |outcome, why| Removal {
+        folder: name.to_string(),
+        outcome,
+        why,
+        repo: None,
+        holding: Vec::new(),
+        other_files: false,
+        backed_up: Vec::new(),
+    };
+    let (session, path) = match session_folder(environment, name) {
+        Ok(found) => found,
+        Err(Word::Gone) => return Some(came(Outcome::Gone, None)),
+        Err(word) => return Some(came(Outcome::Failed, Some(word))),
+    };
+    let Ok(manifest) = Workspace::load_manifest_in(&session, &path) else {
+        return Some(came(Outcome::Kept, Some(Word::NotASession)));
+    };
+    let (now, _) = folder_entry(workspace, name, &path, Some(manifest));
+    if now.unreadable {
+        return Some(came(Outcome::Failed, Some(Word::Unreadable)));
+    }
+    if now.stamp.as_deref() != Some(expect) {
+        return Some(came(Outcome::Kept, Some(Word::Changed)));
+    }
+    let Ok(worktrees) = crate::worktrees::worktrees_of(workspace, &path) else {
+        return Some(came(Outcome::Failed, Some(Word::Unreadable)));
+    };
+    let left_alone = workspace.leaves_alone(&path)
+        || worktrees
+            .iter()
+            .any(|(_, info)| workspace.leaves_alone(&info.path));
+    if left_alone {
+        return Some(came(Outcome::Kept, Some(Word::LeftAlone)));
+    }
+    // A process in the container working in it, or a container that cannot
+    // say, keeps it.
+    let in_use = || housekeeping::in_use(&path) != Some(false);
+    if in_use() {
+        return Some(came(Outcome::Kept, Some(Word::InUse)));
+    }
+    let committing = Committing {
+        begin: &begin,
+        end: &|| {},
+    };
+    let how = Cleaning {
+        discard,
+        in_use: &in_use,
+        keys,
+        plain: true,
+        usable: &valid_wip_ref,
+        committing: &committing,
+    };
+    let pairs = |list: Vec<(String, String)>| -> Vec<Backup> {
+        list.into_iter()
+            .map(|(repo, reference)| Backup {
+                repo: reported(&repo),
+                reference,
+            })
+            .collect()
+    };
+    Some(match clean_up_core(workspace, &path, &how) {
+        Cleaned::NotStarted => return None,
+        Cleaned::Removed { backed_up } => Removal {
+            backed_up: pairs(backed_up),
+            ..came(Outcome::Removed, None)
+        },
+        Cleaned::Holding {
+            holding,
+            other_files,
+        } => {
+            let why = match holding.is_empty() {
+                true => Word::OtherFiles,
+                false => Word::Unsaved,
+            };
+            Removal {
+                holding: holding
+                    .into_iter()
+                    .take(MAX_FOLDER_REPOS)
+                    .map(|(repo, found)| Holding {
+                        repo: reported(&repo),
+                        unpushed: found.unpushed.min(MAX_COUNT),
+                        uncommitted: found.uncommitted,
+                    })
+                    .collect(),
+                other_files,
+                ..came(Outcome::Kept, Some(why))
+            }
+        }
+        Cleaned::Failed {
+            why,
+            repo,
+            backed_up,
+        } => Removal {
+            repo: repo.map(|repo| reported(&repo)),
+            backed_up: pairs(backed_up),
+            ..came(Outcome::Failed, Some(why))
+        },
+    })
 }
 
 #[cfg(test)]

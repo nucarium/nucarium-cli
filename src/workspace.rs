@@ -77,6 +77,9 @@ pub struct Workspace {
     /// Where GitHub's answers to "was this commit merged?" are remembered,
     /// for a caller that asks on a schedule.
     merges: Option<PathBuf>,
+    /// The commits GitHub said were merged, as someone else asked it: when
+    /// set, GitHub is not asked here, and a commit not among them was not.
+    known_merged: Option<std::collections::BTreeSet<String>>,
     /// Folders that belong to something else, a driver that makes and
     /// removes its own worktrees. Nothing under one is removed, pruned,
     /// snapshotted or counted here. See [`Workspace::left_alone_because`]
@@ -301,6 +304,7 @@ impl Workspace {
             sessions_dir: root.join(".worktrees"),
             seeds_dir: root.join(".seeds"),
             merges: None,
+            known_merged: None,
             protected: Vec::new(),
             git,
         }
@@ -392,6 +396,13 @@ impl Workspace {
     /// Remember GitHub's answers in `file`, so that counting unsaved work on
     /// a schedule asks about each commit once an hour at most, and never
     /// again once it was merged.
+    /// Take these commits for the ones GitHub says were merged, and ask
+    /// GitHub nothing: inside a container, where the host has asked it.
+    pub fn knowing_merged(mut self, merged: &[String]) -> Self {
+        self.known_merged = Some(merged.iter().cloned().collect());
+        self
+    }
+
     pub fn remembering_merges(mut self, file: PathBuf) -> Self {
         self.merges = Some(file);
         self
@@ -1190,6 +1201,12 @@ impl Workspace {
 
     /// As [`Workspace::asked`], for a repo whose remote is `remote`.
     fn asked_remote(&self, remote: &str, sha: &str) -> Asked {
+        if let Some(known) = &self.known_merged {
+            return Asked {
+                merged: known.contains(sha),
+                ..Asked::default()
+            };
+        }
         let now_s = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
