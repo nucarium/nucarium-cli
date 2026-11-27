@@ -1650,7 +1650,7 @@ fn a_push_answer_out_of_line_or_cut_short_is_taken_for_no_more_than_it_says() {
     assert_eq!(result["outcome"], "failed");
     assert_eq!(
         result["detail"],
-        "The rest was not pushed: it took too long."
+        "Pushed 1 commit in web. The rest was not pushed: it took too long."
     );
     assert!(git(&rig.upstream, &["branch", "--list", "workspace/fix-login"]).is_empty());
 }
