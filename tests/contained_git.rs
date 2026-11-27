@@ -113,6 +113,33 @@ impl Boxed {
     }
 }
 
+/// Whether the host asked inside `client-a`'s container to `op`.
+fn asked_inside(rig: &Rig, op: &str) -> bool {
+    rig.podman_calls().iter().any(|call| {
+        call.starts_with("exec agent-env-client-a ")
+            && call.contains(" repos --env ")
+            && call.contains(&format!(" --do {op} "))
+    })
+}
+
+/// Ask for `client-a`'s session `s1` to be reported on, as the daemon's
+/// loop asks once it stops, long enough ago that it is due.
+fn ask_for_outcome(rig: &Rig) {
+    nucleate::reporter::ask(
+        &rig.home.state_dir(),
+        "client-a",
+        "s1",
+        SystemTime::now() - Duration::from_secs(60),
+    );
+}
+
+fn outcomes_spooled(rig: &Rig) -> usize {
+    rig.spooled()
+        .iter()
+        .filter(|record| record["event"]["type"] == "outcome")
+        .count()
+}
+
 fn commit(worktree: &Path, file: &str, subject: &str) {
     fs::write(worktree.join(file), "work\n").unwrap();
     git(worktree, &["add", "."]);
@@ -582,11 +609,22 @@ fn whatever_a_container_prints_in_place_of_an_answer_is_known_as_nothing() {
             ),
         ),
     ];
+    // Asked for an outcome, the reporter writes one only from an answer.
+    ask_for_outcome(rig);
+    boxed.reporter().tick(&rig.settings(), SystemTime::now());
+    assert_eq!(outcomes_spooled(rig), 1);
     let spooled = rig.spooled().len();
     for (what, does) in hostile {
         rig.container_does("agent-env-client-a", &does);
         let hangs = does.contains("sleep 60");
         let seen = heard(&boxed, &session, limit);
+        if !hangs {
+            ask_for_outcome(rig);
+            boxed
+                .reporter()
+                .waiting_at_most(limit)
+                .tick(&rig.settings(), SystemTime::now());
+        }
         assert_eq!(seen.unsaved, None, "{what}");
         assert_eq!(seen.worktrees, None, "{what}");
         assert!(seen.outcome.is_none(), "{what}");
@@ -617,7 +655,7 @@ fn whatever_a_container_prints_in_place_of_an_answer_is_known_as_nothing() {
             "{pid} is still running"
         );
     }
-    assert_eq!(boxed.host_git(), Vec::<String>::new());
+    assert!(asked_inside(rig, "census"));
 
     // An answer about another folder than the one asked about tells of no
     // outcome, though it does for the whole nucleus.
@@ -727,6 +765,7 @@ fn no_string_a_container_hands_over_but_names_words_and_numbers_is_taken() {
         assert!(answer.to_string().contains(MARK), "{field}");
         fs::write(&file, answer.to_string()).unwrap();
         let _ = fs::remove_file(rig.home.state_dir().join("unsaved.json"));
+        ask_for_outcome(rig);
         boxed.reporter().tick(&rig.settings(), SystemTime::now());
         let counts = fs::read_to_string(rig.home.state_dir().join("unsaved.json")).unwrap();
         assert!(!counts.contains(MARK), "{field}: {counts}");
@@ -802,7 +841,7 @@ fn what_a_real_census_reads_stays_in_the_container() {
         .any(|record| record["event"]["type"] == "outcome"));
     gate::tick(rig);
     assert!(!mock.to(contract::EVENTS).is_empty());
-    assert_eq!(boxed.host_git(), Vec::<String>::new());
+    assert!(asked_inside(rig, "census"));
     gate::assert_clean(rig, &mock);
 }
 
@@ -1663,32 +1702,45 @@ fn a_removal_answer_out_of_line_or_cut_short_removes_nothing_it_does_not_say() {
     rig.configure_in_container("worktree_actions = true\n");
     let worktree = rig.session("fix-login");
     fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
-    let removal = |entry: Value| json!([entry]);
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    // Each backup fits in every way but its ref.
+    let backed_up = |reference: &str| {
+        json!([{ "folder": "fix-login", "outcome": "backed_up", "backed_up": [{
+            "repo": "web", "branch": "workspace/fix-login", "tree": tree, "ref": reference,
+        }] }])
+    };
     for (what, discard, entries) in [
         (
             "done for a folder not asked",
             false,
-            removal(json!({ "folder": "other", "outcome": "removed" })),
+            json!([{ "folder": "other", "outcome": "removed" }]),
         ),
         (
             "a backup outside refs/wip",
             true,
-            removal(json!({ "folder": "fix-login", "outcome": "removed",
-                "backed_up": [{ "repo": "web", "ref": "refs/heads/main" }] })),
+            backed_up("refs/heads/main"),
         ),
         (
             "a backup of another action",
             true,
-            removal(json!({ "folder": "fix-login", "outcome": "removed",
-                "backed_up": [{ "repo": "web", "ref": "refs/wip/workspace-fix-login-wta_0000000000000000" }] })),
+            backed_up("refs/wip/workspace-fix-login-wta_0000000000000000"),
+        ),
+        (
+            "a backup of another branch",
+            true,
+            backed_up("refs/wip/workspace-other-{id}"),
         ),
     ] {
+        let asked = action("fix-login", "clean_up", discard);
+        let id = asked["id"].as_str().unwrap();
+        let entries: Value =
+            serde_json::from_str(&entries.to_string().replace("{id}", id)).unwrap();
         answers(
             rig,
             "remove",
             &write_answer("remove", "ok", "removals", entries),
         );
-        let result = act_inside(&boxed, &action("fix-login", "clean_up", discard), None);
+        let result = act_inside(&boxed, &asked, None);
         assert_eq!(result["outcome"], "failed", "{what}: {result}");
         assert_eq!(
             result["detail"],
@@ -1697,6 +1749,20 @@ fn a_removal_answer_out_of_line_or_cut_short_removes_nothing_it_does_not_say() {
         );
         assert!(worktree.is_dir(), "{what}");
     }
+    // The same answer with this branch's ref for this action is taken.
+    let asked = action("fix-login", "clean_up", true);
+    let id = asked["id"].as_str().unwrap();
+    let mut good = backed_up(&format!("refs/wip/workspace-fix-login-{id}"));
+    good[0]["outcome"] = json!("kept");
+    good[0]["why"] = json!("in_use");
+    answers(
+        rig,
+        "remove",
+        &write_answer("remove", "ok", "removals", good),
+    );
+    let result = act_inside(&boxed, &asked, None);
+    assert_eq!(result["outcome"], "refused", "{result}");
+
     answers(
         rig,
         "remove",
@@ -1709,6 +1775,82 @@ fn a_removal_answer_out_of_line_or_cut_short_removes_nothing_it_does_not_say() {
     );
     assert!(worktree.is_dir());
     assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+}
+
+/// A Clean up with discard whose removal call answers with `does`, the
+/// backups having been made for real.
+#[cfg(target_os = "linux")]
+fn removal_answers(rig: &Rig, does: &str) {
+    rig.container_does(
+        "agent-env-client-a",
+        &format!("case \"$*\" in *--backup-only*) exec \"$@\" ;; *'--do remove'*) {does} ;; esac\nexec \"$@\""),
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_begun_when_the_time_ran_out_is_said_as_unknown_with_its_backups() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
+    let file = rig.home.dir.join("started.json");
+    fs::write(
+        &file,
+        json!({ "version": 1, "op": "remove", "condition": "timeout",
+            "removals": [{ "folder": "fix-login", "outcome": "started" }] })
+        .to_string(),
+    )
+    .unwrap();
+    removal_answers(rig, &format!("exec cat '{}'", file.display()));
+    let asked = action("fix-login", "clean_up", true);
+    let id = asked["id"].as_str().unwrap().to_string();
+    let result = act_inside(&boxed, &asked, None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        format!(
+            "Backed up to refs/wip/workspace-fix-login-{id} in web. It took too long to say \
+             whether it was removed."
+        )
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_that_comes_back_while_the_backups_are_pushed_keeps_the_folder() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
+    // A session of this box in the folder, which it learns of only once
+    // the backups are made: the container cannot see the box's store.
+    stopped_in(rig, "fix-login");
+    let kept = rig.home.state_dir().join("sessions/client-a/s1.json");
+    let aside = rig.home.dir.join("session-aside.json");
+    fs::rename(&kept, &aside).unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "case \"$*\" in *--backup-only*) \"$@\"; done=$?; cp '{}' '{}'; exit $done ;; esac\n\
+             exec \"$@\"",
+            aside.display(),
+            kept.display()
+        ),
+    );
+    let asked = action("fix-login", "clean_up", true);
+    let id = asked["id"].as_str().unwrap().to_string();
+    let result = act_inside(&boxed, &asked, None);
+    assert_eq!(result["outcome"], "refused", "{result}");
+    assert_eq!(
+        result["detail"],
+        format!(
+            "Backed up to refs/wip/workspace-fix-login-{id} in web. A session is still using it."
+        )
+    );
+    assert!(worktree.is_dir());
 }
 
 #[test]
@@ -1805,6 +1947,54 @@ fn nothing_a_write_hands_over_but_names_words_and_numbers_is_taken() {
             }
         }
     }
+    // A removal's answer, where one can be asked for: whether a process is
+    // in the folder is read from `/proc`.
+    if cfg!(target_os = "linux") {
+        let removal = |id: &str| {
+            json!({
+                "folder": "fix-login", "outcome": "backed_up", "backed_up": [{
+                    "repo": "web", "branch": "workspace/fix-login", "tree": tree,
+                    "ref": format!("refs/wip/workspace-fix-login-{id}"),
+                }],
+            })
+        };
+        type Change = Box<dyn Fn(&mut Value)>;
+        let mut fields: Vec<(&str, Change)> = Vec::new();
+        for field in ["folder", "outcome", "why", "repo", "note"] {
+            fields.push((
+                field,
+                Box::new(move |r: &mut Value| r[field] = json!(mark(field))),
+            ));
+        }
+        for field in ["repo", "ref", "branch", "tree"] {
+            fields.push((
+                field,
+                Box::new(move |r: &mut Value| r["backed_up"][0][field] = json!(mark(field))),
+            ));
+        }
+        fields.push((
+            "holding.repo",
+            Box::new(|r: &mut Value| {
+                r["outcome"] = json!("kept");
+                r["why"] = json!("unsaved");
+                r["holding"] = json!([{ "repo": mark("holding"), "uncommitted": true }]);
+            }),
+        ));
+        for (field, change) in fields {
+            let asked = action("fix-login", "clean_up", true);
+            let mut entry = removal(asked["id"].as_str().unwrap());
+            change(&mut entry);
+            assert!(entry.to_string().contains(MARK), "{field}");
+            answers(
+                rig,
+                "remove",
+                &write_answer("remove", "ok", "removals", json!([entry])),
+            );
+            let result = act_inside(&boxed, &asked, None);
+            assert_eq!(result["outcome"], "failed", "removals.{field}: {result}");
+            assert!(!result.to_string().contains(MARK), "removals.{field}");
+        }
+    }
     gate::tick(rig);
     assert!(!mock.to(contract::HEARTBEATS).is_empty());
     gate::assert_clean(rig, &mock);
@@ -1829,6 +2019,7 @@ fn what_a_real_write_reads_and_sends_stays_in_the_container() {
 
     let report = job_inside(&boxed, Job::Snapshot, None).unwrap();
     assert_eq!(report["worktrees"][0]["action"], "snapshot", "{report}");
+    assert!(!report.to_string().contains(MARK), "{report}");
     let report = job_inside(&boxed, Job::Refresh, None).unwrap();
     assert_eq!(report["repos"][0]["ok"], true, "{report}");
     let result = act_inside(&boxed, &action("fix-login", "push", false), None);
@@ -1841,6 +2032,108 @@ fn what_a_real_write_reads_and_sends_stays_in_the_container() {
     gate::tick(rig);
     gate::tick(rig);
     assert!(!mock.to(contract::HEARTBEATS).is_empty());
-    assert_eq!(boxed.host_git(), Vec::<String>::new());
+    for op in ["census", "snapshot", "refresh", "push"] {
+        assert!(asked_inside(rig, op), "{op}");
+    }
     gate::assert_clean(rig, &mock);
+}
+
+#[test]
+fn a_host_environment_sharing_a_containers_nucleus_has_its_git_run_in_that_container() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    // `client-a` on the host, first, and `box-b` in the container, over the
+    // same nucleus.
+    rig.configure(&format!(
+        "[[environment]]\nname = \"box-b\"\nroot = \"{}\"\ncheck = \"true\"\n\
+         unit = \"agent-env-client-a.service\"\n",
+        rig.root.display()
+    ));
+    rig.session("fix-login");
+    let flat = rig.flatten();
+    let out = boxed.job("refresh", &["--env", "client-a"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout_json(&out)[0]["repos"][0]["ok"], true);
+    assert!(!flat.exists());
+    assert!(rig
+        .podman_calls()
+        .iter()
+        .any(|call| call.contains(" repos --env box-b ") && call.contains("--do refresh")));
+
+    // The count is the container's answer: here one that says a worktree
+    // holds what the nucleus's does not.
+    let mut said = answer();
+    said["folders"][0]["worktrees"][0]["facts"]["uncommitted"] = json!(true);
+    let file = rig.home.dir.join("count.json");
+    fs::write(&file, said.to_string()).unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!("exec cat '{}'", file.display()),
+    );
+    let counts = rig.home.state_dir().join("unsaved.json");
+    rig.looker();
+    let out = gate::daemon_until(rig, Some(&boxed.path), "a count", &|| counts.is_file());
+    let counts: Value = serde_json::from_str(&fs::read_to_string(&counts).unwrap()).unwrap();
+    let nucleus = &counts["nuclei"][0];
+    assert_eq!(
+        nucleus["environments"],
+        json!(["client-a", "box-b"]),
+        "{nucleus}"
+    );
+    assert_eq!(nucleus["unsaved"]["uncommitted_repos"], 1, "{nucleus}");
+    assert_eq!(boxed.host_git(), Vec::<String>::new(), "{}", stderr(&out));
+}
+
+#[test]
+fn a_container_drivers_worktrees_are_counted_inside_it_with_no_git_on_the_host() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let workspaces = rig.home.dir.join("orca").join("workspaces");
+    fs::create_dir_all(&workspaces).unwrap();
+    rig.configure_in_container(&format!(
+        "[[environment]]\nname = \"orca\"\nroot = \"{}\"\ndriver = \"orca\"\ncheck = \"true\"\n\
+         unit = \"agent-env-client-a.service\"\ndriver_cli = \"/nonexistent\"\ndriver_home = \"{}\"\n",
+        workspaces.display(),
+        rig.home.dir.join("orca-data").display(),
+    ));
+    let project = rig.root.join("projects").join("web");
+    git(
+        &rig.home.dir,
+        &[
+            "clone",
+            "-q",
+            rig.upstream.to_str().unwrap(),
+            project.to_str().unwrap(),
+        ],
+    );
+    let task = workspaces.join("task");
+    git(
+        &project,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task",
+            task.to_str().unwrap(),
+        ],
+    );
+    fs::write(task.join("notes.txt"), "not committed\n").unwrap();
+    let counts = rig.home.state_dir().join("unsaved.json");
+    rig.looker();
+    let out = gate::daemon_until(rig, Some(&boxed.path), "a count", &|| counts.is_file());
+    let counts: Value = serde_json::from_str(&fs::read_to_string(&counts).unwrap()).unwrap();
+    let orca = counts["nuclei"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|nucleus| nucleus["environments"] == json!(["orca"]))
+        .cloned()
+        .unwrap();
+    assert_eq!(orca["unsaved"]["uncommitted_repos"], 1, "{orca}");
+    assert!(rig
+        .podman_calls()
+        .iter()
+        .any(|call| call.contains(" repos --env orca ") && call.ends_with(" --driver")));
+    assert_eq!(boxed.host_git(), Vec::<String>::new(), "{}", stderr(&out));
 }

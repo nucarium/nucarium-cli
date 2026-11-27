@@ -943,6 +943,7 @@ fn unsaved_work_in_orcas_worktrees_is_counted_with_orca_stopped_and_nothing_is_t
                 .args(["housekeeping", "run", job]),
             "",
         );
+        assert!(all.status.success(), "{job}: {}", stderr(&all));
         let reports = stdout_json(&all);
         let ran: Vec<&Value> = reports
             .as_array()

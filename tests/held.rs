@@ -95,7 +95,7 @@ fn an_outcome_reads_a_session_folder_of_the_nucleus_itself() {
     assert_eq!(told.branch.as_deref(), Some("workspace/fix-login"));
     assert_eq!(told.uncommitted_repos, Some(1));
     assert!(asked_inside(&rig, "--do census"));
-    assert!(asked_inside(&rig, "--folder fix-login"));
+    assert!(asked_inside(&rig, "--folder=fix-login"));
 }
 
 #[test]
@@ -205,6 +205,38 @@ fn a_container_nucleus_counts_no_worktree_its_repos_say_is_outside_it() {
     // The container can write where its repos say their worktrees are.
     worktree_at(&rig, &rig.home.dir.join("workspace-other").join("wt"));
     assert_eq!(uncommitted(&rig), None);
+}
+
+#[test]
+fn a_container_nucleus_counts_what_the_container_says_and_not_what_the_host_sees() {
+    let rig = contained();
+    // Clean, as the host would see it.
+    rig.session("fix-login");
+    assert_eq!(uncommitted(&rig), Some(0));
+    // The container says otherwise, and the count is what it says.
+    let said = serde_json::json!({
+        "version": 1, "op": "census", "condition": "ok", "complete": true,
+        "folders": [{
+            "folder": "fix-login", "stamp": "0123456789abcdef",
+            "worktrees": [{
+                "key": "web", "repo": "web", "label": "web",
+                "facts": {
+                    "uncommitted": true, "tracked": true, "ahead": 2, "on_remote": true,
+                    "head": "0123456789abcdef0123456789abcdef01234567", "on_default": false,
+                },
+            }],
+        }],
+    });
+    let file = rig.home.dir.join("said.json");
+    fs::write(&file, said.to_string()).unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!("exec cat '{}'", file.display()),
+    );
+    let counts = reporter(&rig).count(&rig.settings(), SystemTime::now());
+    let unsaved = counts.nucleus("client-a").unwrap().unsaved.unwrap();
+    assert_eq!(unsaved.uncommitted_repos, 1);
+    assert_eq!(unsaved.unpushed_commits, 2);
 }
 
 #[test]
