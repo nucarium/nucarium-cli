@@ -1327,8 +1327,8 @@ fn cleaned_ended(cleaned: &Cleaned, network: bool) -> Ended {
                         Outcome::Failed,
                         fit(
                             format!(
-                                "{} It changed while it was backed up, so nothing was removed.",
-                                backed(backed_up)
+                                "{}It changed while it was backed up, so nothing was removed.",
+                                prefix(backed_up)
                             ),
                             || {
                                 "It changed while it was backed up, so nothing was removed."
