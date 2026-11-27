@@ -1234,11 +1234,9 @@ mod tests {
         let repo = dir.path().join("web.git");
         Git::Plain.init_bare(&repo).unwrap();
         let said = |guarded: Guarded| -> String {
-            let git = Git::Guarded(guarded.quiet());
-            let out = git
+            Git::Guarded(guarded.quiet())
                 .bare(&repo, &["config", "--get", "gc.autoDetach"])
-                .unwrap_or_default();
-            out
+                .unwrap_or_default()
         };
         let here = Guarded::new(None, Vetting::Enforce);
         assert_eq!(said(here.clone()), "");
