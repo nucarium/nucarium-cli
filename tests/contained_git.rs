@@ -1821,11 +1821,13 @@ fn a_removal_answer_out_of_line_or_cut_short_removes_nothing_it_does_not_say() {
         );
         let result = act_inside(&boxed, &asked, None);
         assert_eq!(result["outcome"], "failed", "{what}: {result}");
-        assert_eq!(
-            result["detail"],
-            "The environment gave no answer that could be used, so nothing was done.",
-            "{what}"
-        );
+        // The backups' call that answers so did nothing; a removal's call
+        // may have begun.
+        let expected = match discard {
+            true => "The environment gave no answer that could be used, so nothing was done.",
+            false => "The box could not tell whether it was removed.",
+        };
+        assert_eq!(result["detail"], expected, "{what}");
         assert!(worktree.is_dir(), "{what}");
     }
     // The same answer with this branch's ref for this action is taken.
@@ -2262,4 +2264,312 @@ fn the_daemon_moves_nothing_through_a_link_in_place_of_a_container_nucleuss_repo
         .collect();
     assert_eq!(moved, Vec::<String>::new(), "{}", stderr(&out));
     assert!(rig.home.dir.join("repos-elsewhere/web.git").is_dir());
+}
+
+// ---- removals, where /proc can say whether a folder is in use -------------
+
+#[cfg(target_os = "linux")]
+#[test]
+fn work_that_changes_after_its_backup_is_not_removed() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    // A file already changed: more changes to it leave its head and what
+    // `git status` says as they were, and the folder's stamp with them.
+    fs::write(worktree.join("README.md"), "changed\n").unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "case \"$*\" in *--backup-only*) \"$@\"; done=$?; echo more >> '{}'; exit $done ;; esac\n\
+             exec \"$@\"",
+            worktree.join("README.md").display()
+        ),
+    );
+    let asked = action("fix-login", "clean_up", true);
+    let id = asked["id"].as_str().unwrap().to_string();
+    let result = act_inside(&boxed, &asked, None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        format!(
+            "Backed up to refs/wip/workspace-fix-login-{id} in web. It changed while it was \
+             backed up, so nothing was removed."
+        )
+    );
+    assert!(worktree.is_dir());
+    assert_eq!(
+        fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "changed\nmore\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_after_backups_that_backed_up_nothing_backs_up_and_removes_nothing() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
+    // The backups' call says it backed up nothing.
+    let file = rig.home.dir.join("nothing-backed.json");
+    fs::write(
+        &file,
+        json!({ "version": 1, "op": "remove", "condition": "ok", "complete": true,
+            "removals": [{ "folder": "fix-login", "outcome": "backed_up" }] })
+        .to_string(),
+    )
+    .unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "case \"$*\" in *--backup-only*) exec cat '{}' ;; esac\nexec \"$@\"",
+            file.display()
+        ),
+    );
+    let result = act_inside(&boxed, &action("fix-login", "clean_up", true), None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        "It changed while it was backed up, so nothing was removed."
+    );
+    assert!(worktree.join("notes.txt").is_file());
+    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_call_given_up_on_says_it_cannot_tell_whether_it_removed() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container(
+        "worktree_actions = true\n[housekeeping]\ncleanup_min_age = \"0s\"\n",
+    );
+    let pushed = rig.session("pushed");
+    commit(&pushed, "b.txt", "pushed work");
+    rig.push(&pushed);
+    rig.container_does(
+        "agent-env-client-a",
+        "case \"$*\" in *'--do remove'*) exec sleep 60 ;; esac\nexec \"$@\"",
+    );
+    let result = act_inside(
+        &boxed,
+        &action("pushed", "clean_up", false),
+        Some(Duration::from_secs(3)),
+    );
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        "The box could not tell whether it was removed."
+    );
+    // And cleanup's job, given no answer it can use.
+    rig.container_does(
+        "agent-env-client-a",
+        "case \"$*\" in *'--do remove'*) echo the user typed this; exit 0 ;; esac\nexec \"$@\"",
+    );
+    let out = boxed.job("cleanup", &[], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        verdict(report, "pushed"),
+        json!({ "session": "pushed", "action": "failed",
+            "reason": "the box could not tell whether it was removed" })
+    );
+}
+
+/// `nucleated repos` as the daemon runs it in `client-a`'s container, with
+/// the config at `config` and, when given, a `PATH` of its own.
+#[cfg(target_os = "linux")]
+fn repos_inside(rig: &Rig, config: &Path, path: Option<&OsString>, args: &[&str]) -> Value {
+    let mut command = rig.nucleated();
+    command
+        .env("NUCLEATED_CONFIG", config)
+        .args(["repos", "--env", "client-a"])
+        .args(args);
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let out = run(&mut command, "");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    stdout_json(&out)
+}
+
+#[cfg(target_os = "linux")]
+fn stamp_of(rig: &Rig, config: &Path, folder: &str) -> String {
+    let census = repos_inside(
+        rig,
+        config,
+        None,
+        &["--do", "census", &format!("--folder={folder}")],
+    );
+    census["folders"][0]["stamp"].as_str().unwrap().to_string()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_under_way_when_the_time_runs_out_is_in_the_answer_as_begun() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let pushed = rig.session("pushed");
+    commit(&pushed, "b.txt", "pushed work");
+    rig.push(&pushed);
+    rig.looker();
+    let config = rig.home.config_file().with_file_name("inside.toml");
+    let stamp = stamp_of(rig, &config, "pushed");
+    // A git that takes its time to remove a worktree.
+    let real = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let slow = rig.home.dir.join("slow-bin");
+    script(
+        &slow.join("git"),
+        &format!(
+            "case \"$*\" in *'worktree remove'*) sleep 6 ;; esac\nexec '{}' \"$@\"",
+            real.trim()
+        ),
+    );
+    let mut paths = vec![slow];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let path = std::env::join_paths(paths).unwrap();
+    let answer = repos_inside(
+        rig,
+        &config,
+        Some(&path),
+        &[
+            "--do",
+            "remove",
+            "--folder=pushed",
+            &format!("--expect={stamp}"),
+            "--within=2500",
+            "--grace=0",
+        ],
+    );
+    assert_eq!(answer["condition"], "timeout", "{answer}");
+    assert_eq!(answer["removals"][0]["folder"], "pushed", "{answer}");
+    assert_eq!(answer["removals"][0]["outcome"], "started", "{answer}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_in_a_folder_keeps_it_however_the_root_is_named() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let pushed = rig.session("pushed");
+    commit(&pushed, "b.txt", "pushed work");
+    rig.push(&pushed);
+    // The config names the root through a link.
+    let linked = rig.home.dir.join("linked-root");
+    std::os::unix::fs::symlink(&rig.root, &linked).unwrap();
+    rig.looker();
+    let text = fs::read_to_string(rig.home.config_file().with_file_name("inside.toml")).unwrap();
+    let config = rig.home.config_file().with_file_name("inside-linked.toml");
+    fs::write(
+        &config,
+        text.replace(
+            &format!("root = \"{}\"", rig.root.display()),
+            &format!("root = \"{}\"", linked.display()),
+        ),
+    )
+    .unwrap();
+    let stamp = stamp_of(rig, &config, "pushed");
+    let mut working = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(rig.root.join(".worktrees/pushed"))
+        .spawn()
+        .unwrap();
+    let answer = repos_inside(
+        rig,
+        &config,
+        None,
+        &[
+            "--do",
+            "remove",
+            "--folder=pushed",
+            &format!("--expect={stamp}"),
+        ],
+    );
+    let _ = working.kill();
+    let _ = working.wait();
+    assert_eq!(answer["removals"][0]["outcome"], "kept", "{answer}");
+    assert_eq!(answer["removals"][0]["why"], "in_use", "{answer}");
+    assert!(pushed.is_dir());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cleanup_looks_again_for_a_session_just_before_it_removes() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.as_github("octo/web");
+    let pushed = rig.session("a-pushed");
+    commit(&pushed, "b.txt", "pushed work");
+    rig.push(&pushed);
+    rig.configure_in_container("[housekeeping]\ncleanup_min_age = \"0s\"\n");
+    // A session of this box comes to the folder while cleanup is asking
+    // GitHub about it: after it was looked at, before the removal.
+    stopped_in(rig, "a-pushed");
+    let kept = rig.home.state_dir().join("sessions/client-a/s1.json");
+    let aside = rig.home.dir.join("session-aside.json");
+    fs::rename(&kept, &aside).unwrap();
+    let (from, to) = (aside.clone(), kept.clone());
+    let github = Mock::start(move |_request: &Request| {
+        let _ = fs::copy(&from, &to);
+        Reply::json(404, json!({ "message": "Not Found" }))
+    });
+    let out = boxed.job("cleanup", &[], Some(&github));
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        verdict(report, "a-pushed"),
+        json!({ "session": "a-pushed", "action": "kept", "reason": "its agent session has not ended" })
+    );
+    assert!(pushed.is_dir());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn backups_pushed_before_one_failed_are_said() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    // Two repos, the second GitHub's, behind a proxy that will not go there.
+    let zed = rig.home.dir.join("upstream").join("zed");
+    fs::create_dir_all(&zed).unwrap();
+    git(&zed, &["init", "-q", "-b", "main"]);
+    commit(&zed, "README.md", "init");
+    let cloned = run(rig.nucleate().args(["clone", zed.to_str().unwrap()]), "");
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let made = run(
+        rig.nucleate().args(["create-session", "two", "web", "zed"]),
+        "",
+    );
+    assert!(made.status.success(), "{}", stderr(&made));
+    let two = rig.root.join(".worktrees").join("two");
+    fs::write(two.join("web").join("notes.txt"), "not committed\n").unwrap();
+    fs::write(two.join("zed").join("notes.txt"), "not committed\n").unwrap();
+    git(
+        &rig.root.join(".repos/_/zed.git"),
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/octo/zed.git",
+        ],
+    );
+    behind(rig, &refusing_proxy());
+    let asked = action("two", "clean_up", true);
+    let id = asked["id"].as_str().unwrap().to_string();
+    let result = act_inside(&boxed, &asked, None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        format!(
+            "Backed up to refs/wip/workspace-two-{id} in web. The backup of zed could not be \
+             pushed, as the environment's network does not reach GitHub, so nothing was removed."
+        )
+    );
+    assert!(two.is_dir());
 }
