@@ -7,8 +7,10 @@
 //! git and a local remote. What the daemon learns of the container's
 //! repositories it learns from that answer: the counts of unsaved work, the
 //! session folders it reports, what a session left behind, and what cleanup
-//! would remove. And when the answer is not one, it knows nothing, and says
-//! nothing in its place.
+//! would remove. What it changes in them is changed in there too: a refresh,
+//! a snapshot, Watch's Push and Clean up, and cleanup's removal. And when the
+//! answer is not one, it knows nothing, says nothing in its place, and
+//! removes nothing.
 
 mod common;
 
@@ -875,4 +877,761 @@ fn facts_and_a_verdict_come_to_what_the_one_rule_says() {
     assert_eq!(unsaved("tracked").unpushed, 1);
     assert!(unsaved("pushed").is_saved());
     assert_eq!(unsaved("on-default").unpushed, 1);
+}
+
+// ---- what is changed inside -------------------------------------------------
+
+/// The `podman` the tests run in-process calls through: git for the
+/// container inside it, each call given `patience` when it is given.
+fn inside(boxed: &Boxed, patience: Option<Duration>) -> nucleate::repos::Inside {
+    nucleate::repos::Inside {
+        runner: boxed.rig.looker(),
+        patience,
+    }
+}
+
+/// A housekeeping job for `client-a`, run in-process as the daemon runs it.
+fn job_inside(
+    boxed: &Boxed,
+    job: nucleate::housekeeping::Job,
+    patience: Option<Duration>,
+) -> anyhow::Result<Value> {
+    let settings = boxed.rig.settings();
+    let environment = settings.environment("client-a").unwrap();
+    let inside = inside(boxed, patience);
+    nucleate::housekeeping::run_job_with(&settings, environment, job, false, Some(&inside))
+}
+
+/// An action's id, new each time it is asked for.
+fn action_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("wta_{:016}", NEXT.fetch_add(1, Ordering::SeqCst))
+}
+
+fn action(folder: &str, kind: &str, discard: bool) -> Value {
+    json!({
+        "id": action_id(), "env_id": "client-a", "folder": folder, "kind": kind,
+        "discard": discard, "requested_at": nucleate::envelope::rfc3339(SystemTime::now()),
+    })
+}
+
+fn result_file(rig: &Rig, action: &Value) -> PathBuf {
+    rig.home
+        .state_dir()
+        .join("worktree-actions/results/client-a")
+        .join(format!("{}.json", action["id"].as_str().unwrap()))
+}
+
+/// Run one Watch action in-process, as the daemon's thread for them does,
+/// and hand back its result.
+fn act_inside(boxed: &Boxed, action: &Value, patience: Option<Duration>) -> Value {
+    let settings = boxed.rig.settings();
+    let taken: nucleate::worktrees::Action = serde_json::from_value(action.clone()).unwrap();
+    nucleate::worktrees::take(&settings, &[taken], SystemTime::now());
+    let inside = inside(boxed, patience);
+    nucleate::worktrees::run_queued_with(&settings, Some(&inside));
+    serde_json::from_str(&fs::read_to_string(result_file(&boxed.rig, action)).unwrap()).unwrap()
+}
+
+/// A Watch that hands out `actions` in its answer to every heartbeat.
+fn handing_out(actions: Vec<Value>) -> Mock {
+    let mut mock = Mock::start(move |request: &Request| {
+        if contract::violation_taking(request, &["worktrees"]).is_some() {
+            return Reply::problem(400, "validation_failed");
+        }
+        let received = json!("2026-11-19T12:00:00.000Z");
+        match request.path.as_str() {
+            contract::HEARTBEATS => Reply::json(
+                200,
+                json!({
+                    "received_at": received, "heartbeat_interval_s": 60,
+                    "accepts": ["worktrees"], "worktree_actions": actions,
+                }),
+            ),
+            _ => Reply::json(
+                200,
+                json!({ "received_at": received, "accepted": 1, "duplicates": 0, "rejected": [] }),
+            ),
+        }
+    });
+    mock.ahead = &["worktrees"];
+    mock
+}
+
+/// Run one Watch action as the box does, by `nucleated run` with the host's
+/// `PATH`, and hand back its result.
+fn act_through_the_daemon(boxed: &Boxed, action: &Value) -> Value {
+    let rig = &boxed.rig;
+    let mock = handing_out(vec![action.clone()]);
+    rig.sign_in(&mock.url);
+    rig.looker();
+    let file = result_file(rig, action);
+    gate::daemon_until(rig, Some(&boxed.path), "the action's result", &|| {
+        file.is_file()
+    });
+    serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap()
+}
+
+/// Set a file's modification time well into the past, so that it does not
+/// look like something being written.
+fn age(path: &Path) {
+    assert!(std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// A session whose worktree holds a file not committed that a snapshot
+/// would push.
+fn with_work(rig: &Rig, name: &str) -> PathBuf {
+    let worktree = rig.session(name);
+    fs::write(worktree.join("notes.txt"), "work\n").unwrap();
+    age(&worktree.join("notes.txt"));
+    worktree
+}
+
+#[test]
+fn a_refresh_moves_the_repos_and_fetches_them_inside_the_container() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.session("fix-login");
+    let flat = rig.flatten();
+    commit(&rig.upstream, "later.txt", "later");
+    let head = git(&rig.upstream, &["rev-parse", "HEAD"]);
+
+    let out = boxed.job("refresh", &[], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        report["repos"],
+        json!([{ "repo": "web", "ok": true }]),
+        "{report}"
+    );
+    assert_eq!(report["moved"], 1);
+    assert!(!flat.exists());
+    let moved = rig.root.join(".repos/_/web.git");
+    assert_eq!(
+        git(&moved, &["rev-parse", "refs/remotes/origin/main"]),
+        head
+    );
+    // The session's worktree follows its repo.
+    let worktree = rig.root.join(".worktrees/fix-login/web");
+    assert_eq!(git(&worktree, &["status", "--porcelain"]), "");
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
+
+#[test]
+fn the_daemon_moves_a_container_nucleus_inside_it_when_it_starts() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.session("fix-login");
+    let flat = rig.flatten();
+    let moved = rig.root.join(".repos/_/web.git");
+    rig.looker();
+    let out = gate::daemon_until(rig, Some(&boxed.path), "the move", &|| {
+        moved.is_dir() && !flat.exists()
+    });
+    assert_eq!(boxed.host_git(), Vec::<String>::new(), "{}", stderr(&out));
+}
+
+#[test]
+fn a_snapshot_is_pushed_from_inside_and_what_the_host_recorded_is_not_pushed_again() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    with_work(rig, "fix-login");
+
+    let out = boxed.job("snapshot", &["--dry-run"], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        report["worktrees"][0]["action"], "would_snapshot",
+        "{report}"
+    );
+    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+
+    let out = boxed.job("snapshot", &[], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        report["worktrees"],
+        json!([{
+            "repo": "web", "folder": "fix-login", "action": "snapshot",
+            "branch": "workspace/fix-login", "ref": "refs/wip/workspace-fix-login",
+        }])
+    );
+    let pushed = git(
+        &rig.upstream,
+        &["rev-parse", "refs/wip/workspace-fix-login^{tree}"],
+    );
+    let kept = fs::read_to_string(
+        rig.home
+            .state_dir()
+            .join("snapshots/client-a/web-workspace-fix-login"),
+    )
+    .unwrap();
+    assert_eq!(kept.trim(), pushed);
+
+    let out = boxed.job("snapshot", &[], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(report["worktrees"][0]["action"], "skipped");
+    assert_eq!(report["worktrees"][0]["reason"], "already snapshotted");
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
+
+#[test]
+fn push_runs_inside_the_container_and_says_what_it_pushed() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    commit(&worktree, "a.txt", "work");
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let result = act_through_the_daemon(&boxed, &action("fix-login", "push", false));
+    assert_eq!(result["outcome"], "done", "{result}");
+    assert_eq!(result["detail"], "Pushed 1 commit in web.");
+    assert_eq!(
+        git(
+            &rig.upstream,
+            &["rev-parse", "refs/heads/workspace/fix-login"]
+        ),
+        head
+    );
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+
+    // Pushed, there is nothing more to push.
+    let again = act_inside(&boxed, &action("fix-login", "push", false), None);
+    assert_eq!(again["outcome"], "refused");
+    assert_eq!(again["detail"], "There is nothing to push.");
+    let gone = act_inside(&boxed, &action("nowhere", "push", false), None);
+    assert_eq!(gone["detail"], "There is nothing to push.");
+}
+
+#[test]
+fn a_push_github_turns_down_is_said_in_the_hosts_words() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    commit(&worktree, "a.txt", "first");
+    rig.push(&worktree);
+    // The branch moves on on the remote, and here another way.
+    git(&rig.upstream, &["checkout", "-q", "workspace/fix-login"]);
+    commit(&rig.upstream, "theirs.txt", "theirs");
+    git(&rig.upstream, &["checkout", "-q", "main"]);
+    git(&worktree, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&worktree, "b.txt", "ours");
+    rig.home.git(&worktree, &["fetch", "-q"]);
+    git(&worktree, &["reset", "-q", "--soft", "HEAD"]);
+    let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        "web was not pushed: the branch on GitHub has commits this one does not."
+    );
+}
+
+/// A proxy that takes no one anywhere: every `CONNECT` is refused, as an
+/// environment's proxy refuses GitHub when its network is `none`.
+fn refusing_proxy() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut asked = [0u8; 4096];
+            let _ = stream.read(&mut asked);
+            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    format!("http://{address}")
+}
+
+#[test]
+fn where_the_environments_network_does_not_reach_github_nothing_is_sent_and_it_says_so() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    commit(&worktree, "a.txt", "work");
+    // The repo is GitHub's, as a box's are, and the container's proxy will
+    // not go there.
+    git(
+        &rig.bare(),
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/octo/web.git",
+        ],
+    );
+    let proxy = refusing_proxy();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "HTTPS_PROXY='{proxy}' https_proxy='{proxy}' ALL_PROXY='{proxy}'\n\
+             export HTTPS_PROXY https_proxy ALL_PROXY\nexec \"$@\""
+        ),
+    );
+    let out = boxed.job("refresh", &[], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(report["repos"][0]["ok"], false, "{report}");
+    assert_eq!(
+        report["repos"][0]["error"],
+        "The environment's network does not reach GitHub, so nothing was sent."
+    );
+    let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(
+        result["detail"],
+        "The environment's network does not reach GitHub, so nothing was sent."
+    );
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
+
+/// Whether a process is in a folder is read from `/proc`, so what is
+/// removed can only be shown where there is one.
+#[cfg(target_os = "linux")]
+#[test]
+fn clean_up_with_discard_backs_up_inside_and_removes_the_folder() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
+    let asked = action("fix-login", "clean_up", true);
+    let id = asked["id"].as_str().unwrap().to_string();
+    let result = act_through_the_daemon(&boxed, &asked);
+    let backup = format!("refs/wip/workspace-fix-login-{id}");
+    assert_eq!(result["outcome"], "done", "{result}");
+    assert_eq!(result["detail"], format!("Backed up to {backup} in web."));
+    let tree = git(&rig.upstream, &["ls-tree", "--name-only", &backup]);
+    assert!(tree.lines().any(|name| name == "notes.txt"), "{tree}");
+    assert!(!rig.root.join(".worktrees/fix-login").exists());
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+
+    // Without discard, a folder that holds work keeps it.
+    let other = rig.session("other");
+    fs::write(other.join("notes.txt"), "not committed\n").unwrap();
+    let kept = act_inside(&boxed, &action("other", "clean_up", false), None);
+    assert_eq!(kept["outcome"], "refused");
+    assert_eq!(kept["detail"], "It holds changes not committed in web.");
+    assert!(other.is_dir());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cleanup_removes_inside_what_the_host_decided_could_go() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.as_github("octo/web");
+    let commits = merged_session(rig, "merged");
+    three_folders(rig);
+    let github = github(commits);
+    rig.configure_in_container("[housekeeping]\ncleanup_min_age = \"0s\"\n");
+    let out = boxed.job("cleanup", &[], Some(&github));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report = &stdout_json(&out)[0];
+    assert_eq!(verdict(report, "merged")["action"], "removed", "{report}");
+    assert_eq!(verdict(report, "pushed")["action"], "removed", "{report}");
+    assert_eq!(verdict(report, "dirty")["action"], "kept");
+    assert!(!rig.root.join(".worktrees/merged").exists());
+    assert!(!rig.root.join(".worktrees/pushed").exists());
+    assert!(rig.root.join(".worktrees/dirty").is_dir());
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_folder_that_changed_since_the_host_looked_at_it_is_not_removed() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let pushed = rig.session("pushed");
+    commit(&pushed, "b.txt", "pushed work");
+    rig.push(&pushed);
+    rig.configure_in_container(
+        "worktree_actions = true\n[housekeeping]\ncleanup_min_age = \"0s\"\n",
+    );
+    // Something is written in it between the host's look and the removal.
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "case \"$*\" in *'--do remove'*) echo late > '{}'/late-$$.txt ;; esac\nexec \"$@\"",
+            pushed.display()
+        ),
+    );
+    let out = boxed.job("cleanup", &[], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        verdict(report, "pushed"),
+        json!({ "session": "pushed", "action": "kept", "reason": "it changed since it was looked at" })
+    );
+    assert!(pushed.is_dir());
+    let result = act_inside(&boxed, &action("pushed", "clean_up", true), None);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(
+        result["detail"],
+        "It changed while it was looked at, so nothing was done."
+    );
+    assert!(pushed.is_dir());
+}
+
+/// From now on the container answers `op` by printing `answer`, and runs
+/// everything else as it should.
+fn answers(rig: &Rig, op: &str, answer: &Value) {
+    let file = rig.home.dir.join(format!("{op}-answer.json"));
+    fs::write(&file, answer.to_string()).unwrap();
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "case \"$*\" in *'--do {op} '*|*'--do {op}') exec cat '{}' ;; esac\nexec \"$@\"",
+            file.display()
+        ),
+    );
+}
+
+fn write_answer(op: &str, condition: &str, part: &str, entries: Value) -> Value {
+    let mut answer =
+        json!({ "version": 1, "op": op, "condition": condition, "complete": condition == "ok" });
+    answer[part] = entries;
+    answer
+}
+
+#[test]
+fn a_refresh_or_snapshot_answer_out_of_line_or_cut_short_is_taken_for_no_more_than_it_says() {
+    use nucleate::housekeeping::Job;
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    with_work(rig, "fix-login");
+    let keys = rig.home.state_dir().join("snapshots/client-a");
+    let fetched = |repo: &str| json!([{ "repo": repo, "ok": true }]);
+    for (what, answer) in [
+        (
+            "a repo up and out",
+            write_answer("refresh", "ok", "fetched", fetched("../x")),
+        ),
+        (
+            "a word of its own",
+            write_answer(
+                "refresh",
+                "ok",
+                "fetched",
+                json!([{ "repo": "web", "ok": false, "failure": "it broke" }]),
+            ),
+        ),
+        (
+            "another op's part",
+            write_answer("refresh", "ok", "pushes", json!([{ "repo": "web" }])),
+        ),
+    ] {
+        answers(rig, "refresh", &answer);
+        assert!(job_inside(&boxed, Job::Refresh, None).is_err(), "{what}");
+    }
+    // Cut short: what it did not list was not done.
+    answers(
+        rig,
+        "refresh",
+        &write_answer("refresh", "timeout", "fetched", fetched("web")),
+    );
+    let error = job_inside(&boxed, Job::Refresh, None).unwrap_err();
+    assert!(format!("{error:#}").contains("took too long"), "{error:#}");
+
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let snapshot = |reference: &str| {
+        json!([{
+            "repo": "web", "folder": "fix-login", "branch": "workspace/fix-login",
+            "action": "snapshot", "tree": tree, "ref": reference,
+        }])
+    };
+    for (what, answer) in [
+        (
+            "a ref outside refs/wip",
+            write_answer("snapshot", "ok", "snapshots", snapshot("refs/heads/main")),
+        ),
+        (
+            "another branch's ref",
+            write_answer(
+                "snapshot",
+                "ok",
+                "snapshots",
+                snapshot("refs/wip/workspace-other"),
+            ),
+        ),
+        (
+            "a tree that is no tree",
+            write_answer(
+                "snapshot",
+                "ok",
+                "snapshots",
+                json!([{
+                    "repo": "web", "branch": "workspace/fix-login", "action": "snapshot",
+                    "tree": "HEAD", "ref": "refs/wip/workspace-fix-login",
+                }]),
+            ),
+        ),
+    ] {
+        answers(rig, "snapshot", &answer);
+        assert!(job_inside(&boxed, Job::Snapshot, None).is_err(), "{what}");
+        assert!(gate::leaks_on_disk(&keys).is_empty());
+        assert!(
+            fs::read_dir(&keys).map_or(true, |mut files| files.next().is_none()),
+            "{what}"
+        );
+    }
+    // Cut short, what it says it pushed is recorded, and the run is not good.
+    answers(
+        rig,
+        "snapshot",
+        &write_answer(
+            "snapshot",
+            "timeout",
+            "snapshots",
+            snapshot("refs/wip/workspace-fix-login"),
+        ),
+    );
+    assert!(job_inside(&boxed, Job::Snapshot, None).is_err());
+    let kept = fs::read_to_string(keys.join("web-workspace-fix-login")).unwrap();
+    assert_eq!(kept.trim(), tree);
+    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+}
+
+#[test]
+fn a_push_answer_out_of_line_or_cut_short_is_taken_for_no_more_than_it_says() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    commit(&worktree, "a.txt", "work");
+    for (what, entries) in [
+        (
+            "a repo with spaces",
+            json!([{ "repo": "the user typed this", "pushed": 1 }]),
+        ),
+        (
+            "a count over its cap",
+            json!([{ "repo": "web", "pushed": 100_001 }]),
+        ),
+        (
+            "a word of its own",
+            json!([{ "repo": "web", "failure": "it broke" }]),
+        ),
+    ] {
+        answers(rig, "push", &write_answer("push", "ok", "pushes", entries));
+        let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+        assert_eq!(result["outcome"], "failed", "{what}");
+        assert_eq!(
+            result["detail"],
+            "The environment gave no answer that could be used, so nothing was done.",
+            "{what}"
+        );
+    }
+    answers(
+        rig,
+        "push",
+        &write_answer(
+            "push",
+            "timeout",
+            "pushes",
+            json!([{ "repo": "web", "pushed": 1 }]),
+        ),
+    );
+    let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(
+        result["detail"],
+        "The rest was not pushed: it took too long."
+    );
+    assert!(git(&rig.upstream, &["branch", "--list", "workspace/fix-login"]).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_answer_out_of_line_or_cut_short_removes_nothing_it_does_not_say() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let worktree = rig.session("fix-login");
+    fs::write(worktree.join("notes.txt"), "not committed\n").unwrap();
+    let removal = |entry: Value| json!([entry]);
+    for (what, discard, entries) in [
+        (
+            "done for a folder not asked",
+            false,
+            removal(json!({ "folder": "other", "outcome": "removed" })),
+        ),
+        (
+            "a backup outside refs/wip",
+            true,
+            removal(json!({ "folder": "fix-login", "outcome": "removed",
+                "backed_up": [{ "repo": "web", "ref": "refs/heads/main" }] })),
+        ),
+        (
+            "a backup of another action",
+            true,
+            removal(json!({ "folder": "fix-login", "outcome": "removed",
+                "backed_up": [{ "repo": "web", "ref": "refs/wip/workspace-fix-login-wta_0000000000000000" }] })),
+        ),
+    ] {
+        answers(
+            rig,
+            "remove",
+            &write_answer("remove", "ok", "removals", entries),
+        );
+        let result = act_inside(&boxed, &action("fix-login", "clean_up", discard), None);
+        assert_eq!(result["outcome"], "failed", "{what}: {result}");
+        assert_eq!(
+            result["detail"],
+            "The environment gave no answer that could be used, so nothing was done.",
+            "{what}"
+        );
+        assert!(worktree.is_dir(), "{what}");
+    }
+    answers(
+        rig,
+        "remove",
+        &json!({ "version": 1, "op": "remove", "condition": "timeout" }),
+    );
+    let result = act_inside(&boxed, &action("fix-login", "clean_up", true), None);
+    assert_eq!(
+        result["detail"],
+        "It took too long, so nothing was removed."
+    );
+    assert!(worktree.is_dir());
+    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+}
+
+#[test]
+fn a_write_that_hangs_is_ended_by_the_host_and_leaves_nothing_running() {
+    use nucleate::housekeeping::Job;
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let pid_file = rig.home.dir.join("hung.pids");
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "trap '' TERM; echo $$ >> '{pids}'; sleep 60 & echo $! >> '{pids}'; wait",
+            pids = pid_file.display()
+        ),
+    );
+    let patience = Duration::from_secs(3);
+    let started = Instant::now();
+    let error = job_inside(&boxed, Job::Refresh, Some(patience)).unwrap_err();
+    assert!(
+        started.elapsed() < patience + END_LIMIT,
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "The environment took too long to answer, so nothing was done."
+    );
+    let pids = pids_in(&pid_file);
+    assert_eq!(pids.len(), 2);
+    for pid in pids {
+        assert!(
+            gone(&pid, END_LIMIT + END_GRACE + Duration::from_secs(3)),
+            "{pid} is still running"
+        );
+    }
+}
+
+#[test]
+fn nothing_a_write_hands_over_but_names_words_and_numbers_is_taken() {
+    use nucleate::housekeeping::Job;
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let mock = gate::watch_ahead();
+    rig.sign_in(&mock.url);
+    let worktree = with_work(rig, "fix-login");
+    commit(&worktree, "a.txt", "work");
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let mut marked: Vec<(String, &str, Value)> = Vec::new();
+    for field in ["repo", "failure", "refused", "error"] {
+        let mut entry = json!({ "repo": "web", "ok": false, "failure": "git" });
+        entry[field] = json!(mark(field));
+        marked.push((
+            format!("fetched.{field}"),
+            "refresh",
+            write_answer("refresh", "ok", "fetched", json!([entry])),
+        ));
+    }
+    for field in [
+        "repo", "folder", "branch", "action", "reason", "tree", "ref", "worktree",
+    ] {
+        let mut entry = json!({
+            "repo": "web", "folder": "fix-login", "branch": "workspace/fix-login",
+            "action": "snapshot", "tree": tree, "ref": "refs/wip/workspace-fix-login",
+        });
+        entry[field] = json!(mark(field));
+        marked.push((
+            format!("snapshots.{field}"),
+            "snapshot",
+            write_answer("snapshot", "ok", "snapshots", json!([entry])),
+        ));
+    }
+    for field in ["repo", "failure", "detail"] {
+        let mut entry = json!({ "repo": "web", "pushed": 1 });
+        entry[field] = json!(mark(field));
+        marked.push((
+            format!("pushes.{field}"),
+            "push",
+            write_answer("push", "ok", "pushes", json!([entry])),
+        ));
+    }
+    let mut answer = write_answer("push", "ok", "pushes", json!([]));
+    answer["why"] = json!(mark("why"));
+    marked.push(("why".into(), "push", answer));
+    for (field, op, answer) in &marked {
+        assert!(answer.to_string().contains(MARK), "{field}");
+        answers(rig, op, answer);
+        match *op {
+            "refresh" => assert!(job_inside(&boxed, Job::Refresh, None).is_err(), "{field}"),
+            "snapshot" => assert!(job_inside(&boxed, Job::Snapshot, None).is_err(), "{field}"),
+            _ => {
+                let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+                assert_eq!(result["outcome"], "failed", "{field}");
+            }
+        }
+    }
+    gate::tick(rig);
+    assert!(!mock.to(contract::HEARTBEATS).is_empty());
+    gate::assert_clean(rig, &mock);
+}
+
+#[test]
+fn what_a_real_write_reads_and_sends_stays_in_the_container() {
+    use nucleate::housekeeping::Job;
+    let boxed = boxed_in(Rig::under(MARK));
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    let mock = gate::watch_ahead();
+    rig.sign_in(&mock.url);
+    let worktree = with_work(rig, "fix-login");
+    let content = format!("{MARK} in a file the user wrote\n");
+    fs::write(worktree.join("notes.txt"), &content).unwrap();
+    age(&worktree.join("notes.txt"));
+    fs::write(worktree.join(format!("{MARK}.txt")), &content).unwrap();
+    age(&worktree.join(format!("{MARK}.txt")));
+    git(&worktree, &["add", "notes.txt"]);
+    git(&worktree, &["commit", "-q", "-m", &mark("subject")]);
+
+    let report = job_inside(&boxed, Job::Snapshot, None).unwrap();
+    assert_eq!(report["worktrees"][0]["action"], "snapshot", "{report}");
+    let report = job_inside(&boxed, Job::Refresh, None).unwrap();
+    assert_eq!(report["repos"][0]["ok"], true, "{report}");
+    let result = act_inside(&boxed, &action("fix-login", "push", false), None);
+    assert_eq!(
+        result["detail"], "Pushed 1 commit in web. web has changes that are not committed.",
+        "{result}"
+    );
+    assert!(!report.to_string().contains(MARK), "{report}");
+    boxed.reporter().tick(&rig.settings(), SystemTime::now());
+    gate::tick(rig);
+    gate::tick(rig);
+    assert!(!mock.to(contract::HEARTBEATS).is_empty());
+    assert_eq!(boxed.host_git(), Vec::<String>::new());
+    gate::assert_clean(rig, &mock);
 }
