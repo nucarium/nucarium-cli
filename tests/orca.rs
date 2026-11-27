@@ -1169,3 +1169,28 @@ fn no_content_orca_hands_over_reaches_the_wire_the_disk_or_the_status() {
     }
     orca.assert_only_asked(2);
 }
+
+#[test]
+fn a_link_in_place_of_a_container_nucleuss_sessions_is_not_taken_for_them() {
+    let orca = Orca::new();
+    let rig = &orca.rig;
+    let project = orca.project("web", false);
+    // The login's `.worktrees` is a link the container made, to a folder
+    // that is no nucleus's, where a worktree Orca lists is.
+    let elsewhere = rig.home.dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let sessions = rig.root.join(".worktrees");
+    fs::remove_dir_all(&sessions).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &sessions).unwrap();
+    let task = orca.worktree(&project, &elsewhere.join("task"), "orca/task", None);
+    orca.answers(
+        &json!({ "ok": true, "result": { "truncated": false, "worktrees": [
+        { "workspaceKind": "git", "path": task, "agents": [] },
+    ] } }),
+    );
+    let memory = orca.look();
+    assert_eq!(memory.condition, Condition::Ok);
+    // Left out of the count, so the count is not known; not taken for a
+    // session folder of the nucleus.
+    assert_eq!(memory.uncounted_worktrees, 1);
+}

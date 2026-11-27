@@ -534,11 +534,17 @@ fn uncounted(settings: &Settings, environment: &Environment, listed: &[PathBuf])
         .iter()
         .map(|path| resolve(path))
         .collect();
+    // The session folders of every nucleus. One a container writes is
+    // resolved only as far as its root, which the config names: a link in
+    // the place of its `.worktrees` leads where the container chose.
     let sessions: Vec<PathBuf> = settings
         .environments
         .iter()
         .filter(|other| !other.driver_owns_worktrees())
-        .map(|other| resolve(&other.root.join(".worktrees")))
+        .map(|other| match housekeeping::container_of(settings, other) {
+            Some(_) => resolve(&other.root).join(".worktrees"),
+            None => resolve(&other.root.join(".worktrees")),
+        })
         .collect();
     let left_out: BTreeSet<PathBuf> = listed
         .iter()

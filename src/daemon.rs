@@ -1260,11 +1260,18 @@ impl Daemon {
 fn move_to_owner_folders(settings: &Settings) {
     let mut contained = Vec::new();
     for environment in &settings.environments {
-        if environment.driver_owns_worktrees() || !environment.root.join(".repos").is_dir() {
+        if environment.driver_owns_worktrees() {
             continue;
         }
+        let repos = environment.root.join(".repos");
         let workspace = match housekeeping::workspace(settings, environment) {
+            Nucleus::Host(_) if !repos.is_dir() => continue,
             Nucleus::Host(workspace) => *workspace,
+            // A container writes it: a link in the place of its `.repos` is
+            // not followed, and is no nucleus.
+            Nucleus::Contained(_) if !fs::symlink_metadata(&repos).is_ok_and(|m| m.is_dir()) => {
+                continue
+            }
             Nucleus::Contained(_) => {
                 let first = housekeeping::one_per_nucleus(settings)
                     .iter()

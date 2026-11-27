@@ -2216,3 +2216,50 @@ fn a_container_drivers_worktrees_are_counted_inside_it_with_no_git_on_the_host()
         .any(|call| call.contains(" repos --env orca ") && call.ends_with(" --driver")));
     assert_eq!(boxed.host_git(), Vec::<String>::new(), "{}", stderr(&out));
 }
+
+/// Put a link in place of the nucleus's `.repos`, to a folder elsewhere
+/// that holds the same repos.
+fn repos_behind_a_link(rig: &Rig) {
+    let repos = rig.root.join(".repos");
+    let moved = rig.home.dir.join("repos-elsewhere");
+    fs::rename(&repos, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &repos).unwrap();
+}
+
+#[test]
+fn a_link_in_place_of_a_container_nucleuss_repos_is_no_nucleus_to_check() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    let nucleus = |rig: &Rig| {
+        let out = run(rig.nucleated().arg("check"), "");
+        stdout_json(&out)["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "client-a: nucleus")
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(nucleus(rig)["ok"], true);
+    repos_behind_a_link(rig);
+    assert_eq!(nucleus(rig)["ok"], false);
+}
+
+#[test]
+fn the_daemon_moves_nothing_through_a_link_in_place_of_a_container_nucleuss_repos() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.session("fix-login");
+    rig.flatten();
+    repos_behind_a_link(rig);
+    let counts = rig.home.state_dir().join("unsaved.json");
+    rig.looker();
+    let out = gate::daemon_until(rig, Some(&boxed.path), "a count", &|| counts.is_file());
+    let moved: Vec<String> = rig
+        .podman_calls()
+        .into_iter()
+        .filter(|call| call.contains("--move-only"))
+        .collect();
+    assert_eq!(moved, Vec::<String>::new(), "{}", stderr(&out));
+    assert!(rig.home.dir.join("repos-elsewhere/web.git").is_dir());
+}
