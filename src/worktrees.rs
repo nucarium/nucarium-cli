@@ -666,18 +666,19 @@ fn commits(count: u32) -> String {
 fn push_failure(stderr: &str, repo: &str) -> String {
     format!(
         "{repo} was not pushed: {}.",
-        push_why(transfer::word(stderr))
+        push_why(transfer::word(stderr), false)
     )
 }
 
 /// Why a push failed, in the words a result uses for its word.
-fn push_why(word: Word) -> &'static str {
+fn push_why(word: Word, network: bool) -> &'static str {
     match word {
         Word::TimedOut => "it took too long",
         Word::Rejected => "the branch on GitHub has commits this one does not",
         Word::SignIn => "GitHub did not accept the box's sign-in",
-        // A proxy that would not go to GitHub is GitHub not being reached,
-        // where a result does not say so in a sentence of its own.
+        Word::NoNetwork if network => "the environment's network does not reach GitHub",
+        // On the host, a proxy that would not go to GitHub is GitHub not
+        // being reached, as it always has been said.
         Word::Unreachable | Word::NoNetwork => "GitHub could not be reached",
         Word::Refused => "GitHub refused it",
         Word::BadBranch => "its branch has a name that cannot be pushed safely",
@@ -769,7 +770,15 @@ fn push_one(workspace: &Workspace, key: &str, info: &RepoInfo) -> PushOne {
 /// environment's network would not take to GitHub is said so, for the
 /// whole of it; `cut_short` says the rest was not done.
 fn pushed_ended(done: &[PushOne], network: bool, cut_short: bool) -> Ended {
-    if network && done.iter().any(|one| one.failure == Some(Word::NoNetwork)) {
+    // Nothing went anywhere, and only because the network would not take
+    // it: said so, for the whole of it.
+    let failed: Vec<Word> = done.iter().filter_map(|one| one.failure).collect();
+    let none_pushed = done.iter().all(|one| one.pushed == 0);
+    if network
+        && none_pushed
+        && !failed.is_empty()
+        && failed.iter().all(|word| *word == Word::NoNetwork)
+    {
         return ended(Outcome::Failed, repos::NO_NETWORK);
     }
     let mut pushed: Vec<(String, u32)> = Vec::new();
@@ -782,7 +791,10 @@ fn pushed_ended(done: &[PushOne], network: bool, cut_short: bool) -> Ended {
         }
         match one.failure {
             Some(Word::Unreadable) => failures.push(format!("{name} could not be read.")),
-            Some(word) => failures.push(format!("{name} was not pushed: {}.", push_why(word))),
+            Some(word) => failures.push(format!(
+                "{name} was not pushed: {}.",
+                push_why(word, network)
+            )),
             None if one.pushed > 0 => match pushed.iter_mut().find(|(have, _)| have == name) {
                 Some((_, count)) => *count = count.saturating_add(one.pushed),
                 None => pushed.push((name.clone(), one.pushed)),
@@ -795,11 +807,18 @@ fn pushed_ended(done: &[PushOne], network: bool, cut_short: bool) -> Ended {
     }
     if !failures.is_empty() {
         let count = failures.len();
+        // For a container, what was pushed beside them is said first.
+        let parts: Vec<String> = pushed
+            .iter()
+            .map(|(name, count)| format!("{} in {name}", commits(*count)))
+            .collect();
+        let mut text = failures.join(" ");
+        if network && !parts.is_empty() {
+            text = format!("Pushed {}. {text}", listed(&parts));
+        }
         return ended(
             Outcome::Failed,
-            fit(failures.join(" "), || {
-                format!("{count} repos were not pushed.")
-            }),
+            fit(text, || format!("{count} repos were not pushed.")),
         );
     }
     if pushed.is_empty() {
@@ -1094,7 +1113,7 @@ pub(crate) fn clean_up_core(workspace: &Workspace, path: &Path, how: &Cleaning) 
         return Cleaned::Failed {
             why,
             repo: Some(name.clone()),
-            backed_up: Vec::new(),
+            backed_up,
         };
     }
     // Looked at once more just before the removal. A session that came
@@ -1176,25 +1195,35 @@ fn cleaned_ended(cleaned: &Cleaned, network: bool) -> Ended {
             backed_up,
         } => {
             let name = repo.clone().unwrap_or_else(|| "a repo".to_string());
+            // For a container, backups that were pushed before one failed
+            // are said; on the host, as it always has been, they are not.
+            let before = match network && !backed_up.is_empty() {
+                true => format!("{} ", backed(backed_up)),
+                false => String::new(),
+            };
             let detail = match why {
-                Word::NoNetwork if network => repos::NO_NETWORK.to_string(),
+                Word::NoNetwork if network && backed_up.is_empty() => repos::NO_NETWORK.to_string(),
+                Word::NoNetwork if network => format!(
+                    "{before}The backup of {name} could not be pushed, as the environment's \
+                     network does not reach GitHub, so nothing was removed."
+                ),
                 Word::OtherFiles => "It holds files outside its repos, which cannot be backed up, \
                                      so nothing was removed."
                     .to_string(),
                 Word::BadBranch => format!(
-                    "The backup of {name} could not be made, as its branch has a name that \
-                     cannot be used, so nothing was removed."
+                    "{before}The backup of {name} could not be made, as its branch has a name \
+                     that cannot be used, so nothing was removed."
                 ),
                 Word::NestedRepo => format!(
-                    "{name} holds another git repository that cannot be backed up, so nothing \
-                     was removed."
+                    "{before}{name} holds another git repository that cannot be backed up, so \
+                     nothing was removed."
                 ),
-                Word::NotPushed | Word::NoNetwork => {
-                    format!("The backup of {name} could not be pushed, so nothing was removed.")
-                }
-                Word::NotMade => {
-                    format!("The backup of {name} could not be made, so nothing was removed.")
-                }
+                Word::NotPushed | Word::NoNetwork => format!(
+                    "{before}The backup of {name} could not be pushed, so nothing was removed."
+                ),
+                Word::NotMade => format!(
+                    "{before}The backup of {name} could not be made, so nothing was removed."
+                ),
                 Word::Changed => {
                     return ended(
                         Outcome::Failed,

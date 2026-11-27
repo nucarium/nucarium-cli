@@ -1154,6 +1154,11 @@ fn a_push_github_turns_down_is_said_in_the_hosts_words() {
 /// A proxy that takes no one anywhere: every `CONNECT` is refused, as an
 /// environment's proxy refuses GitHub when its network is `none`.
 fn refusing_proxy() -> String {
+    proxy_answering("403 Forbidden")
+}
+
+/// A proxy that answers every `CONNECT` with `status`.
+fn proxy_answering(status: &'static str) -> String {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1162,7 +1167,8 @@ fn refusing_proxy() -> String {
             let mut stream = stream;
             let mut asked = [0u8; 4096];
             let _ = stream.read(&mut asked);
-            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+            let said = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.write_all(said.as_bytes());
         }
     });
     format!("http://{address}")
@@ -1207,6 +1213,76 @@ fn where_the_environments_network_does_not_reach_github_nothing_is_sent_and_it_s
         "The environment's network does not reach GitHub, so nothing was sent."
     );
     assert_eq!(boxed.host_git(), Vec::<String>::new());
+}
+
+/// The container's proxy in front of every https remote.
+fn behind(rig: &Rig, proxy: &str) {
+    rig.container_does(
+        "agent-env-client-a",
+        &format!(
+            "HTTPS_PROXY='{proxy}' https_proxy='{proxy}' ALL_PROXY='{proxy}'\n\
+             export HTTPS_PROXY https_proxy ALL_PROXY\nexec \"$@\""
+        ),
+    );
+}
+
+#[test]
+fn a_proxy_that_fails_another_way_is_github_not_being_reached() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    git(
+        &rig.bare(),
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/octo/web.git",
+        ],
+    );
+    behind(rig, &proxy_answering("502 Bad Gateway"));
+    let out = boxed.job("refresh", &[], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        report["repos"][0]["error"], "GitHub could not be reached",
+        "{report}"
+    );
+}
+
+#[test]
+fn where_one_repo_cannot_reach_github_the_others_are_still_pushed_and_said() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("worktree_actions = true\n");
+    // A second repo, whose remote is GitHub's, behind the proxy.
+    let api = rig.home.dir.join("upstream").join("api");
+    fs::create_dir_all(&api).unwrap();
+    git(&api, &["init", "-q", "-b", "main"]);
+    commit(&api, "README.md", "init");
+    let cloned = run(rig.nucleate().args(["clone", api.to_str().unwrap()]), "");
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let made = run(
+        rig.nucleate().args(["create-session", "two", "web", "api"]),
+        "",
+    );
+    assert!(made.status.success(), "{}", stderr(&made));
+    let two = rig.root.join(".worktrees").join("two");
+    commit(&two.join("web"), "a.txt", "web work");
+    commit(&two.join("api"), "b.txt", "api work");
+    git(
+        &rig.root.join(".repos/_/api.git"),
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/octo/api.git",
+        ],
+    );
+    behind(rig, &refusing_proxy());
+    let result = act_inside(&boxed, &action("two", "push", false), None);
+    assert_eq!(result["outcome"], "failed", "{result}");
+    assert_eq!(
+        result["detail"],
+        "Pushed 1 commit in web. api was not pushed: the environment's network does not reach GitHub."
+    );
+    assert!(!git(&rig.upstream, &["branch", "--list", "workspace/two"]).is_empty());
 }
 
 /// Whether a process is in a folder is read from `/proc`, so what is

@@ -44,13 +44,19 @@ pub fn word(stderr: &str) -> Word {
     if said == "timed out" {
         Word::TimedOut
     } else if any(&[
+        "connect tunnel failed, response 403",
+        "received http code 403 from proxy after connect",
+    ]) {
+        // The environment's proxy refused to take it to GitHub: its network
+        // does not reach there. A proxy that failed any other way is GitHub
+        // not being reached.
+        Word::NoNetwork
+    } else if any(&[
         "from proxy after connect",
         "connect tunnel failed",
         "proxy connect aborted",
     ]) {
-        // The environment's proxy would not take it to GitHub: its network
-        // does not reach there.
-        Word::NoNetwork
+        Word::Unreachable
     } else if any(&["non-fast-forward", "[rejected]", "fetch first"]) {
         Word::Rejected
     } else if any(&[
@@ -91,6 +97,15 @@ mod tests {
             word("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"),
             Word::Unreachable
         );
+        // A proxy that fails some other way does not say the network is
+        // closed.
+        for said in [
+            "fatal: unable to access 'https://github.com/a/b.git/': CONNECT tunnel failed, response 502",
+            "fatal: unable to access 'https://github.com/a/b.git/': Received HTTP code 503 from proxy after CONNECT",
+            "fatal: unable to access 'https://github.com/a/b.git/': Proxy CONNECT aborted",
+        ] {
+            assert_eq!(word(said), Word::Unreachable, "{said}");
+        }
         assert_eq!(word("timed out"), Word::TimedOut);
         assert_eq!(
             word(" ! [rejected] main -> main (fetch first)"),
