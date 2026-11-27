@@ -367,7 +367,16 @@ pub struct Guarded {
     /// is all of the box such a driver's worktrees can be of.
     within: Option<Vec<PathBuf>>,
     vetting: Vetting,
+    /// Whether each call is started as [`crate::bounded`] starts a program,
+    /// so that it ends when its caller's time is up: inside a container,
+    /// where `nucleated repos` must leave nothing running.
+    stopped_with_caller: bool,
 }
+
+/// The longest one call stopped with its caller may run, and the most it
+/// may print. Its caller's own time is shorter.
+const STOPPED_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+const STOPPED_MAX: u64 = 256 * 1024 * 1024;
 
 /// Refusals already logged, so that each is logged once while it lasts.
 static LOGGED: std::sync::Mutex<std::collections::BTreeSet<(PathBuf, Reason)>> =
@@ -410,7 +419,43 @@ impl Guarded {
             repos,
             within: None,
             vetting,
+            stopped_with_caller: false,
         }
+    }
+
+    /// Start each call so that it is stopped with everything else this
+    /// program started when its time is up ([`crate::bounded::stop_all`]),
+    /// and none is started after.
+    pub fn stopped_with_caller(mut self) -> Guarded {
+        self.stopped_with_caller = true;
+        self
+    }
+
+    /// Run a prepared call: what it printed, untrimmed, whether it
+    /// succeeded, and its complaints.
+    fn run(&self, command: &mut Command) -> Result<(bool, Vec<u8>, String)> {
+        if !self.stopped_with_caller {
+            let out = command.output().context("running git (is it installed?)")?;
+            return Ok((
+                out.status.success(),
+                out.stdout,
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ));
+        }
+        match crate::bounded::run(command, STOPPED_LIMIT, STOPPED_MAX) {
+            Ok(out) => Ok((out.ok, out.stdout, out.stderr)),
+            Err(failure) => bail!("running git: {failure:?}"),
+        }
+    }
+
+    /// As [`Guarded::run`], trimmed, as [`Output`].
+    fn collect(&self, command: &mut Command) -> Result<Output> {
+        let (ok, stdout, stderr) = self.run(command)?;
+        Ok(Output {
+            ok,
+            stdout: String::from_utf8_lossy(&stdout).trim().to_string(),
+            stderr,
+        })
     }
 
     /// Hold the git data of repositories with no `.repos` to these folders.
@@ -697,21 +742,22 @@ impl Guarded {
     }
 }
 
-/// How a caller runs git: as the user would, or guarded, as `nucleate` and
-/// the daemon do.
+/// How a caller runs git: as the user would, guarded, as `nucleate` and
+/// the daemon do, or not at all, for repositories a container writes.
 #[derive(Debug, Clone)]
 pub enum Git {
     Plain,
     Guarded(Guarded),
+    /// The repositories are a container's: git for them runs inside it,
+    /// never here. Every call fails at once, before anything is started,
+    /// so a path that should have asked the container fails rather than
+    /// run git on the host.
+    Elsewhere,
 }
 
-fn collect(command: &mut Command) -> Result<Output> {
-    let out = command.output().context("running git (is it installed?)")?;
-    Ok(Output {
-        ok: out.status.success(),
-        stdout: String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    })
+/// What a call to [`Git::Elsewhere`] fails with.
+fn elsewhere<T>() -> Result<T> {
+    bail!("git for these repositories runs inside their container, not on the host")
 }
 
 /// The output of a call that must succeed, or an error that names the
@@ -735,7 +781,7 @@ impl Git {
     /// Why a bare repo would be refused, if it would, in either mode.
     pub fn vet_bare(&self, dir: &Path) -> Option<Refused> {
         match self {
-            Git::Plain => None,
+            Git::Plain | Git::Elsewhere => None,
             Git::Guarded(guarded) => guarded.vet(dir, true, true, None).err(),
         }
     }
@@ -743,7 +789,7 @@ impl Git {
     /// Why a worktree would be refused, if it would, in either mode.
     pub fn vet_tree(&self, dir: &Path) -> Option<Refused> {
         match self {
-            Git::Plain => None,
+            Git::Plain | Git::Elsewhere => None,
             Git::Guarded(guarded) => guarded.vet(dir, false, true, None).err(),
         }
     }
@@ -756,6 +802,7 @@ impl Git {
         let args = ["init", "-q", "--bare", &shown];
         match self {
             Git::Plain => git(args).map(drop),
+            Git::Elsewhere => elsewhere(),
             Git::Guarded(guarded) => {
                 let mut command = guarded.command();
                 command
@@ -763,7 +810,7 @@ impl Git {
                     .args(OVERRIDES)
                     .args(&args[..3])
                     .arg(dir);
-                checked(collect(&mut command)?, None, &args).map(drop)
+                checked(guarded.collect(&mut command)?, None, &args).map(drop)
             }
         }
     }
@@ -771,13 +818,15 @@ impl Git {
     pub fn try_bare(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_bare(dir, args),
-            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, true, args, None)?),
+            Git::Elsewhere => elsewhere(),
+            Git::Guarded(guarded) => guarded.collect(&mut guarded.prepare(dir, true, args, None)?),
         }
     }
 
     pub fn bare(&self, dir: &Path, args: &[&str]) -> Result<String> {
         match self {
             Git::Plain => bare(dir, args),
+            Git::Elsewhere => elsewhere(),
             Git::Guarded(_) => checked(self.try_bare(dir, args)?, Some(("--git-dir", dir)), args),
         }
     }
@@ -785,13 +834,15 @@ impl Git {
     pub fn try_tree(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         match self {
             Git::Plain => try_tree(dir, args),
-            Git::Guarded(guarded) => collect(&mut guarded.prepare(dir, false, args, None)?),
+            Git::Elsewhere => elsewhere(),
+            Git::Guarded(guarded) => guarded.collect(&mut guarded.prepare(dir, false, args, None)?),
         }
     }
 
     pub fn tree(&self, dir: &Path, args: &[&str]) -> Result<String> {
         match self {
             Git::Plain => tree(dir, args),
+            Git::Elsewhere => elsewhere(),
             Git::Guarded(_) => checked(self.try_tree(dir, args)?, Some(("-C", dir)), args),
         }
     }
@@ -814,6 +865,7 @@ impl Git {
                 command
             }
             Git::Guarded(guarded) => guarded.prepare(dir, false, args, None)?,
+            Git::Elsewhere => return elsewhere(),
         };
         match crate::bounded::run(&mut command, timeout, MAX_TIMED_OUTPUT) {
             Ok(out) => Ok(Output {
@@ -837,24 +889,19 @@ impl Git {
         args: &[&str],
         envs: &[(&str, &OsStr)],
     ) -> Result<(bool, Vec<u8>, String)> {
-        let Git::Guarded(guarded) = self else {
-            return tree_raw(dir, args, envs);
+        let guarded = match self {
+            Git::Plain => return tree_raw(dir, args, envs),
+            Git::Elsewhere => return elsewhere(),
+            Git::Guarded(guarded) => guarded,
         };
         // A call given an index of its own is checked against that index.
         let index = envs
             .iter()
             .find(|(name, _)| *name == "GIT_INDEX_FILE")
             .map(|(_, value)| *value);
-        let out = guarded
-            .prepare(dir, false, args, index)?
-            .envs(envs.iter().copied())
-            .output()
-            .context("running git (is it installed?)")?;
-        Ok((
-            out.status.success(),
-            out.stdout,
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ))
+        let mut command = guarded.prepare(dir, false, args, index)?;
+        command.envs(envs.iter().copied());
+        guarded.run(&mut command)
     }
 }
 
@@ -1164,5 +1211,27 @@ mod tests {
         ] {
             assert!(!allowed(key, value), "{key} = {value:?}");
         }
+    }
+
+    #[test]
+    fn git_for_a_containers_repositories_fails_on_the_host_whatever_is_asked() {
+        // A repository git would run in happily.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("web.git");
+        Git::Plain.init_bare(&repo).unwrap();
+        let git = Git::Elsewhere;
+        assert!(!git.enforcing());
+        assert!(git.vet_bare(&repo).is_none());
+        assert!(git.try_bare(&repo, &["rev-parse", "--git-dir"]).is_err());
+        assert!(git.bare(&repo, &["rev-parse", "--git-dir"]).is_err());
+        assert!(git.try_tree(dir.path(), &["status"]).is_err());
+        assert!(git.tree(dir.path(), &["status"]).is_err());
+        assert!(git
+            .try_tree_within(dir.path(), &["status"], std::time::Duration::from_secs(5))
+            .is_err());
+        assert!(git.tree_raw(dir.path(), &["status"], &[]).is_err());
+        let another = dir.path().join("another.git");
+        assert!(git.init_bare(&another).is_err());
+        assert!(!another.exists(), "a repository was made");
     }
 }
