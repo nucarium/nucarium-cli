@@ -478,6 +478,8 @@ fn snapshot_report(answer: &repos::answer::Answer, file: &Path) -> Result<Vec<Va
             entry["reason"] = json!(match (snapped.action, word.refusal()) {
                 (SnapAction::Refused, Some(refused)) => refused.as_str(),
                 (SnapAction::Failed, _) if word == Word::NoNetwork => repos::NO_NETWORK,
+                // Git failed before anything was pushed.
+                (SnapAction::Failed, _) if word == Word::Git => "git could not snapshot it",
                 (SnapAction::Failed, _) => "the push was refused",
                 _ => skipped_because(word),
             });

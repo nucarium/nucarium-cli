@@ -886,11 +886,15 @@ fn snapshot(
                     reference: Some(reference),
                     ..entry(&item.repo, folder, SnapAction::Snapshot, None, branch)
                 },
+                // The push failed: a push's word, never git's own failing.
                 Ok(Snapped::Failed { branch, stderr }) => entry(
                     &item.repo,
                     folder,
                     SnapAction::Failed,
-                    Some(transfer::word(&stderr)),
+                    Some(match transfer::word(&stderr) {
+                        Word::Git => Word::NotPushed,
+                        word => word,
+                    }),
                     branch,
                 ),
                 Err(error) => match git::refusal(&error) {

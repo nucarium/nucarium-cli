@@ -227,7 +227,7 @@ pub enum Reason {
     /// A worktree's `.git`, or a `commondir`, leads outside the nucleus's
     /// repos, or nowhere.
     Pointer,
-    /// Its config could not be read.
+    /// Its config, or its index's listing, could not be read.
     Unreadable,
     /// A worktree's index names a submodule. Git starts again inside one
     /// that is checked out, where that repository's own config is read.
@@ -248,7 +248,9 @@ impl Reason {
         match self {
             Reason::Config => "its git config sets a key Nucarium does not allow",
             Reason::Pointer => "a git pointer in it leads outside the nucleus's repos",
-            Reason::Unreadable => "its git config could not be read",
+            // Its config, or the listing of its index, which a worktree
+            // whose git data is out of shape fails.
+            Reason::Unreadable => "its git data could not be read",
             Reason::Submodule => "it holds a submodule, whose own git config is not checked",
         }
     }

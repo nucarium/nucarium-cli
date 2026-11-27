@@ -2665,3 +2665,59 @@ fn a_snapshot_is_signed_where_the_box_signs_its_commits_and_not_where_it_does_no
     ));
     assert_eq!(boxed.host_git(), Vec::<String>::new());
 }
+
+/// Put a link in place of the `web` worktree's `HEAD`, as a container can.
+fn head_behind_a_link(rig: &Rig) {
+    let head = rig.bare().join("worktrees/web/HEAD");
+    let elsewhere = rig.home.dir.join("elsewhere-HEAD");
+    fs::copy(&head, &elsewhere).unwrap();
+    fs::remove_file(&head).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &head).unwrap();
+}
+
+#[test]
+fn a_snapshot_says_git_failed_where_it_did_and_a_push_refused_where_one_was() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    with_work(rig, "fix-login");
+    // GitHub, as it were, turns the push down.
+    let hook = rig.upstream.join(".git/hooks/pre-receive");
+    script(&hook, "exit 1");
+    let out = boxed.job("snapshot", &[], None);
+    let entry = &stdout_json(&out)[0]["worktrees"][0];
+    assert_eq!(entry["action"], "failed", "{entry}");
+    assert_eq!(entry["reason"], "the push was refused");
+    fs::remove_file(&hook).unwrap();
+    // A push that fails in words of no kind is still a push that failed.
+    let away = rig.home.dir.join("upstream-away");
+    fs::rename(&rig.upstream, &away).unwrap();
+    let out = boxed.job("snapshot", &[], None);
+    let entry = &stdout_json(&out)[0]["worktrees"][0];
+    assert_eq!(entry["reason"], "the push was refused", "{entry}");
+    fs::rename(&away, &rig.upstream).unwrap();
+    // Git cannot even start on it: nothing is pushed, and it says so.
+    head_behind_a_link(rig);
+    let out = boxed.job("snapshot", &[], None);
+    let entry = &stdout_json(&out)[0]["worktrees"][0];
+    assert_eq!(entry["action"], "failed", "{entry}");
+    assert_eq!(entry["reason"], "git could not snapshot it");
+    assert_eq!(git(&rig.upstream, &["for-each-ref", "refs/wip"]), "");
+}
+
+/// Whether a process is in a folder is read from `/proc`.
+#[cfg(target_os = "linux")]
+#[test]
+fn cleanup_says_a_worktree_whose_git_data_is_out_of_shape_could_not_be_read() {
+    let boxed = boxed();
+    let rig = &boxed.rig;
+    rig.configure_in_container("[housekeeping]\ncleanup_min_age = \"0s\"\n");
+    rig.session("fix-login");
+    head_behind_a_link(rig);
+    let out = boxed.job("cleanup", &["--dry-run"], None);
+    let report = &stdout_json(&out)[0];
+    assert_eq!(
+        verdict(report, "fix-login"),
+        json!({ "session": "fix-login", "action": "kept",
+            "reason": "web: refused repo web: its git data could not be read" })
+    );
+}
