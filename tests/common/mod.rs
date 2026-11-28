@@ -539,6 +539,13 @@ impl Rig {
     }
 
     /// Sign the box in to the API at `api_url`, as `nucleate login` leaves it.
+    /// Turn `session_names` on in the config as it is now.
+    pub fn send_names(&self) {
+        let file = self.home.config_file();
+        let config = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("session_names = true\n{config}")).unwrap();
+    }
+
     pub fn sign_in(&self, api_url: &str) {
         let out = run(
             self.home
@@ -895,10 +902,11 @@ pub mod contract {
 
     /// The fields of an event that are ahead of 0.5.0. `driver_session`
     /// stands for two, `driver_env` and `driver_session`, sent together.
-    pub const EVENT_AHEAD: [&str; 1] = ["driver_session"];
+    /// `session_name` is a session's name.
+    pub const EVENT_AHEAD: [&str; 2] = ["driver_session", "session_name"];
 
     /// Every name a Watch that takes all of the above says in `accepts`.
-    pub const ACCEPTS: [&str; 10] = [
+    pub const ACCEPTS: [&str; 11] = [
         "agent",
         "driver",
         "driver_ref",
@@ -909,7 +917,18 @@ pub mod contract {
         "usage",
         "worktrees",
         "driver_session",
+        "session_name",
     ];
+
+    /// `^[^\s\p{Cc}](?:[^\p{Cc}]*[^\s\p{Cc}])?$`, at most 80 UTF-16 units:
+    /// a session's name, the one event field with room for words.
+    fn session_name(value: &str) -> bool {
+        let edge = |c: Option<char>| c.is_some_and(|c| !js_space(c) && !c.is_control());
+        (1..=80).contains(&value.encode_utf16().count())
+            && !value.chars().any(char::is_control)
+            && edge(value.chars().next())
+            && edge(value.chars().next_back())
+    }
 
     const NETWORKS: [&str; 3] = ["none", "limited", "full"];
     const SCRIPT_STATES: [&str; 3] = ["running", "ok", "failed"];
@@ -1468,6 +1487,9 @@ pub mod contract {
         if ahead.contains(&"driver_session") {
             optional.extend(["driver_env", "driver_session"]);
         }
+        if ahead.contains(&"session_name") {
+            optional.push("session_name");
+        }
         closed(
             event,
             "event",
@@ -1486,6 +1508,7 @@ pub mod contract {
         field(event, "event", "bridge_session_id", string(session))?;
         field(event, "event", "driver_env", string(env_key))?;
         field(event, "event", "driver_session", string(session))?;
+        field(event, "event", "session_name", string(session_name))?;
         field(event, "event", "type", string(|v| TYPES.contains(&v)))?;
         field(event, "event", "repos", |repos| {
             repos

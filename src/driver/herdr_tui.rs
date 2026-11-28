@@ -18,7 +18,7 @@
 
 use super::herdr_core::{ask, folder, own_var, same_socket, Call};
 use super::{Condition, Driver, HookProcess, Look, Memory, Observed, Phase};
-use crate::allowlist::{self, number, short_string, Nested};
+use crate::allowlist::{self, number, session_name, short_string, Nested};
 use crate::envelope::valid_session_id;
 use crate::paths;
 use crate::settings::Environment;
@@ -45,8 +45,9 @@ struct Listing {
     agents: Option<Vec<Nested<Agent>>>,
 }
 
-/// The fields of an `AgentInfo` this program takes. Every other key of the
-/// record is skipped unread: name, agent, title, terminal_title,
+/// The fields of an `AgentInfo` this program takes, and its `title` only
+/// when the box sends names. Every other key of the record is skipped
+/// unread: name, agent, terminal_title,
 /// terminal_title_stripped, display_agent, state_labels, tokens and the
 /// rest.
 #[derive(Deserialize)]
@@ -63,6 +64,11 @@ struct Agent {
     /// Set while "the current idle transition completed work".
     #[serde(default, deserialize_with = "number")]
     completion_seq: Option<u64>,
+    /// The title an integration reported for what the agent is working on,
+    /// such as "Refactor auth middleware". Read only when the box sends
+    /// names; otherwise skipped unread.
+    #[serde(default, deserialize_with = "session_name")]
+    title: Option<String>,
     #[serde(default)]
     agent_session: Nested<AgentSession>,
     /// Box only.
@@ -114,6 +120,7 @@ fn observed(agent: &Agent) -> Option<Observed> {
         agent.agent_status.as_deref().and_then(phase),
     );
     session.turn = agent.completion_seq;
+    session.name = agent.title.clone();
     session.cwd = folder(agent.foreground_cwd.as_ref(), agent.cwd.as_ref());
     session.claim_key = agent.pane_id.clone().filter(|id| herdr_id(id));
     session.agent_session_id = agent.agent_session.get().and_then(|theirs| {

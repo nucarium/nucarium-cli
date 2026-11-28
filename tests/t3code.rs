@@ -907,6 +907,54 @@ const CONTENT_FIELDS: [&str; 30] = [
 ];
 
 #[test]
+fn on_a_box_that_sends_names_a_thread_s_title_is_its_name_and_nothing_else_comes_with_it() {
+    let (rig, t3, mut fixture) = boxed(Rig::new());
+    rig.send_names();
+    let start = SystemTime::now() - Duration::from_secs(600);
+    let at = |seconds: u64| start + Duration::from_secs(seconds);
+    assert_eq!(look_at(&rig, at(0)).condition, Condition::Ok);
+    // Every event carries its thread's title, and the sentinel is nowhere
+    // else, though the fixture has it in every field there is.
+    let (names, leaks) = gate::names_and_leaks(&rig.spooled());
+    assert!(names.len() >= 20, "too few names: {}", names.len());
+    assert!(names.iter().all(|name| name == &gate::mark("title")));
+    assert!(!leaks, "content beside the name in the spool");
+    let memory = std::fs::read_to_string(rig.home.state_dir().join("drivers/t3.json")).unwrap();
+    assert!(!memory.contains(MARK), "a name in the driver's memory");
+
+    // A new title goes with the thread's next change, made to fit.
+    let before = rig.spooled().len();
+    change(&mut fixture, "thread-working", words(COMPLETED));
+    change(
+        &mut fixture,
+        "thread-working",
+        json!({ "title": "Speed up\nthe   login page" }),
+    );
+    t3.answer_shell(200, &fixture);
+    look_at(&rig, at(20));
+    let renamed: Vec<Value> = rig
+        .spooled()
+        .into_iter()
+        .skip(before)
+        .filter(|record| record["event"]["session_id"] == "thread-working")
+        .collect();
+    assert!(!renamed.is_empty());
+    for record in renamed {
+        assert_eq!(record["event"]["session_name"], "Speed up the login page");
+    }
+}
+
+#[test]
+fn a_box_that_does_not_send_names_reads_no_thread_title() {
+    let (rig, _t3, _fixture) = boxed(Rig::new());
+    look(&rig);
+    let (names, leaks) = gate::names_and_leaks(&rig.spooled());
+    assert!(!rig.spooled().is_empty());
+    assert_eq!(names, Vec::<String>::new());
+    assert!(!leaks);
+}
+
+#[test]
 fn the_fixtures_would_catch_a_leak() {
     gate::assert_fixture_would_catch_a_leak(SHELL, 700, &CONTENT_FIELDS);
     gate::assert_fixture_would_catch_a_leak(ENVIRONMENT, 4, &["label", "serverVersion"]);

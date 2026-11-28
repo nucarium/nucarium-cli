@@ -28,9 +28,10 @@ pub fn mark(field: &str) -> String {
     format!("{MARK} {field} the user typed this")
 }
 
-/// Every field an event may carry. There is no other. The last two go only
-/// to a Watch that takes `driver_session`.
-pub const EVENT_FIELDS: [&str; 16] = [
+/// Every field an event may carry. There is no other. `driver_env` and
+/// `driver_session` go only to a Watch that takes `driver_session`, and
+/// `session_name` only to one that takes it, from a box that sends names.
+pub const EVENT_FIELDS: [&str; 17] = [
     "event_id",
     "env_id",
     "session_id",
@@ -47,6 +48,7 @@ pub const EVENT_FIELDS: [&str; 16] = [
     "client_ts",
     "driver_env",
     "driver_session",
+    "session_name",
 ];
 
 /// Every field a heartbeat may carry, at its top, about the machine, about
@@ -113,8 +115,9 @@ pub fn only_listed_fields(mock: &Mock) {
     let event_fields: Vec<&str> = EVENT_FIELDS
         .iter()
         .filter(|field| {
-            !["driver_env", "driver_session"].contains(field)
-                || mock.ahead.contains(&"driver_session")
+            (!["driver_env", "driver_session"].contains(field)
+                || mock.ahead.contains(&"driver_session"))
+                && (**field != "session_name" || mock.ahead.contains(&"session_name"))
         })
         .copied()
         .collect();
@@ -216,6 +219,25 @@ pub fn leaks_on_disk(dir: &Path) -> Vec<String> {
             .map(|name| format!("a name under {}: {name}", dir.display())),
     );
     leaks
+}
+
+/// The names a box that sends them spooled, and whether the sentinel is
+/// anywhere in the spool once each event's `session_name` is taken out:
+/// the name is the one thing that may carry words.
+pub fn names_and_leaks(spooled: &[Value]) -> (Vec<String>, bool) {
+    let mut names = Vec::new();
+    let mut leaks = false;
+    for record in spooled {
+        let mut record = record.clone();
+        if let Some(name) = record["event"]
+            .as_object_mut()
+            .and_then(|event| event.remove("session_name"))
+        {
+            names.push(name.as_str().unwrap().to_string());
+        }
+        leaks |= record.to_string().contains(MARK);
+    }
+    (names, leaks)
 }
 
 /// A stand-in for Watch as it is: it refuses anything the contract does not

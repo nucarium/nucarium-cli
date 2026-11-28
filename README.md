@@ -421,6 +421,10 @@ target = "hosted"
 # and Clean up (see Worktrees in Watch). Off unless set: each is refused.
 worktree_actions = false
 
+# Whether each session's name is sent to Watch (see Session names). Off
+# unless set: no name is read, kept or sent.
+session_names = false
+
 [watch]
 # Only for a Watch API on this machine, in development.
 # url = "http://localhost:8787"
@@ -1094,7 +1098,7 @@ Nine fields of a heartbeat are newer than the contract every Watch holds:
 `config_state`, `setup`, `usage` and `worktrees`, which brings
 `worktree_action_results` and `worktree_actions_allowed` with it. So are two
 fields of an event, `driver_env` and `driver_session`, which Watch names
-together as `driver_session`. Watch refuses a heartbeat that carries a field
+together as `driver_session`, and a third, `session_name`. Watch refuses a heartbeat that carries a field
 it does not name, and a refused heartbeat is a box gone dark, with every
 environment on it looking down and no event sent. So the daemon sends none of
 them on a guess.
@@ -1117,6 +1121,32 @@ events, with no link into the driver, config sync runs on the box with
 nothing said of it to Watch, and an environment's setup and plan usage are
 shown only by `nucleated status`.
 
+### Session names
+
+With `session_names = true`, Watch shows each session by its name instead of
+its short id. It is off unless set. Off, no adapter reads a name: the field is
+skipped unread, as every other field is.
+
+On, each adapter reads one field and no other:
+
+| Agent or driver | Field |
+|---|---|
+| Claude Code | `session_title` on `SessionStart` and `UserPromptSubmit`: the title set with `/rename`, `--name` or by the app that runs the session. Its generated title is not in any hook. |
+| Codex | None: no hook carries one. |
+| T3 Code | A thread's `title`. |
+| Orca | An agent row's `conversationName`, from an Orca that sends it. |
+| herdr-core | `status.title`, the program's own label in its OSC 7501 status. |
+| Herdr TUI | An agent's `title`, as an integration reported it. |
+
+The name is made to fit before it is written down: each line break, tab and
+run of spaces becomes one space, the ends are trimmed, and it is cut to 80
+characters. It travels with the session's events, so a new name reaches Watch
+with the session's next change. It waits in the spool until it is sent and is
+kept nowhere else on the box: not in the session's state, not in a driver's
+memory, not in `nucleated status`. Turned off again, a name already in the
+spool is sent without it. Watch keeps the names it has until those sessions
+go.
+
 ### What leaves the box
 
 Every payload is built from named fields. This is the whole list.
@@ -1133,6 +1163,7 @@ Every payload is built from named fields. This is the whole list.
 | `error_kind` | The hook's `error`, for `StopFailure` only, and only when it is a short kind such as `rate_limit`. |
 | `limit_resets_at` | When the agent says a usage limit resets, for `StopFailure` only: a timestamp, kept only from a minute before to eight days after the event. Claude Code's hook gives none, so none is sent. |
 | `client_ts` | The box's clock. |
+| `session_name`, from a box whose config sets `session_names = true`, to a Watch that names it in `accepts` | The session's name, from the one field each agent or driver keeps it in (see Session names): at most 80 characters, on one line. |
 | `driver_env`, `driver_session`, together, to a Watch that names `driver_session` in `accepts` | For a session that runs inside a driver's session on the same box: the driver environment's `name` in the config, and the driver's own id for that session (letters, digits, `.`, `_`, `:` and `-`). |
 | `commits`, with an `outcome` only | How many commits the session made: those on its branch since the commit each worktree started from. A number. |
 | `uncommitted_repos`, `unpushed_commits`, with an `outcome` only | How many of the session's repos hold uncommitted changes, and how many of its commits are on no remote. Numbers. |
@@ -1157,7 +1188,7 @@ is not the same as zero: a probe that gets no answer, a count not yet made and
 a GitHub that does not reply each leave their field off.
 
 Never read from the hook, never written to disk, never sent: prompts, messages,
-session titles, tool inputs and outputs, transcript paths and contents, the
+session titles (unless the box sends session names), tool inputs and outputs, transcript paths and contents, the
 last assistant message, compaction summaries and instructions, error details,
 file contents, file paths beyond a repo's name, environment variables, user
 names and tokens. The hook's `cwd` is read to find the session's repos and
@@ -1173,7 +1204,7 @@ head commit. For a merged pull request whose head is a later commit, it reads
 the ids of that pull request's commits, and nothing else about them.
 
 Never read from a driver, never written to disk, never sent: thread and
-session titles, messages, prompts, goals, terminal contents and previews, tool
+session titles (unless the box sends session names), messages, prompts, goals, terminal contents and previews, tool
 names and input, error text, command lines, labels, and the names of other
 machines. A driver hands these over beside the state, and the adapter's parser
 skips them unread. A folder a driver names is read to find the session's repos

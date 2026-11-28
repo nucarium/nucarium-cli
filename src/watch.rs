@@ -436,9 +436,10 @@ pub const AHEAD: [&str; 9] = [
 /// The fields of an event that are ahead of the contract every Watch holds,
 /// named in the same `accepts` as [`AHEAD`]. `driver_session` stands for two
 /// fields, `driver_env` and `driver_session`, which go together or not at
-/// all. Watch refuses a batch for one field it does not name, so neither is
-/// sent until it has said it takes them.
-pub const EVENT_AHEAD: [&str; 1] = ["driver_session"];
+/// all. `session_name` is a session's name, sent only from a box that sends
+/// names. Watch refuses a batch for one field it does not name, so none is
+/// sent until it has said it takes it.
+pub const EVENT_AHEAD: [&str; 2] = ["driver_session", "session_name"];
 
 /// Which of the [`AHEAD`] and [`EVENT_AHEAD`] fields a Watch has said it
 /// takes. None, until it says so.
@@ -461,6 +462,12 @@ impl Taken {
 
     pub fn takes(&self, field: &str) -> bool {
         self.0.contains(field)
+    }
+
+    /// The same, less `field`: for a field this box has turned off.
+    pub fn without(mut self, field: &str) -> Taken {
+        self.0.remove(field);
+        self
     }
 }
 

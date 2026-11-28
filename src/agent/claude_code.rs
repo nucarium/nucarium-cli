@@ -4,7 +4,7 @@
 //! this file.
 
 use super::{Agent, Lifecycle};
-use crate::allowlist::{read_object, short_string};
+use crate::allowlist::{read_object, session_name, short_string};
 use crate::envelope::EventType;
 use crate::settings::Environment;
 use serde::Deserialize;
@@ -40,6 +40,22 @@ struct SessionStart {
     /// `startup`, `resume`, `clear`, `compact` or `fork`.
     #[serde(default, deserialize_with = "short_string")]
     source: Option<String>,
+    /// "The session's custom title, present when one is set". Read only when
+    /// the box sends names; otherwise skipped unread, as every other key is.
+    #[serde(default, deserialize_with = "session_name")]
+    session_title: Option<String>,
+}
+
+/// `UserPromptSubmit`: the common fields and, as on `SessionStart`, the
+/// session's custom title. Its `prompt` is never read.
+#[derive(Deserialize)]
+struct UserPrompt {
+    #[serde(default, deserialize_with = "short_string")]
+    session_id: Option<String>,
+    #[serde(default, deserialize_with = "short_string")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "session_name")]
+    session_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +119,7 @@ impl Agent for ClaudeCode {
             read_object::<Common>(payload).map(|hook| (hook.session_id, hook.cwd))
         };
         let mut error_kind = None;
+        let mut name = None;
         let (kind, (session_id, cwd)) = match event.as_str() {
             "sessionstart" => {
                 let hook: SessionStart = read_object(payload)?;
@@ -112,9 +129,14 @@ impl Agent for ClaudeCode {
                 if hook.source.as_deref() == Some("compact") {
                     return None;
                 }
+                name = hook.session_title;
                 (EventType::SessionStart, (hook.session_id, hook.cwd))
             }
-            "userpromptsubmit" => (EventType::UserPromptSubmit, common(payload)?),
+            "userpromptsubmit" => {
+                let hook: UserPrompt = read_object(payload)?;
+                name = hook.session_title;
+                (EventType::UserPromptSubmit, (hook.session_id, hook.cwd))
+            }
             "notification" => {
                 let hook: Notification = read_object(payload)?;
                 let kind = match hook.notification_type.as_deref()? {
@@ -142,6 +164,7 @@ impl Agent for ClaudeCode {
             event: kind,
             session_id: session_id?,
             cwd: cwd.map(PathBuf::from),
+            session_name: name,
             error_kind,
             // The hook reference names no field for when a limit resets, so
             // none is read.
@@ -378,6 +401,65 @@ mod tests {
         assert_eq!(
             named["hooks"]["Stop"][0]["hooks"][0]["command"],
             "nucleated hook Stop --env client-a"
+        );
+    }
+
+    #[test]
+    fn the_session_title_is_read_only_when_the_box_sends_names() {
+        use crate::allowlist::with_names;
+        let titled = |source: Option<&str>| {
+            let mut payload = json!({
+                "session_id": "s1",
+                "session_title": "Speed up the\nlogin page",
+                "prompt": "rewrite the billing module",
+            });
+            if let Some(source) = source {
+                payload["source"] = json!(source);
+            }
+            payload
+        };
+        let name = |on: bool, event: &str, payload: Value| {
+            with_names(on, || lifecycle(event, payload)).and_then(|l| l.session_name)
+        };
+        // Off, which is the default, no title is read on any event.
+        for event in ["SessionStart", "UserPromptSubmit", "Stop"] {
+            assert_eq!(name(false, event, titled(Some("startup"))), None, "{event}");
+            assert_eq!(
+                lifecycle(event, titled(Some("startup")))
+                    .unwrap()
+                    .session_name,
+                None
+            );
+        }
+        // On, the two events that carry it give it, made to fit.
+        for (event, source) in [("SessionStart", Some("resume")), ("UserPromptSubmit", None)] {
+            assert_eq!(
+                name(true, event, titled(source)).as_deref(),
+                Some("Speed up the login page"),
+                "{event}"
+            );
+        }
+        // Every other event reads no title, even on.
+        for event in ["Stop", "PostToolUse", "SessionEnd", "StopFailure"] {
+            assert_eq!(name(true, event, titled(None)), None, "{event}");
+        }
+        // A title that is not a string, or is nothing once made to fit, is no
+        // name and costs the event nothing.
+        for odd in [
+            json!({ "text": "a title" }),
+            json!(["a title"]),
+            json!(7),
+            json!(" \n "),
+        ] {
+            let payload = json!({ "session_id": "s1", "session_title": odd });
+            let read = with_names(true, || lifecycle("UserPromptSubmit", payload)).unwrap();
+            assert_eq!(read.event, EventType::UserPromptSubmit);
+            assert_eq!(read.session_name, None, "{odd}");
+        }
+        // A session with no title has none.
+        assert_eq!(
+            name(true, "SessionStart", json!({ "session_id": "s1" })),
+            None
         );
     }
 }

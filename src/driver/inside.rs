@@ -57,6 +57,8 @@ pub struct Asked<'a> {
     /// of which only the condition, when it was last good, the link
     /// reference and the facts are read.
     pub previous: Option<&'a str>,
+    /// Whether the host sends names, and so asks for each session's name.
+    pub names: bool,
 }
 
 /// Run one look and print its answer. Never fails, always prints one answer,
@@ -95,7 +97,8 @@ fn one(asked: &Asked) -> Answer {
         .map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
         .unwrap_or_else(SystemTime::now);
     let previous = previous(adapter.name(), asked.previous);
-    let result = adapter.observe(environment, &previous, now);
+    let result =
+        crate::allowlist::with_names(asked.names, || adapter.observe(environment, &previous, now));
     answer::settle(&settings, environment, adapter.name(), result)
 }
 

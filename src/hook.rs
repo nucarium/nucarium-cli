@@ -6,6 +6,7 @@
 //! 0 within two seconds: nothing here may ever hold up a session.
 
 use crate::agent::{self, Agent, Lifecycle};
+use crate::allowlist;
 use crate::driver;
 use crate::envelope::{unix_ms, Draft, Envelope};
 use crate::github;
@@ -305,13 +306,16 @@ pub fn record_as(
             .unwrap_or(agent::DEFAULT),
     )?;
     let named = named(settings, env, adapter);
+    // The session's name is read only on a box that sends names. Otherwise
+    // the adapter reads past it, as it does every key it does not name.
     let Lifecycle {
         event: kind,
         session_id,
         cwd,
+        session_name,
         error_kind,
         limit_resets_at,
-    } = adapter.lifecycle(event, payload)?;
+    } = allowlist::with_names(settings.session_names, || adapter.lifecycle(event, payload))?;
     let environment = named.or_else(|| located(settings, adapter, cwd.as_deref()))?;
     let place = place(environment, cwd.as_deref());
     let draft = Draft {
@@ -320,6 +324,7 @@ pub fn record_as(
         bridge_session_id: adapter.bridge_session_id(),
         repos: place.repos,
         branch: place.branch,
+        session_name,
         error_kind,
         limit_resets_at,
         // If this agent runs inside a driver's session, the driver lists it

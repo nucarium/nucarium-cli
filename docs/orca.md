@@ -85,6 +85,7 @@ complaints are discarded.
 | `agents[].updatedAt` | That a working agent is still doing things |
 | `agents[].restoredUnconfirmed` | Orca itself is not sure of this row |
 | `agents[].agentType` | On the box only: whether the agent's own hook could report it |
+| `agents[].conversationName` | Only with `session_names = true`: the session's name (see Session names in the README). Orca sends it from 1.4.245 on. Otherwise skipped unread |
 
 A value of the wrong kind in one of these fields is nothing. The session id
 must be a UUID, which is what Orca mints; a row with anything else there, or

@@ -121,7 +121,11 @@ records of a repository that holds it. Its unsaved work is counted with that
 nucleus's, which only reads. A thread worktree of a project outside any
 nucleus is not counted anywhere.
 
-Never named, and so never read: `title`, `latestVisibleMessage`, `lastError`,
+A thread's `title` is read only on a box whose config sets
+`session_names = true`, and sent as the session's name (see Session names in
+the README). Otherwise it is skipped unread.
+
+Never named, and so never read: `latestVisibleMessage`, `lastError`,
 `lastErrorCode`, `goal`, `branch`, `tags`, `linkOrigin`, `modelSelection`,
 pull requests and issues, a background task's `description`, `command` and
 `taskId`, every thread in `archivedThreads`, a project's `title`, `scripts`,

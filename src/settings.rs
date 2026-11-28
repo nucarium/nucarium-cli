@@ -188,6 +188,10 @@ pub struct Settings {
     /// Push and Clean up. Off unless the config turns it on: each action is
     /// then refused, and nothing runs.
     pub worktree_actions: bool,
+    /// Whether each session's name, as its agent or driver has it, is read
+    /// and sent to Watch. Off unless the config turns it on: no name is then
+    /// read, kept or sent.
+    pub session_names: bool,
 }
 
 // Every table refuses a key it does not know. A key that is misspelled is
@@ -202,6 +206,7 @@ struct File {
     cache_dir: Option<PathBuf>,
     setup_dir: Option<PathBuf>,
     worktree_actions: Option<bool>,
+    session_names: Option<bool>,
     #[serde(default)]
     watch: WatchFile,
     #[serde(default)]
@@ -779,6 +784,7 @@ fn from_file(path: &Path, exists: bool, file: File) -> Result<Settings> {
         config_sync,
         git_vetting,
         worktree_actions: file.worktree_actions.unwrap_or(false),
+        session_names: file.session_names.unwrap_or(false),
     })
 }
 
@@ -853,6 +859,7 @@ mod tests {
         );
         assert_eq!(settings.spool_max_events, 10_000);
         assert!(!settings.worktree_actions);
+        assert!(!settings.session_names);
     }
 
     #[test]
@@ -864,6 +871,15 @@ mod tests {
                 .worktree_actions
         );
         assert!(parse("worktree_actions = \"yes\"\n").is_err());
+    }
+
+    #[test]
+    fn session_names_are_off_unless_turned_on() {
+        assert!(parse("session_names = true\n").unwrap().session_names);
+        assert!(!parse("session_names = false\n").unwrap().session_names);
+        assert!(!parse("").unwrap().session_names);
+        assert!(parse("session_names = \"yes\"\n").is_err());
+        assert!(parse("session_names = 1\n").is_err());
     }
 
     #[test]

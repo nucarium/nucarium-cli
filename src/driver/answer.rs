@@ -4,7 +4,8 @@
 //! where the driver's own answer and the folders it names stay. What crosses
 //! to the host is this, and only this: ids, fixed words, numbers, repo names
 //! and branches held to Watch's own patterns, a session folder's name, and
-//! numbers made from folders. No path, no title, no message.
+//! numbers made from folders. No path, no title, no message, and a session's
+//! name only from a look the host asked for names.
 //!
 //! The host trusts none of it. [`Answer::check`] holds every field to a fixed
 //! list, a pattern or a cap, and an answer with one field out of line is no
@@ -13,6 +14,7 @@
 use super::{folder_number, resolved, uncounted, valid_key, Condition, Look, Phase, CLAIM_FOLDERS};
 use crate::envelope::{
     valid_branch, valid_error_kind, valid_folder_number, valid_repo, valid_session_id,
+    valid_session_name,
 };
 use crate::settings::{Environment, Settings};
 use crate::worktrees::valid_folder;
@@ -72,6 +74,9 @@ pub struct Seen {
     /// Nothing is "no opinion".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<Phase>,
+    /// The session's name, only from a look the host asked for names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     /// When a usage limit resets, in Unix milliseconds.
@@ -136,6 +141,7 @@ impl Seen {
 
     fn fits(&self) -> bool {
         valid_session_id(&self.id)
+            && self.name.as_deref().is_none_or(valid_session_name)
             && self.error_kind.as_deref().is_none_or(valid_error_kind)
             && self.claim_key.as_deref().is_none_or(valid_key)
             && self
@@ -265,6 +271,7 @@ pub fn settle(
             branch: place.branch.filter(|branch| valid_branch(branch)),
             workspace: place.workspace.filter(|name| valid_folder(name)),
             phase: observed.phase,
+            name: observed.name.filter(|name| valid_session_name(name)),
             error_kind: observed.error_kind.filter(|kind| valid_error_kind(kind)),
             limit_resets_at_ms: observed.limit_resets_at.map(crate::envelope::unix_ms),
             activity: observed.activity,

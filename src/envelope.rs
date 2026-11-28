@@ -67,6 +67,11 @@ pub struct Envelope {
     pub repos: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The session's name, as the agent or the driver has it. Only from a
+    /// box whose owner turned `session_names` on, and only to a Watch that
+    /// takes `session_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     /// When the agent says a usage limit resets. A timestamp, and only with a
@@ -165,6 +170,8 @@ pub struct Draft {
     pub bridge_session_id: Option<String>,
     pub repos: Vec<String>,
     pub branch: Option<String>,
+    /// Read only when the box sends names. One that does not fit is none.
+    pub session_name: Option<String>,
     pub error_kind: Option<String>,
     /// A time, never the agent's words for one: there is nothing here a
     /// sentence could be put in.
@@ -216,6 +223,7 @@ impl Envelope {
             kind,
             repos: (!repos.is_empty()).then_some(repos),
             branch: draft.branch.filter(|branch| valid_branch(branch)),
+            session_name: draft.session_name.filter(|name| valid_session_name(name)),
             error_kind: draft
                 .error_kind
                 .filter(|_| kind == EventType::StopFailure)
@@ -241,8 +249,9 @@ impl Envelope {
     }
 
     /// The envelope as it goes to a Watch that takes `taken`: never the
-    /// claim, and the session's driver reference only to a Watch that takes
-    /// `driver_session`, and only whole.
+    /// claim, the session's driver reference only to a Watch that takes
+    /// `driver_session`, and only whole, and the session's name only to one
+    /// that takes `session_name`.
     pub fn as_sent(&self, taken: &Taken) -> Envelope {
         let (driver_env, driver_session) = match taken.takes("driver_session") {
             true => driver_pair(self.driver_env.clone(), self.driver_session.clone()),
@@ -251,6 +260,10 @@ impl Envelope {
         Envelope {
             driver_env,
             driver_session,
+            session_name: self
+                .session_name
+                .clone()
+                .filter(|_| taken.takes("session_name")),
             claim: None,
             ..self.clone()
         }
@@ -271,6 +284,7 @@ impl Envelope {
                 .as_ref()
                 .is_none_or(|repos| repos.len() <= 32 && repos.iter().all(|r| valid_repo(r)))
             && self.branch.as_deref().is_none_or(valid_branch)
+            && self.session_name.as_deref().is_none_or(valid_session_name)
             && self.error_kind.as_deref().is_none_or(valid_error_kind)
             && self.limit_resets_at.as_deref().is_none_or(valid_timestamp)
             && self.commits.is_none_or(|n| n <= MAX_COMMITS)
@@ -323,6 +337,65 @@ pub fn valid_event_id(value: &str) -> bool {
 /// `^[A-Za-z0-9._:-]{1,128}$`
 pub fn valid_session_id(value: &str) -> bool {
     all(value, 1, 128, |c| word(c) || c == b':')
+}
+
+/// The most a session's name holds, counted as Watch counts: in UTF-16 units.
+pub const MAX_SESSION_NAME: usize = 80;
+
+/// What JavaScript's `\s` matches, as Watch checks a name with it.
+fn js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+/// A session's name as Watch takes one: 1 to [`MAX_SESSION_NAME`] UTF-16
+/// units, no control character, and no space at either end.
+/// `^[^\s\p{Cc}](?:[^\p{Cc}]*[^\s\p{Cc}])?$`.
+pub fn valid_session_name(value: &str) -> bool {
+    let units = value.encode_utf16().count();
+    let edge = |c: Option<char>| c.is_some_and(|c| !js_space(c) && !c.is_control());
+    (1..=MAX_SESSION_NAME).contains(&units)
+        && !value.chars().any(char::is_control)
+        && edge(value.chars().next())
+        && edge(value.chars().next_back())
+}
+
+/// A session's name made to fit: every control character and run of space is
+/// one space, the ends are trimmed, and what is longer than Watch takes is
+/// cut between two characters. Nothing when nothing is left.
+pub fn session_name(text: &str) -> Option<String> {
+    let mut name = String::new();
+    let mut units = 0;
+    for word in text
+        .split(|c: char| js_space(c) || c.is_control())
+        .filter(|word| !word.is_empty())
+    {
+        let gap = usize::from(!name.is_empty());
+        for (at, c) in word.chars().enumerate() {
+            let needs = c.len_utf16() + if at == 0 { gap } else { 0 };
+            if units + needs > MAX_SESSION_NAME {
+                return Some(name).filter(|name| valid_session_name(name));
+            }
+            if at == 0 && gap == 1 {
+                name.push(' ');
+            }
+            name.push(c);
+            units += needs;
+        }
+    }
+    Some(name).filter(|name| valid_session_name(name))
 }
 
 /// `^[0-9a-f]{16}$`: a folder number as `folder_number` makes one.
@@ -928,5 +1001,93 @@ mod tests {
         let envelope: Envelope = serde_json::from_str(old).unwrap();
         assert!(envelope.is_valid());
         assert_eq!(envelope.limit_resets_at, None);
+    }
+
+    #[test]
+    fn a_title_is_made_into_a_name_watch_takes() {
+        let name = |text: &str| session_name(text);
+        assert_eq!(
+            name("Speed up the login page").as_deref(),
+            Some("Speed up the login page")
+        );
+        // Lines, tabs and odd spaces are one space, and the ends are trimmed.
+        assert_eq!(
+            name("  Fix\nthe\t\tlogin\u{a0}\u{2003}page \u{feff}").as_deref(),
+            Some("Fix the login page")
+        );
+        assert_eq!(name("a\u{0}b\u{7f}c\u{9f}d").as_deref(), Some("a b c d"));
+        for empty in ["", "   ", "\n\t", "\u{0}\u{1b}", "\u{3000}"] {
+            assert_eq!(name(empty), None, "{empty:?}");
+        }
+        // Cut to 80 UTF-16 units between two characters, never after a space.
+        let long = "word ".repeat(40);
+        let cut = name(&long).unwrap();
+        assert!(cut.encode_utf16().count() <= MAX_SESSION_NAME);
+        assert!(!cut.ends_with(' '));
+        assert!(valid_session_name(&cut));
+        let wide = "\u{1f600}".repeat(50);
+        let cut = name(&wide).unwrap();
+        assert_eq!(cut.encode_utf16().count(), MAX_SESSION_NAME);
+        assert_eq!(cut.chars().count(), 40);
+        let fits = "x".repeat(MAX_SESSION_NAME);
+        assert_eq!(name(&fits), Some(fits.clone()));
+        assert_eq!(name(&format!("{fits}y")), Some(fits));
+        // Names in any script are kept as they are.
+        assert_eq!(
+            name("Écrire la page d’accueil").as_deref(),
+            Some("Écrire la page d’accueil")
+        );
+        assert_eq!(
+            name("ログイン画面を直す").as_deref(),
+            Some("ログイン画面を直す")
+        );
+    }
+
+    #[test]
+    fn only_a_name_watch_takes_is_valid() {
+        assert!(valid_session_name("Fix the login page"));
+        assert!(valid_session_name("x"));
+        assert!(valid_session_name(&"x".repeat(MAX_SESSION_NAME)));
+        for odd in [
+            String::new(),
+            " leading".into(),
+            "trailing ".into(),
+            "two\nlines".into(),
+            "a\u{7}bell".into(),
+            "x".repeat(MAX_SESSION_NAME + 1),
+            "\u{1f600}".repeat(41),
+        ] {
+            assert!(!valid_session_name(&odd), "{odd:?}");
+        }
+        // A name that does not fit is left out of the envelope, which is still made.
+        let envelope = in_a_driver(|draft| draft.session_name = Some(" two\nlines".into()));
+        assert_eq!(envelope.session_name, None);
+        let envelope = in_a_driver(|draft| draft.session_name = Some("Fix it".into()));
+        assert_eq!(envelope.session_name.as_deref(), Some("Fix it"));
+        // One from disk that does not fit makes the record invalid.
+        let mut odd = envelope.clone();
+        odd.session_name = Some("two\nlines".into());
+        assert!(!odd.is_valid());
+        assert!(envelope.is_valid());
+    }
+
+    #[test]
+    fn a_name_goes_only_to_a_watch_that_takes_it() {
+        let envelope = in_a_driver(|draft| draft.session_name = Some("Fix the login page".into()));
+        let sent = |taken: &Taken| serde_json::to_value(envelope.as_sent(taken)).unwrap();
+        for taken in [Taken::default(), taking(&["driver_session"])] {
+            assert!(sent(&taken).get("session_name").is_none(), "{taken:?}");
+        }
+        assert_eq!(
+            sent(&taking(&["session_name"]))["session_name"],
+            "Fix the login page"
+        );
+        let off = taking(&["session_name", "driver_session"]).without("session_name");
+        assert!(sent(&off).get("session_name").is_none());
+        assert_eq!(sent(&off)["driver_session"], "thread_01HZX:2");
+        // With no name there is no field at all.
+        let unnamed = in_a_driver(|_| {});
+        let sent = serde_json::to_value(unnamed.as_sent(&taking(&["session_name"]))).unwrap();
+        assert!(sent.get("session_name").is_none());
     }
 }

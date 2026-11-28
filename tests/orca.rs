@@ -423,6 +423,51 @@ fn each_agent_orca_lists_is_reported_by_its_state_and_one_command_is_all_that_is
 }
 
 #[test]
+fn on_a_box_that_sends_names_an_agent_is_named_by_its_conversation_and_nothing_else() {
+    for on in [false, true] {
+        let orca = Orca::new();
+        let rig = &orca.rig;
+        if on {
+            rig.send_names();
+        }
+        let mut answer = plain(&orca);
+        for worktree in answer["result"]["worktrees"].as_array_mut().unwrap() {
+            for agent in worktree["agents"].as_array_mut().unwrap() {
+                agent.as_object_mut().unwrap().remove("conversationName");
+            }
+        }
+        // The name Orca's desktop row leads with, from an Orca that sends
+        // it. Its task's title, and every other row's, is never a name.
+        row(&mut answer, CLAUDE)["conversationName"] = json!("Speed up\nthe   login page");
+        row(&mut answer, GEMINI)["taskTitle"] = json!("Login page performance");
+        orca.answers(&answer);
+        assert_eq!(orca.look().condition, Condition::Ok);
+        let names: Vec<(String, Option<String>)> = rig
+            .spooled()
+            .iter()
+            .map(|record| {
+                let event = &record["event"];
+                (
+                    event["session_id"].as_str().unwrap().to_string(),
+                    event["session_name"].as_str().map(str::to_string),
+                )
+            })
+            .collect();
+        assert!(names.iter().any(|(id, _)| id == CLAUDE));
+        for (id, name) in names {
+            let named = on && id == CLAUDE;
+            assert_eq!(
+                name.as_deref(),
+                named.then_some("Speed up the login page"),
+                "{id}, names on: {on}"
+            );
+        }
+        let spool = serde_json::to_string(&rig.spooled()).unwrap();
+        assert!(!spool.contains("Login page performance"));
+    }
+}
+
+#[test]
 fn a_working_agent_is_heard_from_while_orca_says_it_is_doing_things() {
     let orca = Orca::new();
     let rig = &orca.rig;
