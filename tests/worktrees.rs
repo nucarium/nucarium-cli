@@ -634,7 +634,12 @@ mod clean_up {
         let gone = rig.home.dir.join("no-such-remote");
         git(
             &rig.bare(),
-            &["remote", "set-url", "origin", gone.to_str().unwrap()],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &crate::common::remote_of(&gone),
+            ],
         );
         let result = act(&rig, action("fix-login", "clean_up", true));
         assert_eq!(result["outcome"], "failed");

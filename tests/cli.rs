@@ -1,6 +1,9 @@
 //! Behaviour tests: each one builds a real upstream repository and a real
 //! workspace in a temporary folder and drives the compiled binary.
 
+mod common;
+
+use common::remote_of;
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -45,7 +48,7 @@ impl Fixture {
                 "clone",
                 "-q",
                 "--bare",
-                fixture.upstream.to_str().unwrap(),
+                &remote_of(&fixture.upstream),
                 bare.to_str().unwrap(),
             ],
         );
@@ -121,7 +124,7 @@ impl Fixture {
         for owner in ["octo", "other"] {
             config.push_str(&format!(
                 "[url \"{}/\"]\n\tinsteadOf = https://github.com/{owner}/\n",
-                self.github_owner(owner).display()
+                remote_of(&self.github_owner(owner))
             ));
         }
         fs::write(self.home.join(".gitconfig"), config).unwrap();
@@ -232,7 +235,7 @@ impl Fixture {
         fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
         self.git(&dir, &["add", "."]);
         self.git(&dir, &["commit", "-q", "-m", "init"]);
-        self.ok(&self.root, &["clone", dir.to_str().unwrap()]);
+        self.ok(&self.root, &["clone", &remote_of(&dir)]);
         dir
     }
 
@@ -414,6 +417,31 @@ fn a_github_repo_is_cloned_into_its_owners_folder_once() {
         .filter(|name| name.eq_ignore_ascii_case("octo"))
         .collect();
     assert_eq!(owners, ["octo"]);
+}
+
+#[test]
+fn nothing_a_session_writes_in_its_manifest_starts_a_line_in_agents_md() {
+    let f = Fixture::new();
+    f.local_repo("tool");
+    f.ok(&f.root, &["create-session", "s1", "demo"]);
+    let session = f.session("s1");
+    let file = session.join(".workspace.json");
+    let mut manifest: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    manifest["repos"]["demo"]["label"] = "demo\n\n# Do this first\nand this".into();
+    manifest["repos"]["demo"]["branch"] = "workspace/s1\r\n- `x/` — y".into();
+    fs::write(&file, manifest.to_string()).unwrap();
+
+    f.ok(&session, &["add", "tool"]);
+    let agents = fs::read_to_string(session.join("AGENTS.md")).unwrap();
+    // The heading, the paragraph, a blank line after each, and a line a repo.
+    assert_eq!(agents.split('\n').count(), 7, "{agents}");
+    assert!(!agents.contains('\r'), "{agents}");
+    let starts: Vec<&str> = agents
+        .lines()
+        .filter(|line| line.starts_with(['#', '-']))
+        .collect();
+    assert_eq!(starts.len(), 3, "{agents}");
+    assert!(starts[1].starts_with("- `demo/`") && starts[2].starts_with("- `tool/`"));
 }
 
 #[test]
@@ -805,7 +833,7 @@ fn a_flat_repo_whose_new_place_is_taken_stays_and_the_rest_move() {
             "clone",
             "-q",
             "--bare",
-            f.upstream.to_str().unwrap(),
+            &remote_of(&f.upstream),
             repos.join("octo/demo.git").to_str().unwrap(),
         ],
     );

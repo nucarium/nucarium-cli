@@ -114,13 +114,16 @@ pub fn tree_raw(
 // refuses it unless every key is one it knows to name no program. It checks
 // that every pointer leads into the nucleus's `.repos`. And it runs git with
 // nothing from the system's config or attributes, its own global config, and
-// hooks, the file-system monitor and an attributes file switched off. Where
+// hooks, the file-system monitor and an attributes file switched off. A
+// remote's address must be one git reaches over a network, and git is told
+// never to use the two transports that run a program on this machine. Where
 // the nucleus's config names a GitHub token file, git signs in to GitHub with
 // it, in place of whatever helper the global config names for GitHub.
 
 /// Keys of a repository's config that name no program and change nothing
 /// either relies on. Section and key are compared without case, as git
-/// compares them; `*` is a subsection, which must be there.
+/// compares them; `*` is a subsection, which must be there. A remote's `url`
+/// is allowed only with a value [`remote_address`] takes.
 const ALLOWED: [(&str, bool, &str); 12] = [
     ("core", false, "repositoryformatversion"),
     ("core", false, "bare"),
@@ -141,7 +144,14 @@ const ALLOWED: [(&str, bool, &str); 12] = [
 /// `diff.ignoreSubmodules` keeps `git status` out of a submodule, whose own
 /// config is not checked; `git add` goes into one whatever is set, which is
 /// why a worktree whose index names one is refused before either runs.
-const OVERRIDES: [&str; 8] = [
+///
+/// The two `protocol` settings are for a remote that is a folder on this
+/// machine, or a program: git serves a push to a folder by starting
+/// `receive-pack` in it, which runs that repository's own hooks, and the
+/// `hooksPath` above is not passed on to it. Nothing a session can write
+/// names such a remote and passes the check, and git refuses one here even
+/// if something else does, a rewrite in the user's own config say.
+const OVERRIDES: [&str; 12] = [
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
@@ -150,6 +160,10 @@ const OVERRIDES: [&str; 8] = [
     "core.attributesFile=/dev/null",
     "-c",
     "diff.ignoreSubmodules=all",
+    "-c",
+    "protocol.file.allow=never",
+    "-c",
+    "protocol.ext.allow=never",
 ];
 
 /// The git commands that start git again inside each checked-out
@@ -200,9 +214,99 @@ pub fn allowed(key: &str, value: Option<&str>) -> bool {
     if section == "gc" && !subsection {
         return value.is_some_and(numeric);
     }
+    if section == "remote" && subsection && name == "url" {
+        return value.is_some_and(remote_address);
+    }
     ALLOWED
         .iter()
         .any(|&(s, sub, n)| s == section && sub == subsection && n == name)
+}
+
+/// True for an address a remote may have: one git reaches over a network,
+/// by https or by ssh, written `https://…`, `ssh://…` or `git@host:path`.
+/// Those are the ones `nucleate clone` takes. A session can write a
+/// repository's config, and any other address has git run something on this
+/// machine: a path or `file://` starts `receive-pack` in that folder on a
+/// push, hooks and all, and lets a fetch read any repository the caller
+/// can; `ext::` and every other `<name>::` form name a program outright.
+/// Plain `http://` is taken for this machine alone, where a stand-in for
+/// GitHub is in tests; `git://` is not taken at all.
+pub fn remote_address(value: &str) -> bool {
+    if value.starts_with('-') || value.chars().any(char::is_control) {
+        return false;
+    }
+    for scheme in ["https://", "ssh://"] {
+        if let Some(rest) = value.strip_prefix(scheme) {
+            return host_of(rest).is_some();
+        }
+    }
+    if let Some(rest) = value.strip_prefix("http://") {
+        return host_of(rest)
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]"));
+    }
+    // Any other scheme, `file://` among them.
+    !value.contains("://") && scp_like(value)
+}
+
+/// The host of an address after its scheme, `[user@]host[:port][/path]`, if
+/// it is a plain one: a name, or an IPv6 address in brackets. Neither it nor
+/// the user starts with `-`, which ssh would read as an option.
+fn host_of(rest: &str) -> Option<&str> {
+    // Up to whatever any reader of the address would end it at, and with
+    // nothing two readers could split differently.
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.contains(['\\', ' ']) {
+        return None;
+    }
+    let host = match authority.rsplit_once('@') {
+        Some((user, _)) if user.is_empty() || user.starts_with('-') => return None,
+        Some((_, host)) => host,
+        None => authority,
+    };
+    let bracketed = host.strip_prefix('[').and_then(|rest| rest.split_once(']'));
+    let (host, port) = match bracketed {
+        Some((inside, port)) => {
+            let address = !inside.is_empty()
+                && inside
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'));
+            if !address {
+                return None;
+            }
+            (&host[..inside.len() + 2], port)
+        }
+        None => host.split_at(host.find(':').unwrap_or(host.len())),
+    };
+    let port_ok = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()));
+    (port_ok && (bracketed.is_some() || plain_name(host))).then_some(host)
+}
+
+/// A host's or a user's name: letters, digits, `.`, `_` and `-`, not first.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// `[user@]host:path`, as git reads an ssh address with no scheme: nothing
+/// before the colon but a user and a host, so it is no path on this machine,
+/// and a path that starts with neither `:`, which would make it git's
+/// `<name>::` way of naming a program, nor `-`.
+fn scp_like(value: &str) -> bool {
+    let Some((host, path)) = value.split_once(':') else {
+        return false;
+    };
+    let host = match host.split_once('@') {
+        Some((user, host)) if plain_name(user) => host,
+        Some(_) => return false,
+        None => host,
+    };
+    plain_name(host) && !path.is_empty() && !path.starts_with([':', '-'])
 }
 
 /// A whole number as git reads one: an optional sign and a `k`, `m` or `g`.
@@ -924,7 +1028,7 @@ impl Git {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, Git, Guarded, Vetting};
+    use super::{allowed, refusal, remote_address, Git, Guarded, Reason, Vetting};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -1227,6 +1331,167 @@ mod tests {
             ("nonsection", Some("x")),
         ] {
             assert!(!allowed(key, value), "{key} = {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_remote_is_an_address_git_reaches_over_https_or_ssh() {
+        for url in [
+            "https://github.com/octo/web.git",
+            "https://user:secret@example.com:8443/group/web",
+            "ssh://git@github.com/octo/web.git",
+            "ssh://example.com:2222/srv/git/web.git",
+            "ssh://[2001:db8::1]:22/web.git",
+            "git@github.com:octo/web.git",
+            "example.com:web.git",
+            // This machine alone, over plain http: GitHub's stand-in in tests.
+            "http://127.0.0.1:8787/octo/web.git",
+            "http://localhost/web.git",
+            "http://[::1]:8787/web.git",
+        ] {
+            assert!(remote_address(url), "{url}");
+            assert!(allowed("remote.origin.url", Some(url)), "{url}");
+            assert!(allowed("Remote.Fork.URL", Some(url)), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_remote_that_is_a_folder_or_a_program_on_this_machine_is_refused() {
+        for url in [
+            // A folder here: a push to one runs its hooks.
+            "/srv/git/web.git",
+            "../web.git",
+            "web.git",
+            "./evil:web.git",
+            "sessions/evil:web.git",
+            "file:///srv/git/web.git",
+            "file://localhost/srv/git/web.git",
+            // A program.
+            "ext::sh -c 'touch /tmp/x'",
+            "fd::3",
+            "anything::address",
+            "https::address",
+            // An option to git, or to ssh.
+            "-oProxyCommand=x",
+            "--upload-pack=x",
+            "ssh://-oProxyCommand=x/web.git",
+            "ssh://-oProxyCommand=x@example.com/web.git",
+            "-oProxyCommand=x@example.com:web.git",
+            "git@-oProxyCommand=x:web.git",
+            "example.com:-web.git",
+            // Across a network in the clear, or by a scheme not taken.
+            "http://example.com/web.git",
+            "http://127.0.0.1.example.com/web.git",
+            "http://127.0.0.1@example.com/web.git",
+            "http://example.com#@127.0.0.1/web.git",
+            "http://example.com\\@127.0.0.1/web.git",
+            "git://example.com/web.git",
+            "git+ssh://example.com/web.git",
+            "HTTPS://github.com/octo/web.git",
+            // No host, or no path.
+            "https://",
+            "https:///web.git",
+            "ssh://example.com:port/web.git",
+            "example.com:",
+            "https://github.com/octo/web.git\nfile:///srv/git/web.git",
+            "",
+        ] {
+            assert!(!remote_address(url), "{url}");
+            assert!(!allowed("remote.origin.url", Some(url)), "{url}");
+        }
+        assert!(!allowed("remote.origin.url", None));
+    }
+
+    /// A hook that leaves `marker` behind when it runs.
+    fn hook(repo: &Path, name: &str, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let file = repo.join("hooks").join(name);
+        std::fs::create_dir_all(repo.join("hooks")).unwrap();
+        std::fs::write(&file, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_push_to_a_folder_on_this_machine_runs_none_of_its_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // A nucleus with one repo and one session's worktree of it.
+        let source = upstream(&root);
+        let repos = root.join(".repos");
+        let bare = repos.join("_").join("web.git");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let (source_arg, bare_arg) = (source.to_str().unwrap(), bare.to_str().unwrap());
+        plain_git(&root, &["clone", "-q", "--bare", source_arg, bare_arg]);
+        let worktree = root.join(".worktrees").join("s1").join("web");
+        let worktree_arg = worktree.to_str().unwrap();
+        plain_git(
+            &bare,
+            &["worktree", "add", "-q", "-b", "work", worktree_arg],
+        );
+        // A repository a session made, whose hooks leave a marker, and the
+        // session's repo pointed at it.
+        let planted = root.join(".worktrees").join("s1").join("planted.git");
+        plain_git(&root, &["init", "-q", "--bare", planted.to_str().unwrap()]);
+        let marker = root.join("a-hook-ran");
+        hook(&planted, "pre-receive", &marker);
+        hook(&planted, "post-receive", &marker);
+        let point_at = |url: &str| plain_git(&bare, &["remote", "set-url", "origin", url]);
+        point_at(planted.to_str().unwrap());
+
+        // Switching hooks off for the push does not reach the repository
+        // pushed to: its hooks run.
+        let off = ["-c", "core.hooksPath=/dev/null", "push", "-q", "origin"];
+        plain_git(&worktree, &[&off[..], &["HEAD:refs/heads/plain"]].concat());
+        assert!(marker.exists(), "the hooks are not ones a push runs");
+        std::fs::remove_file(&marker).unwrap();
+
+        // The user's own config allows every transport; the call still does not.
+        let global = root.join("gitconfig");
+        std::fs::write(
+            &global,
+            "[protocol \"file\"]\n\tallow = always\n[protocol \"ext\"]\n\tallow = always\n",
+        )
+        .unwrap();
+        let guarded = |vetting: Vetting| {
+            let mut guarded = Guarded::new(Some(repos.clone()), vetting).quiet();
+            guarded.global = global.clone();
+            Git::Guarded(guarded)
+        };
+        let push = ["push", "-q", "origin", "--", "HEAD:refs/heads/guarded"];
+        let program = format!("ext::sh -c 'touch {}'", marker.display());
+        for url in [
+            planted.to_str().unwrap().to_string(),
+            format!("file://{}", planted.display()),
+            program,
+        ] {
+            point_at(&url);
+            // Enforcing, the repo is refused, and git is not run in it.
+            let enforcing = guarded(Vetting::Enforce);
+            let refused = enforcing.try_tree(&worktree, &push).err().unwrap();
+            assert_eq!(refusal(&refused).unwrap().reason, Reason::Config, "{url}");
+            assert_eq!(enforcing.vet_bare(&bare).unwrap().reason, Reason::Config);
+            // Reporting only, git is run, and will not use that transport.
+            let reporting = guarded(Vetting::Report);
+            let pushed = reporting.try_tree(&worktree, &push).unwrap();
+            assert!(!pushed.ok, "{url}");
+            assert!(pushed.stderr.contains("not allowed"), "{}", pushed.stderr);
+            let fetched = reporting
+                .try_bare(&bare, &["fetch", "-q", "origin"])
+                .unwrap();
+            assert!(!fetched.ok, "{url}");
+            assert!(!marker.exists(), "{url}: a program was run");
+        }
+        assert!(plain_git(&planted, &["branch", "--list", "guarded"]).is_empty());
+
+        // An address across a network is one the check takes.
+        for url in [
+            "https://github.com/octo/web.git",
+            "git@github.com:octo/web.git",
+        ] {
+            point_at(url);
+            let enforcing = guarded(Vetting::Enforce);
+            assert!(enforcing.vet_bare(&bare).is_none(), "{url}");
+            assert!(enforcing.vet_tree(&worktree).is_none(), "{url}");
         }
     }
 

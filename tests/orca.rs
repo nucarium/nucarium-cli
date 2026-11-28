@@ -127,12 +127,7 @@ impl Orca {
         let project = self.projects.join(name);
         git(
             &self.rig.home.dir,
-            &[
-                "clone",
-                "-q",
-                self.rig.upstream.to_str().unwrap(),
-                project.to_str().unwrap(),
-            ],
+            &["clone", "-q", &self.rig.remote(), project.to_str().unwrap()],
         );
         if on_github {
             // Its remote reads as one on GitHub. Nothing here fetches.

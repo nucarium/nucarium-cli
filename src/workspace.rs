@@ -32,6 +32,8 @@ mod layout;
 pub use layout::Moved;
 
 const MANIFEST: &str = ".workspace.json";
+/// What a session's agent is told of it, made from the manifest.
+const AGENTS: &str = "AGENTS.md";
 /// The most of a manifest that is read. A session can write its own, and
 /// one with every repo of a nucleus in it is a few kilobytes.
 const MAX_MANIFEST: u64 = 1024 * 1024;
@@ -262,6 +264,20 @@ fn valid_branch(value: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
         && !value.contains("..")
         && !value.ends_with('/')
+}
+
+/// A string from a manifest, for a line of `AGENTS.md`: the session wrote
+/// the manifest, and nothing in it may start a line of its own there. Every
+/// character that ends a line or is not printed becomes a space; a name, a
+/// label or a branch nucleate wrote holds none.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '\u{2028}' | '\u{2029}' => ' ',
+            c => c,
+        })
+        .collect()
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
@@ -687,14 +703,12 @@ impl Workspace {
         if !valid_name(&name) {
             bail!("cannot name a repo {name:?} from {url:?}; pass --name");
         }
+        // Only from an address the check takes, said here rather than by
+        // refusing the repo once it is made: a folder on this machine is none.
+        if !git::remote_address(url) {
+            bail!("cannot clone {url:?}: a repo is cloned from an https:// or ssh address");
+        }
         let owner = owner.map_or_else(|| layout::owner_of(url), str::to_string);
-        // A path on this machine is fetched by its full name, so the clone
-        // does not depend on the folder the command was run from.
-        let local = Path::new(url);
-        let source = match local.canonicalize() {
-            Ok(path) if !url.contains("://") => path.to_string_lossy().to_string(),
-            _ => url.to_string(),
-        };
         let label = layout::label(&owner, &name);
         if let Some(have) = self
             .available()?
@@ -703,7 +717,7 @@ impl Workspace {
         {
             // A GitHub repo is the same repo by its owner and name. One with
             // no owner has only its name, so it must come from the same place.
-            if owner != layout::NO_OWNER || self.remote_url(&have.bare) == source {
+            if owner != layout::NO_OWNER || self.remote_url(&have.bare) == url {
                 return Ok(Cloned {
                     repo: have,
                     already_present: true,
@@ -725,7 +739,7 @@ impl Workspace {
         made?;
         let fetched = self
             .git
-            .bare(&bare, &["remote", "add", "origin", &source])
+            .bare(&bare, &["remote", "add", "origin", url])
             .and_then(|_| {
                 self.git.bare(
                     &bare,
@@ -864,13 +878,23 @@ impl Workspace {
         // Not through a link, and not without end: the session wrote it.
         let text = paths::read_plain(&path, MAX_MANIFEST)
             .with_context(|| format!("reading {}", path.display()))?;
-        Self::parse_manifest(&text, &path)
+        let mut manifest = Self::parse_manifest(&text, &path)?;
+        Self::relocate(&mut manifest, session);
+        Ok(manifest)
     }
 
     /// The manifest of the session folder `held` open, which is `session`:
     /// read from that very folder, so a link swapped in for the folder
     /// since it was opened is not followed.
     pub fn load_manifest_in(held: &paths::Dir, session: &Path) -> Result<Manifest> {
+        let mut manifest = Self::read_manifest_in(held, session)?;
+        Self::relocate(&mut manifest, session);
+        Ok(manifest)
+    }
+
+    /// As [`Workspace::load_manifest_in`], as the file has it: a repo moved
+    /// to its owner folder since it was written is still named where it was.
+    fn read_manifest_in(held: &paths::Dir, session: &Path) -> Result<Manifest> {
         let path = session.join(MANIFEST);
         let text = held
             .read_plain(MANIFEST, MAX_MANIFEST)
@@ -879,23 +903,71 @@ impl Workspace {
     }
 
     fn parse_manifest(text: &str, path: &Path) -> Result<Manifest> {
-        let mut manifest: Manifest =
-            serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))?;
-        // A repo moved to its owner folder since this was written.
-        layout::relocate_all(&mut manifest);
-        Ok(manifest)
+        serde_json::from_str(text).with_context(|| format!("parsing {}", path.display()))
     }
 
-    fn save_manifest(session: &Path, manifest: &Manifest) -> Result<()> {
-        let tmp = session.join(format!("{MANIFEST}.tmp"));
-        fs::write(&tmp, serde_json::to_string_pretty(manifest)? + "\n")?;
-        fs::rename(&tmp, session.join(MANIFEST))?;
-        Ok(())
+    /// Have a manifest name each repo moved to its owner folder since it was
+    /// written where it is now. The repos are those of the nucleus the
+    /// session is in: its `.repos`, beside the `.worktrees` that holds it.
+    fn relocate(manifest: &mut Manifest, session: &Path) {
+        if let Some(nucleus) = session.parent().and_then(Path::parent) {
+            layout::relocate_all(manifest, &nucleus.join(".repos"));
+        }
     }
 
-    fn write_agents(session: &Path, manifest: &Manifest) -> Result<()> {
-        fs::write(session.join("AGENTS.md"), Self::agents_text(manifest))?;
-        Ok(())
+    /// A session's folder, held open: a folder directly in this nucleus's
+    /// `.worktrees`, reached with no link followed in place of either. What
+    /// is written to a session is written in the folder held, by name, so
+    /// nothing a session leaves there can send it anywhere else.
+    fn hold_session(&self, session: &Path) -> Result<paths::Dir> {
+        let not_one = || {
+            anyhow!(
+                "not a session folder of this nucleus: {}",
+                session.display()
+            )
+        };
+        let name = session.file_name().and_then(|name| name.to_str());
+        let name = name.ok_or_else(not_one)?;
+        let directly = session.parent().is_some_and(|parent| {
+            parent == self.sessions_dir
+                || parent
+                    .canonicalize()
+                    .is_ok_and(|parent| self.sessions_dir.canonicalize().ok() == Some(parent))
+        });
+        if !directly {
+            return Err(not_one());
+        }
+        paths::Dir::open(&self.sessions_dir, false)
+            .and_then(|sessions| sessions.at(name))
+            .with_context(|| format!("opening the session folder {}", session.display()))
+    }
+
+    /// A session's folder held open, and its manifest read from it.
+    fn open_session(&self, session: &Path) -> Result<(paths::Dir, Manifest)> {
+        let held = self.hold_session(session)?;
+        if held.look(MANIFEST).is_err() {
+            bail!(
+                "not a workspace session (no {MANIFEST}): {}",
+                session.display()
+            );
+        }
+        let manifest = Self::load_manifest_in(&held, session)?;
+        Ok((held, manifest))
+    }
+
+    /// Put a manifest in a session's folder, held open: a new file renamed
+    /// over the old one, so whatever the session left under either name, a
+    /// link included, is replaced and never written through.
+    fn save_manifest(held: &paths::Dir, manifest: &Manifest) -> Result<()> {
+        let text = serde_json::to_string_pretty(manifest)? + "\n";
+        held.replace_shared(MANIFEST, text.as_bytes())
+            .with_context(|| format!("writing {MANIFEST}"))
+    }
+
+    /// As [`Workspace::save_manifest`], for the session's `AGENTS.md`.
+    fn write_agents(held: &paths::Dir, manifest: &Manifest) -> Result<()> {
+        held.replace_shared(AGENTS, Self::agents_text(manifest).as_bytes())
+            .with_context(|| format!("writing {AGENTS}"))
     }
 
     fn agents_text(manifest: &Manifest) -> String {
@@ -903,12 +975,14 @@ impl Workspace {
             "# Workspace session\n\nEach subdirectory is an independent git worktree on branch \
              `{}`. Work only inside them; never edit the bare repos under `../../.repos/`. Use \
              the nucleate MCP tools (`list_repos`, `add_repo`) to expand this session.\n\n",
-            manifest.branch
+            one_line(&manifest.branch)
         );
         for (name, info) in &manifest.repos {
             text.push_str(&format!(
-                "- `{name}/` — {} on `{}`\n",
-                info.label, info.branch
+                "- `{}/` — {} on `{}`\n",
+                one_line(name),
+                one_line(&info.label),
+                one_line(&info.branch)
             ));
         }
         text
@@ -986,7 +1060,7 @@ impl Workspace {
     }
 
     pub fn add_repo(&self, session: &Path, repo: &str, branch: Option<&str>) -> Result<Value> {
-        let mut manifest = Self::load_manifest(session)?;
+        let (held, mut manifest) = self.open_session(session)?;
         let item = self.find_or_fetch(repo)?;
         if let Some(existing) = manifest.repos.get(&item.repo) {
             let same = existing.label.eq_ignore_ascii_case(&item.label)
@@ -1060,8 +1134,8 @@ impl Workspace {
             base: self.git.tree(&child, &["rev-parse", "HEAD"])?,
         };
         manifest.repos.insert(item.repo.clone(), info.clone());
-        Self::save_manifest(session, &manifest)?;
-        Self::write_agents(session, &manifest)?;
+        Self::save_manifest(&held, &manifest)?;
+        Self::write_agents(&held, &manifest)?;
         let mut out = serde_json::to_value(&info)?;
         out["repo"] = json!(item.repo);
         out["already_present"] = json!(false);
@@ -1082,8 +1156,11 @@ impl Workspace {
             branch: format!("{}/{name}", self.config.branch_prefix),
             repos: BTreeMap::new(),
         };
-        Self::save_manifest(&session, &manifest)?;
-        Self::write_agents(&session, &manifest)?;
+        let held = self.hold_session(&session).inspect_err(|_| {
+            let _ = fs::remove_dir(&session);
+        })?;
+        Self::save_manifest(&held, &manifest)?;
+        Self::write_agents(&held, &manifest)?;
         for repo in defaults {
             if let Err(error) = self.add_repo(&session, repo, None) {
                 if let Ok(partial) = Self::load_manifest(&session) {
@@ -1336,7 +1413,7 @@ impl Workspace {
     }
 
     pub fn remove_repo(&self, session: &Path, repo: &str, force: bool) -> Result<Value> {
-        let mut manifest = Self::load_manifest(session)?;
+        let (held, mut manifest) = self.open_session(session)?;
         // Only a worktree that is this session's own, as its manifest names.
         let worktrees = self.session_worktrees(session)?;
         // Named as the session has it: by its folder there, or its label.
@@ -1350,8 +1427,8 @@ impl Workspace {
             .ok_or_else(|| anyhow!("repo not in session: {repo}"))?;
         self.remove_one(&name, &info, force)?;
         manifest.repos.remove(&name);
-        Self::save_manifest(session, &manifest)?;
-        Self::write_agents(session, &manifest)?;
+        Self::save_manifest(&held, &manifest)?;
+        Self::write_agents(&held, &manifest)?;
         Ok(json!({ "removed": name, "session": session }))
     }
 
@@ -1506,7 +1583,7 @@ impl Workspace {
                 let dir = kind.is_some_and(|kind| kind.is_dir());
                 let known = match name.to_str() {
                     Some(MANIFEST) => file,
-                    Some("AGENTS.md") => {
+                    Some(AGENTS) => {
                         file && manifest.as_ref().is_some_and(|manifest| {
                             fs::read_to_string(entry.path())
                                 .is_ok_and(|text| text == Self::agents_text(manifest))
@@ -1783,7 +1860,160 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_merges, remember_merge, valid_branch, valid_name, Asked, Unsaved};
+    use super::{
+        read_merges, remember_merge, valid_branch, valid_name, Asked, Manifest, RepoInfo, Unsaved,
+        Workspace, AGENTS, MANIFEST,
+    };
+    use crate::config::Config;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    fn workspace_at(root: &Path) -> Workspace {
+        Workspace::new(Config {
+            root: root.to_path_buf(),
+            github_token_file: None,
+            branch_prefix: "workspace".to_string(),
+            github_api: crate::github::API_URL.to_string(),
+        })
+    }
+
+    /// A nucleus in `root`, with one empty session folder, `s1`.
+    fn nucleus(root: &Path) -> (Workspace, PathBuf) {
+        let session = root.join(".worktrees").join("s1");
+        fs::create_dir_all(&session).unwrap();
+        fs::create_dir_all(root.join(".repos")).unwrap();
+        (workspace_at(root), session)
+    }
+
+    fn manifest(repos: &[(&str, &str, &str)]) -> Manifest {
+        Manifest {
+            name: "s1".to_string(),
+            branch: "workspace/s1".to_string(),
+            repos: repos
+                .iter()
+                .map(|(name, label, branch)| {
+                    let info = RepoInfo {
+                        label: label.to_string(),
+                        bare: PathBuf::from("/nucleus/.repos/_/web.git"),
+                        path: PathBuf::from("/nucleus/.worktrees/s1").join(name),
+                        branch: branch.to_string(),
+                        base: String::new(),
+                    };
+                    (name.to_string(), info)
+                })
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn a_manifest_and_its_agents_file_are_never_written_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (workspace, session) = nucleus(&root);
+        // Files of the box's own, outside the session, and a link to one
+        // under every name a write to the session uses or has used.
+        let token = root.join("token");
+        let rc = root.join("shell-rc");
+        fs::write(&token, "nuc_secret\n").unwrap();
+        fs::write(&rc, "export PATH\n").unwrap();
+        let pid = std::process::id();
+        for (name, target) in [
+            (MANIFEST.to_string(), &token),
+            (format!("{MANIFEST}.tmp"), &token),
+            (format!(".{MANIFEST}.{pid}.tmp"), &token),
+            (AGENTS.to_string(), &rc),
+            (format!(".{AGENTS}.{pid}.tmp"), &rc),
+        ] {
+            symlink(target, session.join(name)).unwrap();
+        }
+
+        let written = manifest(&[("web", "octo/web", "workspace/s1")]);
+        let held = workspace.hold_session(&session).unwrap();
+        Workspace::save_manifest(&held, &written).unwrap();
+        Workspace::write_agents(&held, &written).unwrap();
+
+        assert_eq!(fs::read(&token).unwrap(), b"nuc_secret\n");
+        assert_eq!(fs::read(&rc).unwrap(), b"export PATH\n");
+        // Each is a file of its own now, in place of the link.
+        for name in [MANIFEST, AGENTS] {
+            let meta = fs::symlink_metadata(session.join(name)).unwrap();
+            assert!(meta.is_file(), "{name} is still a link");
+        }
+        let read = Workspace::load_manifest(&session).unwrap();
+        assert_eq!(read.repos["web"].label, "octo/web");
+        assert_eq!(
+            fs::read_to_string(session.join(AGENTS)).unwrap(),
+            Workspace::agents_text(&written)
+        );
+        // Nothing of the write is left behind.
+        assert!(!session.join(format!(".{MANIFEST}.{pid}.tmp")).exists());
+        assert!(!session.join(format!(".{AGENTS}.{pid}.tmp")).exists());
+    }
+
+    #[test]
+    fn only_a_folder_directly_in_the_nucleus_sessions_is_held_as_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (workspace, session) = nucleus(&root);
+        assert!(workspace.hold_session(&session).is_ok());
+        // A link in a session's place, to a folder outside.
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join(".worktrees").join("link");
+        symlink(&outside, &link).unwrap();
+        assert!(workspace.hold_session(&link).is_err());
+        // A folder inside a session, one outside the nucleus, and one gone.
+        let inside = session.join("web").join("deeper");
+        fs::create_dir_all(&inside).unwrap();
+        assert!(workspace.hold_session(&inside).is_err());
+        assert!(workspace.hold_session(&outside).is_err());
+        assert!(workspace
+            .hold_session(&root.join(".worktrees").join("gone"))
+            .is_err());
+        assert!(workspace.hold_session(&root.join(".worktrees")).is_err());
+        // The sessions' folder itself a link: none of its folders is held.
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().canonicalize().unwrap();
+        fs::create_dir_all(outside.join("s1")).unwrap();
+        symlink(&outside, other_root.join(".worktrees")).unwrap();
+        assert!(workspace_at(&other_root)
+            .hold_session(&other_root.join(".worktrees").join("s1"))
+            .is_err());
+    }
+
+    #[test]
+    fn nothing_in_a_manifest_starts_a_line_of_its_own_in_the_agents_file() {
+        let plain = manifest(&[
+            ("api", "octo/api", "workspace/s1"),
+            ("web", "octo/web", "workspace/s1"),
+        ]);
+        let text = Workspace::agents_text(&plain);
+        assert!(text.ends_with(
+            "- `api/` — octo/api on `workspace/s1`\n- `web/` — octo/web on `workspace/s1`\n"
+        ));
+        let lines = text.lines().count();
+
+        let mut crafted = manifest(&[
+            (
+                "api\n# Run this first",
+                "octo/api\r\n\r\n# Then this",
+                "b\u{2028}# And this",
+            ),
+            ("web", "octo/web\u{85}# Or this\u{b}\u{c}", "workspace/s1\n"),
+        ]);
+        crafted.branch = "workspace/s1`\n\n# Before anything".to_string();
+        let text = Workspace::agents_text(&crafted);
+        assert_eq!(text.lines().count(), lines, "{text}");
+        assert_eq!(
+            text.split(['\r', '\u{85}', '\u{2028}', '\u{2029}']).count(),
+            1
+        );
+        assert_eq!(text.matches('\n').count(), lines);
+        let headings = text.lines().filter(|line| line.starts_with('#')).count();
+        assert_eq!(headings, 1, "{text}");
+    }
 
     #[test]
     fn answers_remembered_at_once_by_several_threads_are_all_kept() {

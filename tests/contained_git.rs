@@ -15,7 +15,7 @@
 mod common;
 
 use common::gate::{self, mark, MARK};
-use common::{contract, git, run, stderr, stdout_json, Mock, Reply, Request, Rig};
+use common::{contract, git, remote_of, run, stderr, stdout_json, Mock, Reply, Request, Rig};
 use nucleate::driver::{END_GRACE, END_LIMIT};
 use nucleate::envelope::{unix_ms, Draft, Envelope, EventType};
 use nucleate::reporter::{Counts, Reporter};
@@ -1382,13 +1382,15 @@ fn where_the_environments_network_does_not_reach_github_nothing_is_sent_and_it_s
     assert_eq!(boxed.host_git(), Vec::<String>::new());
 }
 
-/// The container's proxy in front of every https remote.
+/// The container's proxy in front of every https remote, and of nothing on
+/// this machine, where the upstream of a repo that is not GitHub's is.
 fn behind(rig: &Rig, proxy: &str) {
     rig.container_does(
         "agent-env-client-a",
         &format!(
             "HTTPS_PROXY='{proxy}' https_proxy='{proxy}' ALL_PROXY='{proxy}'\n\
-             export HTTPS_PROXY https_proxy ALL_PROXY\nexec \"$@\""
+             NO_PROXY=127.0.0.1 no_proxy=127.0.0.1\n\
+             export HTTPS_PROXY https_proxy ALL_PROXY NO_PROXY no_proxy\nexec \"$@\""
         ),
     );
 }
@@ -1424,7 +1426,7 @@ fn where_one_repo_cannot_reach_github_the_others_are_still_pushed_and_said() {
     fs::create_dir_all(&api).unwrap();
     git(&api, &["init", "-q", "-b", "main"]);
     commit(&api, "README.md", "init");
-    let cloned = run(rig.nucleate().args(["clone", api.to_str().unwrap()]), "");
+    let cloned = run(rig.nucleate().args(["clone", &remote_of(&api)]), "");
     assert!(cloned.status.success(), "{}", stderr(&cloned));
     let made = run(
         rig.nucleate().args(["create-session", "two", "web", "api"]),
@@ -2180,12 +2182,7 @@ fn a_container_drivers_worktrees_are_counted_inside_it_with_no_git_on_the_host()
     let project = rig.root.join("projects").join("web");
     git(
         &rig.home.dir,
-        &[
-            "clone",
-            "-q",
-            rig.upstream.to_str().unwrap(),
-            project.to_str().unwrap(),
-        ],
+        &["clone", "-q", &rig.remote(), project.to_str().unwrap()],
     );
     let task = workspaces.join("task");
     git(
@@ -2541,7 +2538,7 @@ fn backups_pushed_before_one_failed_are_said() {
     fs::create_dir_all(&zed).unwrap();
     git(&zed, &["init", "-q", "-b", "main"]);
     commit(&zed, "README.md", "init");
-    let cloned = run(rig.nucleate().args(["clone", zed.to_str().unwrap()]), "");
+    let cloned = run(rig.nucleate().args(["clone", &remote_of(&zed)]), "");
     assert!(cloned.status.success(), "{}", stderr(&cloned));
     let made = run(
         rig.nucleate().args(["create-session", "two", "web", "zed"]),

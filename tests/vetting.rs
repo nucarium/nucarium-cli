@@ -172,6 +172,52 @@ fn an_ssh_command_in_the_config_is_refused() {
 }
 
 #[test]
+fn a_remote_that_is_a_folder_with_hooks_is_refused() {
+    let rig = Rig::new();
+    let (program, marker) = marker_program(&rig);
+    session_with_work(&rig);
+    // A repository whose hooks a push to it would run, where a session
+    // could have made one, and the session's repo pointed at it.
+    let planted = rig.home.dir.join("planted.git");
+    let value = planted.to_str().unwrap();
+    git(&rig.home.dir, &["init", "-q", "--bare", value]);
+    for hook in ["pre-receive", "update", "post-receive"] {
+        fs::copy(&program, planted.join("hooks").join(hook)).unwrap();
+    }
+    for url in [value.to_string(), format!("file://{value}")] {
+        git(&bare(&rig), &["config", "remote.origin.url", &url]);
+        assert_refused(&rig, &marker, "config", value);
+    }
+    assert!(git(&planted, &["for-each-ref"]).is_empty());
+}
+
+#[test]
+fn in_report_only_mode_a_push_to_a_folder_runs_none_of_its_hooks() {
+    let rig = Rig::new();
+    rig.configure("[git]\nvetting = \"report\"\n");
+    let (program, marker) = marker_program(&rig);
+    session_with_work(&rig);
+    let planted = rig.home.dir.join("planted.git");
+    let value = planted.to_str().unwrap();
+    git(&rig.home.dir, &["init", "-q", "--bare", value]);
+    for hook in ["pre-receive", "update", "post-receive"] {
+        fs::copy(&program, planted.join("hooks").join(hook)).unwrap();
+    }
+    git(&bare(&rig), &["config", "remote.origin.url", value]);
+
+    let seen = everything(&rig);
+    // Git ran, and would not fetch from the folder or push to it.
+    assert!(!marker.exists(), "a hook of the folder pushed to was run");
+    assert_eq!(seen.refresh["repos"][0]["ok"], false, "{}", seen.refresh);
+    assert!(git(&planted, &["for-each-ref"]).is_empty());
+    let environment = &seen.status["environments"][0];
+    assert_eq!(
+        environment["git_refused"],
+        json!([{ "repo": "web", "reason": "config" }])
+    );
+}
+
+#[test]
 fn a_filter_in_the_config_is_refused() {
     let rig = Rig::new();
     let (program, marker) = marker_program(&rig);

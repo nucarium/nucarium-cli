@@ -333,10 +333,10 @@ impl Dir {
     /// an error. Not synced to disk: for a copy whose loss in a crash costs
     /// nothing.
     pub fn create_new(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-        self.write_new(name, bytes, false)
+        self.write_new(name, bytes, false, 0o600)
     }
 
-    fn write_new(&self, name: &str, bytes: &[u8], sync: bool) -> std::io::Result<()> {
+    fn write_new(&self, name: &str, bytes: &[u8], sync: bool, mode: u32) -> std::io::Result<()> {
         let c = c_string(name.as_bytes())?;
         // SAFETY: a descriptor this folder owns, and a valid C string.
         let fd = checked(unsafe {
@@ -349,7 +349,7 @@ impl Dir {
                     | libc::O_NOFOLLOW
                     | libc::O_NOCTTY
                     | libc::O_CLOEXEC,
-                0o600 as libc::c_uint,
+                mode as libc::c_uint,
             )
         })?;
         // SAFETY: `openat` just made this file, and nothing else owns it.
@@ -370,9 +370,20 @@ impl Dir {
     /// Synced to disk before the rename, so a crash leaves the old entry or
     /// the whole new one.
     pub fn replace(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.replace_as(name, bytes, 0o600)
+    }
+
+    /// As [`Dir::replace`], with a file others may read, as an ordinary
+    /// write would leave it: for one a session's agent is meant to read,
+    /// whoever it runs as.
+    pub fn replace_shared(&self, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.replace_as(name, bytes, 0o666)
+    }
+
+    fn replace_as(&self, name: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
         let tmp = format!(".{name}.{}.tmp", std::process::id());
         let _ = self.unlink(&tmp);
-        self.write_new(&tmp, bytes, true)?;
+        self.write_new(&tmp, bytes, true, mode)?;
         let (from, to) = (c_string(tmp.as_bytes())?, c_string(name.as_bytes())?);
         // SAFETY: the descriptor this folder owns, twice, and two valid C
         // strings.

@@ -258,6 +258,133 @@ pub fn git_host(git_dir: &Path, accepted: &str) -> String {
     origin
 }
 
+/// The address a test's repository in a folder on this machine is cloned,
+/// fetched and pushed at. nucleate takes no folder for a remote: a push to
+/// one runs that folder's hooks. So a test's upstream is reached as a real
+/// one is, over a network: git's own server for smart HTTP, `git
+/// http-backend`, on this machine, in front of the folder. One server per
+/// test program serves each folder asked for here, and what is in it, by
+/// its full path, and nothing else on the machine.
+pub fn remote_of(repo: &Path) -> String {
+    static ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SERVED.lock().unwrap().push(repo.to_path_buf());
+    let origin = ORIGIN.get_or_init(|| {
+        let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+        // Several at once: tests run side by side, and so do their daemons.
+        for _ in 0..8 {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    serve_git(request);
+                }
+            });
+        }
+        format!("http://{}", server.server_addr())
+    });
+    let path: String = repo
+        .to_str()
+        .expect("a path that is text")
+        .bytes()
+        .map(|byte| match byte {
+            b'/' | b'-' | b'.' | b'_' | b'~' => (byte as char).to_string(),
+            byte if byte.is_ascii_alphanumeric() => (byte as char).to_string(),
+            byte => format!("%{byte:02X}"),
+        })
+        .collect();
+    format!("{origin}{path}")
+}
+
+/// The folders [`remote_of`] was asked for.
+static SERVED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Answer one request as `git http-backend` does, run as a web server runs
+/// it: the request in its environment and on its input, the answer's
+/// headers and body on its output. A client is taken as signed in, which
+/// is what lets it push.
+fn serve_git(mut request: tiny_http::Request) {
+    use std::io::Write;
+    let url = request.url().to_string();
+    let (path, query) = url.split_once('?').unwrap_or((&url, ""));
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str().to_string())
+    };
+    let asked = decode(path);
+    let served = |folder: &PathBuf| Path::new(&asked).starts_with(folder);
+    if !SERVED.lock().unwrap().iter().any(served) {
+        let _ = request.respond(tiny_http::Response::empty(404));
+        return;
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("http-backend")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .env("GIT_PROJECT_ROOT", "/")
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("REMOTE_USER", "test")
+        .env("REMOTE_ADDR", "127.0.0.1")
+        .env("REQUEST_METHOD", request.method().as_str())
+        .env("PATH_INFO", &asked)
+        .env("QUERY_STRING", query);
+    for (name, variable) in [
+        ("Content-Type", "CONTENT_TYPE"),
+        ("Content-Encoding", "HTTP_CONTENT_ENCODING"),
+        ("Git-Protocol", "GIT_PROTOCOL"),
+    ] {
+        if let Some(value) = header(name) {
+            command.env(variable, value);
+        }
+    }
+    let mut body = Vec::new();
+    let _ = request.as_reader().read_to_end(&mut body);
+    command.env("CONTENT_LENGTH", body.len().to_string());
+    let answered = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            // Written beside the read of its output, so neither waits on
+            // the other.
+            let mut input = child.stdin.take().expect("its input");
+            let writer = std::thread::spawn(move || input.write_all(&body));
+            let out = child.wait_with_output();
+            let _ = writer.join();
+            out
+        });
+    let Ok(out) = answered else {
+        let _ = request.respond(tiny_http::Response::empty(500));
+        return;
+    };
+    let cut = out
+        .stdout
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(out.stdout.len());
+    let mut response =
+        tiny_http::Response::from_data(out.stdout.get(cut + 4..).unwrap_or_default().to_vec());
+    for line in String::from_utf8_lossy(&out.stdout[..cut]).lines() {
+        let Some((name, value)) = line.split_once(": ") else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("Status") {
+            let code = value.split(' ').next().and_then(|code| code.parse().ok());
+            response = response.with_status_code(code.unwrap_or(500u16));
+        } else if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+            response.add_header(header);
+        }
+    }
+    let _ = request.respond(response);
+}
+
 /// A folder of stand-in programs, each a shell script, to go first on a
 /// command's `PATH`. Returns the `PATH` to use.
 pub fn path_with(home: &Home, programs: &[(&str, &str)]) -> std::ffi::OsString {
@@ -498,11 +625,7 @@ impl Rig {
         };
         let made = run(rig.nucleate().arg("init"), "");
         assert!(made.status.success(), "{}", stderr(&made));
-        let cloned = run(
-            rig.nucleate()
-                .args(["clone", rig.upstream.to_str().unwrap()]),
-            "",
-        );
+        let cloned = run(rig.nucleate().args(["clone", &rig.remote()]), "");
         assert!(cloned.status.success(), "{}", stderr(&cloned));
         rig.configure("");
         rig
@@ -566,6 +689,11 @@ impl Rig {
         self.home.nucleated()
     }
 
+    /// The address the `web` repo is cloned from: the upstream folder's.
+    pub fn remote(&self) -> String {
+        remote_of(&self.upstream)
+    }
+
     /// Make the `web` repo's remote read as one on GitHub, so that the repo
     /// has an owner and its pull requests have addresses, while git still
     /// fetches from and pushes to the upstream folder. Nothing here reaches
@@ -578,7 +706,7 @@ impl Rig {
     pub fn as_github(&self, slug: &str) {
         let bare = self.bare();
         let url = format!("https://github.com/{slug}.git");
-        let rewrite = format!("url.{}.insteadOf", self.upstream.display());
+        let rewrite = format!("url.{}.insteadOf", self.remote());
         let global = self.home.gitconfig();
         git(
             &bare,
