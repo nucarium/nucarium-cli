@@ -9,7 +9,9 @@
 //! titles, tool input and output, transcript paths — is skipped by the parser
 //! and never held: every adapter reads through [`crate::allowlist`]. The one
 //! exception is the session's own name, read only on a box whose owner turned
-//! `session_names` on.
+//! `session_names` on. To find it, the Claude Code adapter may also read the
+//! hook's transcript path and look in that transcript for the title entry,
+//! holding each line only while it checks it.
 //!
 //! A tool the daemon has to ask, because it calls no hook, is a driver and
 //! lives behind [`crate::driver`].

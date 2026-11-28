@@ -238,6 +238,18 @@ pub fn session_name<'de, D: Deserializer<'de>>(
     Ok(text.as_deref().and_then(crate::envelope::session_name))
 }
 
+/// Where an agent keeps a session's name when its hook does not carry it: a
+/// path, read only inside [`with_names`] with names on, used there and then to
+/// find the name, and never kept. For an `Option<String>`, with
+/// `#[serde(default, deserialize_with = "name_source")]`.
+pub fn name_source<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    if !NAMES.with(std::cell::Cell::get) {
+        IgnoredAny::deserialize(deserializer)?;
+        return Ok(None);
+    }
+    only(deserializer)
+}
+
 // ---- words told apart from their absence ------------------------------------
 
 /// A short string, with "not there" told apart from "there, and not a short

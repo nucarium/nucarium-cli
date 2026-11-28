@@ -423,6 +423,96 @@ fn a_box_that_sends_names_sends_the_session_title_and_nothing_else() {
     assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
 }
 
+/// A session's transcript as Claude Code writes it, in a folder named with
+/// the sentinel, with the sentinel in every line but one: the entry that gives
+/// the session its title, as the desktop app does after the first prompt.
+fn transcript_full_of_content(dir: &Path) -> std::path::PathBuf {
+    let folder = dir.join(format!("{MARK}_transcripts"));
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(format!("{SESSION}.jsonl"));
+    let mark = |what: &str| format!("{MARK} {what}");
+    let lines = [
+        // A forked session starts with its parent's lines, title and all.
+        json!({ "type": "custom-title", "customTitle": mark("the parent's title"), "sessionId": "the-parent" }),
+        json!({ "type": "user", "sessionId": SESSION, "cwd": mark("cwd"),
+                "message": { "role": "user", "content": mark("the prompt \"custom-title\"") } }),
+        json!({ "type": "custom-title", "customTitle": "ZZNAMEZZ Speed up\n the  login page ", "sessionId": SESSION }),
+        json!({ "type": "assistant", "sessionId": SESSION, "message": { "content": [
+            { "type": "text", "text": mark("the reply") },
+            { "type": "tool_use", "name": mark("tool"), "input": {
+                "type": "custom-title", "customTitle": mark("a tool's input"), "sessionId": SESSION } },
+        ] } }),
+        json!({ "type": "attachment", "sessionId": SESSION, "attachment": { "content": mark("a file") } }),
+        json!({ "type": "last-prompt", "sessionId": SESSION, "lastPrompt": mark("custom-title") }),
+        json!({ "type": "summary", "summary": mark("the summary"), "leafUuid": mark("uuid") }),
+    ];
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// Every hook event of a first turn, before any hook carries the title, each
+/// pointing at `transcript`.
+fn first_turn_hooks(rig: &Rig, cwd: &Path, transcript: &Path) {
+    for (event, allowed) in events() {
+        let mut payload = payload(event, cwd, &allowed);
+        payload.as_object_mut().unwrap().remove("session_title");
+        payload["transcript_path"] = json!(transcript);
+        hook(rig, event, &payload);
+    }
+}
+
+#[test]
+fn a_box_that_sends_names_takes_a_title_from_the_transcript_and_nothing_else() {
+    let (rig, cwd) = rig();
+    rig.configure("session_names = true");
+    let mock = gate::watch_taking(&["session_name"]);
+    rig.sign_in(&mock.url);
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = transcript_full_of_content(dir.path());
+    first_turn_hooks(&rig, &cwd, &transcript);
+    assert_eq!(
+        leaks_on_disk(&rig.home.state_dir()),
+        Vec::<String>::new(),
+        "content in the spool"
+    );
+    tick(&rig);
+    let sent = mock.everything();
+    assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    only_listed_fields(&mock);
+    // The end of the turn sends the session's own title, made to fit, and no
+    // event sends anything else the transcript holds.
+    let names = names_sent(&mock);
+    assert!(
+        names.iter().any(|(sent, _)| sent == "stop"),
+        "no stop event was sent"
+    );
+    for (kind, name) in &names {
+        match kind.as_str() {
+            "stop" => assert_eq!(name.as_deref(), Some(NAMED), "{kind}"),
+            _ => assert_eq!(name.as_deref(), None, "{kind}"),
+        }
+    }
+    assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
+}
+
+#[test]
+fn a_box_that_does_not_send_names_takes_no_title_from_the_transcript() {
+    let (rig, cwd) = rig();
+    let mock = gate::watch_taking(&["session_name"]);
+    rig.sign_in(&mock.url);
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = transcript_full_of_content(dir.path());
+    first_turn_hooks(&rig, &cwd, &transcript);
+    assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
+    tick(&rig);
+    let sent = mock.everything();
+    assert!(!mock.to("/v1/events:ingest").is_empty());
+    assert!(!sent.contains("ZZNAMEZZ"), "a name on the wire:\n{sent}");
+    assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+}
+
 #[test]
 fn a_name_goes_only_to_a_watch_that_takes_it_and_not_after_names_are_turned_off() {
     // A Watch that does not take the field hears no name, and refuses nothing.

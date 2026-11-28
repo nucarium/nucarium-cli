@@ -1125,13 +1125,13 @@ shown only by `nucleated status`.
 
 With `session_names = true`, Watch shows each session by its name instead of
 its short id. It is off unless set. Off, no adapter reads a name: the field is
-skipped unread, as every other field is.
+skipped unread, as every other field is, and no transcript is opened.
 
-On, each adapter reads one field and no other:
+On, each adapter reads only where its agent or driver keeps the name:
 
 | Agent or driver | Field |
 |---|---|
-| Claude Code | `session_title` on `SessionStart` and `UserPromptSubmit`: the title set with `/rename`, `--name` or by the app that runs the session. Its generated title is not in any hook. |
+| Claude Code | `session_title` on `SessionStart` and `UserPromptSubmit`: the title set with `/rename`, `--name` or by the app that runs the session. At the end of each turn, the latest `custom-title` entry for the session in its transcript, at `transcript_path` on `Stop`: the app titles a session after its first prompt is sent, and no hook carries that title until the next one. Only the last 4 MB of the transcript is searched, only a line naming `custom-title` is parsed, and of it only the entry's type, its session and its title are read. Its generated title is not in any hook. |
 | Codex | None: no hook carries one. |
 | T3 Code | A thread's `title`. |
 | Orca | An agent row's `conversationName`, from an Orca that sends it. |
@@ -1188,11 +1188,13 @@ is not the same as zero: a probe that gets no answer, a count not yet made and
 a GitHub that does not reply each leave their field off.
 
 Never read from the hook, never written to disk, never sent: prompts, messages,
-session titles (unless the box sends session names), tool inputs and outputs, transcript paths and contents, the
-last assistant message, compaction summaries and instructions, error details,
-file contents, file paths beyond a repo's name, environment variables, user
-names and tokens. The hook's `cwd` is read to find the session's repos and
-branch, and goes no further.
+session titles (unless the box sends session names), tool inputs and outputs,
+transcript paths and contents (unless the box sends session names, when a
+Claude Code transcript is searched for the session's title and nothing else of
+it is kept), the last assistant message, compaction summaries and instructions,
+error details, file contents, file paths beyond a repo's name, environment
+variables, user names and tokens. The hook's `cwd` is read to find the
+session's repos and branch, and goes no further.
 
 Never sent from what the box finds out itself: commit subjects and messages,
 file names, diffs, pull request titles, descriptions, branches and authors.

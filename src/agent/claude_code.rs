@@ -4,12 +4,13 @@
 //! this file.
 
 use super::{Agent, Lifecycle};
-use crate::allowlist::{read_object, session_name, short_string};
+use crate::allowlist::{name_source, read_object, session_name, short_string};
 use crate::envelope::EventType;
 use crate::settings::Environment;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -56,6 +57,73 @@ struct UserPrompt {
     cwd: Option<String>,
     #[serde(default, deserialize_with = "session_name")]
     session_title: Option<String>,
+}
+
+/// `Stop`: the common fields and, on a box that sends names, where the
+/// session's transcript is. A title the app running the session gives it
+/// during its first turn comes after that turn's `UserPromptSubmit`, and no
+/// hook carries it until the next prompt, so at the end of a turn it is looked
+/// up in the transcript. Off, the path is skipped unread.
+#[derive(Deserialize)]
+struct Stop {
+    #[serde(default, deserialize_with = "short_string")]
+    session_id: Option<String>,
+    #[serde(default, deserialize_with = "short_string")]
+    cwd: Option<String>,
+    #[serde(default, deserialize_with = "name_source")]
+    transcript_path: Option<String>,
+}
+
+/// A transcript entry, as far as finding the session's title goes. Every
+/// other key of the entry is skipped unread.
+#[derive(Deserialize)]
+struct TitleEntry {
+    #[serde(rename = "type", default, deserialize_with = "short_string")]
+    kind: Option<String>,
+    #[serde(rename = "sessionId", default, deserialize_with = "short_string")]
+    session_id: Option<String>,
+    #[serde(rename = "customTitle", default, deserialize_with = "session_name")]
+    custom_title: Option<String>,
+}
+
+/// How much of the end of a transcript is searched for the session's title.
+/// Claude Code writes the title again as the session goes on, so the latest
+/// is near the end: in 400 real transcripts it was never 3 MB from it.
+const TITLE_SEARCH: u64 = 4 * 1024 * 1024;
+
+/// The title the transcript at `path` last gives the session `session_id`:
+/// the latest `custom-title` entry written for that session, and not one a
+/// forked or resumed session copied from the session before it. Each line is
+/// in memory only while it is checked for the entry's type; one that does not
+/// name it is dropped undecoded, and one that does is parsed for three keys.
+/// Nothing but the title is kept.
+fn transcript_title(path: &Path, session_id: &str) -> Option<String> {
+    const NEEDLE: &[u8] = b"\"custom-title\"";
+    // Only a file: opening a pipe or a device could wait for ever.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let start = file.metadata().ok()?.len().saturating_sub(TITLE_SEARCH);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut title = None;
+    for line in BufReader::new(file.take(TITLE_SEARCH)).split(b'\n') {
+        let Ok(line) = line else { break };
+        if !line.windows(NEEDLE.len()).any(|bytes| bytes == NEEDLE) {
+            continue;
+        }
+        let Some(entry) = read_object::<TitleEntry>(&mut line.as_slice()) else {
+            continue;
+        };
+        if entry.kind.as_deref() == Some("custom-title")
+            && entry.session_id.as_deref() == Some(session_id)
+        {
+            if let Some(name) = entry.custom_title {
+                title = Some(name);
+            }
+        }
+    }
+    title
 }
 
 #[derive(Deserialize)]
@@ -151,7 +219,15 @@ impl Agent for ClaudeCode {
             // A tool ran, so the agent is working: this is how a session
             // leaves "needs input" after a permission is granted.
             "posttooluse" | "posttoolusefailure" => (EventType::Activity, common(payload)?),
-            "stop" => (EventType::Stop, common(payload)?),
+            "stop" => {
+                let hook: Stop = read_object(payload)?;
+                name = hook
+                    .transcript_path
+                    .as_deref()
+                    .zip(hook.session_id.as_deref())
+                    .and_then(|(path, id)| transcript_title(Path::new(path), id));
+                (EventType::Stop, (hook.session_id, hook.cwd))
+            }
             "stopfailure" => {
                 let hook: StopFailure = read_object(payload)?;
                 error_kind = hook.error;
@@ -461,5 +537,114 @@ mod tests {
             name(true, "SessionStart", json!({ "session_id": "s1" })),
             None
         );
+    }
+
+    /// A transcript as Claude Code writes one, with the session's title given
+    /// twice, among lines that look like a title entry and are not one.
+    fn transcript(dir: &Path, lines: &[Value]) -> PathBuf {
+        let path = dir.join("s1.jsonl");
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn stop(on: bool, path: &Path) -> Option<String> {
+        let payload = json!({ "session_id": "s1", "transcript_path": path });
+        crate::allowlist::with_names(on, || lifecycle("Stop", payload))
+            .unwrap()
+            .session_name
+    }
+
+    #[test]
+    fn the_end_of_a_turn_reads_the_title_the_app_gave_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = transcript(
+            dir.path(),
+            &[
+                // A forked session's transcript starts with its parent's lines.
+                json!({ "type": "custom-title", "customTitle": "The parent", "sessionId": "s0" }),
+                json!({ "type": "user", "sessionId": "s1",
+                        "message": { "content": "call it \"custom-title\" please" } }),
+                json!({ "type": "custom-title", "customTitle": "A first try", "sessionId": "s1" }),
+                // A tool's input shaped like a title entry is inside a message,
+                // not an entry of its own.
+                json!({ "type": "assistant", "sessionId": "s1", "message": { "content": [
+                    { "type": "tool_use", "input": { "type": "custom-title", "customTitle": "Not this", "sessionId": "s1" } }
+                ] } }),
+                json!({ "type": "custom-title", "customTitle": "Speed up the\nlogin  page", "sessionId": "s1" }),
+                json!({ "type": "custom-title", "customTitle": { "text": "odd" }, "sessionId": "s1" }),
+                json!({ "type": "last-prompt", "sessionId": "s1", "lastPrompt": "custom-title" }),
+            ],
+        );
+        // The latest title written for this session, made to fit.
+        assert_eq!(
+            stop(true, &path).as_deref(),
+            Some("Speed up the login page")
+        );
+        // Off, the path is not read, so no title is.
+        assert_eq!(stop(false, &path), None);
+        assert_eq!(
+            lifecycle(
+                "Stop",
+                json!({ "session_id": "s1", "transcript_path": path })
+            )
+            .unwrap()
+            .session_name,
+            None
+        );
+    }
+
+    #[test]
+    fn a_transcript_with_no_title_of_its_own_gives_none_and_costs_the_stop_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let untitled = transcript(
+            dir.path(),
+            &[
+                json!({ "type": "user", "sessionId": "s1", "message": { "content": "hello" } }),
+                json!({ "type": "custom-title", "customTitle": "The parent", "sessionId": "s0" }),
+                json!({ "type": "custom-title", "customTitle": "No session" }),
+            ],
+        );
+        for path in [
+            untitled,
+            dir.path().join("not there.jsonl"),
+            // A folder, not a transcript.
+            dir.path().to_path_buf(),
+        ] {
+            let payload = json!({ "session_id": "s1", "transcript_path": path });
+            let read = crate::allowlist::with_names(true, || lifecycle("Stop", payload)).unwrap();
+            assert_eq!(read.event, EventType::Stop, "{}", path.display());
+            assert_eq!(read.session_name, None, "{}", path.display());
+        }
+        // A path that is not a string is no path.
+        let payload = json!({ "session_id": "s1", "transcript_path": ["s1.jsonl"] });
+        let read = crate::allowlist::with_names(true, || lifecycle("Stop", payload)).unwrap();
+        assert_eq!(read.session_name, None);
+    }
+
+    #[test]
+    fn only_the_end_of_a_long_transcript_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.jsonl");
+        let mut text =
+            json!({ "type": "custom-title", "customTitle": "Long ago", "sessionId": "s1" })
+                .to_string();
+        text.push('\n');
+        let filler = json!({ "type": "user", "sessionId": "s1", "message": { "content": "x".repeat(1000) } });
+        while (text.len() as u64) <= TITLE_SEARCH {
+            text.push_str(&filler.to_string());
+            text.push('\n');
+        }
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(stop(true, &path), None);
+        let recent = json!({ "type": "custom-title", "customTitle": "Lately", "sessionId": "s1" });
+        text.push_str(&recent.to_string());
+        text.push('\n');
+        std::fs::write(&path, &text).unwrap();
+        assert_eq!(stop(true, &path).as_deref(), Some("Lately"));
     }
 }
