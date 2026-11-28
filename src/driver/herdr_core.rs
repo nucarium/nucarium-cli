@@ -23,7 +23,7 @@
 //! unread: the structs below name the only fields this program takes.
 
 use super::{Condition, Driver, HookProcess, Look, Memory, Observed, Phase};
-use crate::allowlist::{self, flag, number, short_string, Nested};
+use crate::allowlist::{self, flag, number, session_name, short_string, Nested};
 use crate::paths;
 use crate::settings::Environment;
 use serde::de::DeserializeOwned;
@@ -245,7 +245,8 @@ struct Terminal {
     cwd: Option<String>,
 }
 
-/// One 7501 record, less its `app`, `title`, `msg` and `progress`.
+/// One 7501 record, less its `app`, `msg` and `progress`, and its `title`
+/// unless the box sends names.
 #[derive(Deserialize)]
 struct Status {
     /// "idle, working, done, blocked or error."
@@ -254,6 +255,10 @@ struct Status {
     /// "permission, question or auth (blocked only, when the program said)."
     #[serde(default, deserialize_with = "short_string")]
     kind: Option<String>,
+    /// The program's own label for what it is doing: its name for the
+    /// session. Read only when the box sends names; otherwise skipped unread.
+    #[serde(default, deserialize_with = "session_name")]
+    title: Option<String>,
 }
 
 /// What runs in a terminal now, less its name and command line.
@@ -314,6 +319,10 @@ fn observed(terminal: &Terminal) -> Option<Observed> {
         _ => None,
     };
     let mut session = Observed::new(format!("hc:{address}:{created}"), phase);
+    session.name = terminal
+        .status
+        .get()
+        .and_then(|status| status.title.clone());
     session.turn = terminal.turn;
     session.cwd = folder(
         terminal.foreground.get().and_then(|f| f.cwd.as_ref()),

@@ -30,7 +30,9 @@
 //! without keeping it.
 
 use super::{loopback_origin, Condition, Driver, HookProcess, Look, Memory, Observed, Phase};
-use crate::allowlist::{self, flag, number, object, present, rows, short_string, Rows, Stated};
+use crate::allowlist::{
+    self, flag, number, object, present, rows, session_name, short_string, Rows, Stated,
+};
 use crate::envelope::valid_session_id;
 use crate::paths;
 use crate::settings::Environment;
@@ -383,8 +385,9 @@ struct Snapshot {
     projects: Option<Rows<Project>>,
 }
 
-/// `OrchestrationV2ThreadShell`, the state of it. Not named, and so never
-/// read: `title`, `latestVisibleMessage`, `lastError`, `lastErrorCode`,
+/// `OrchestrationV2ThreadShell`, the state of it. Its `title` is read only
+/// on a box that sends names. Not named, and so never read:
+/// `latestVisibleMessage`, `lastError`, `lastErrorCode`,
 /// `goal`, `branch`, `tags`, `linkOrigin`, `modelSelection`, every pull
 /// request and issue field, and the rest.
 #[derive(Deserialize)]
@@ -396,6 +399,10 @@ struct Thread {
     project_id: Option<String>,
     #[serde(default, deserialize_with = "short_string")]
     status: Option<String>,
+    /// The thread's title, as T3 Code shows it. Read only when the box sends
+    /// names; otherwise skipped unread.
+    #[serde(default, deserialize_with = "session_name")]
+    title: Option<String>,
     /// Told apart from its absence: `activityRunStatus ?? status` falls back
     /// only when this is null or missing.
     #[serde(default)]
@@ -700,6 +707,7 @@ fn sessions(threads: &[Thread], projects: &[Project]) -> Vec<Observed> {
         }
         let phase = phase(thread, waits.get(id).copied());
         let mut observed = Observed::new(id, phase);
+        observed.name = thread.title.clone();
         if phase == Some(Phase::Failed) {
             let class = thread
                 .last_error_class

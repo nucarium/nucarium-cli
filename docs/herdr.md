@@ -89,11 +89,15 @@ sent. A folder is used to find the repo names and the branch, as a hook's
 `cwd` is. A pane id and an agent's own session id are compared with what
 hooks have reported (see below).
 
+Read only on a box whose config sets `session_names = true`, as the session's
+name (see Session names in the README): herdr-core's `status.title` and the
+TUI's `title`. Otherwise each is skipped unread.
+
 Never read from herdr-core: `name`, `argv`, `title`, `labels`, `template`,
 `first_message`, `identity`, `parent`, `records`, `reason`, `status.app`,
-`status.title`, `status.msg`, `status.progress`, `foreground.name`,
+`status.msg`, `status.progress`, `foreground.name`,
 `foreground.argv`, and all of `machines`. Never read from the TUI: `name`,
-`agent`, `title`, `terminal_title`, `terminal_title_stripped`,
+`agent`, `terminal_title`, `terminal_title_stripped`,
 `display_agent`, `state_labels`, `tokens`, `workspace_id`, `tab_id`,
 `agent_session.source`, `agent_session.agent`.
 

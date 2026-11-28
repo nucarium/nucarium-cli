@@ -18,7 +18,7 @@
 
 mod common;
 
-use common::gate::{leaks_on_disk, only_listed_fields, tick, watch, MARK};
+use common::gate::{self, leaks_on_disk, only_listed_fields, tick, watch, MARK};
 use common::{contract, files_under, run, Mock, Reply, Request, Rig};
 use nucleate::daemon::{Daemon, Timings};
 use nucleate::envelope::rfc3339;
@@ -328,6 +328,126 @@ fn no_content_reaches_the_spool_the_local_state_or_the_wire() {
         Vec::<String>::new(),
         "content in the local state"
     );
+}
+
+/// A session's name as the owner gave it, marked so the gate can find it.
+/// It is not the sentinel: on a box that sends names it is meant to leave.
+const NAMED: &str = "ZZNAMEZZ Speed up the login page";
+
+/// Every hook event, with the sentinel everywhere as above and the session's
+/// custom title set to [`NAMED`] split over two lines.
+fn titled_hooks(rig: &Rig, cwd: &Path) {
+    for (event, allowed) in events() {
+        let mut payload = payload(event, cwd, &allowed);
+        payload["session_title"] = json!("ZZNAMEZZ Speed up\n the  login page ");
+        hook(rig, event, &payload);
+    }
+}
+
+/// Every place on the box that holds `text`.
+fn held_on_disk(rig: &Rig, text: &str) -> Vec<String> {
+    files_under(&rig.home.state_dir())
+        .into_iter()
+        .filter(|(_, bytes)| String::from_utf8_lossy(bytes).contains(text))
+        .map(|(path, _)| path.display().to_string())
+        .collect()
+}
+
+/// The `session_name` of every event sent, by event type.
+fn names_sent(mock: &common::Mock) -> Vec<(String, Option<String>)> {
+    mock.to("/v1/events:ingest")
+        .iter()
+        .flat_map(|request| request.json()["events"].as_array().unwrap().clone())
+        .map(|event| {
+            (
+                event["type"].as_str().unwrap().to_string(),
+                event["session_name"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_box_that_does_not_send_names_reads_none_even_for_a_watch_that_takes_them() {
+    let (rig, cwd) = rig();
+    let mock = gate::watch_taking(&["session_name"]);
+    rig.sign_in(&mock.url);
+    titled_hooks(&rig, &cwd);
+    assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
+    tick(&rig);
+    let sent = mock.everything();
+    assert!(!mock.to("/v1/events:ingest").is_empty());
+    assert!(!sent.contains("ZZNAMEZZ"), "a name on the wire:\n{sent}");
+    assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+    assert!(names_sent(&mock).iter().all(|(_, name)| name.is_none()));
+    assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
+}
+
+#[test]
+fn a_box_that_sends_names_sends_the_session_title_and_nothing_else() {
+    let (rig, cwd) = rig();
+    rig.configure("session_names = true");
+    let mock = gate::watch_taking(&["session_name"]);
+    rig.sign_in(&mock.url);
+    titled_hooks(&rig, &cwd);
+    // The sentinel is still nowhere; the name waits in the spool to be sent.
+    assert_eq!(
+        leaks_on_disk(&rig.home.state_dir()),
+        Vec::<String>::new(),
+        "content in the spool"
+    );
+    tick(&rig);
+    let sent = mock.everything();
+    assert!(!sent.contains(MARK), "content on the wire:\n{sent}");
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+    only_listed_fields(&mock);
+    // The two events whose hooks carry the title send it, made to fit, and
+    // no other event carries a name.
+    let names = names_sent(&mock);
+    for kind in ["session_start", "user_prompt_submit"] {
+        assert!(
+            names.iter().any(|(sent, _)| sent == kind),
+            "no {kind} event was sent"
+        );
+    }
+    for (kind, name) in &names {
+        match kind.as_str() {
+            "session_start" | "user_prompt_submit" => {
+                assert_eq!(name.as_deref(), Some(NAMED), "{kind}")
+            }
+            _ => assert_eq!(name.as_deref(), None, "{kind}"),
+        }
+    }
+    // Once sent, the name is held nowhere on the box: not in the spool, not in
+    // the session's state.
+    assert_eq!(held_on_disk(&rig, "ZZNAMEZZ"), Vec::<String>::new());
+}
+
+#[test]
+fn a_name_goes_only_to_a_watch_that_takes_it_and_not_after_names_are_turned_off() {
+    // A Watch that does not take the field hears no name, and refuses nothing.
+    let (rig, cwd) = rig();
+    rig.configure("session_names = true");
+    let mock = watch();
+    rig.sign_in(&mock.url);
+    titled_hooks(&rig, &cwd);
+    tick(&rig);
+    assert!(!mock.to("/v1/events:ingest").is_empty());
+    assert!(!mock.everything().contains("ZZNAMEZZ"));
+    assert_eq!(contract::violations(&mock), Vec::<String>::new());
+
+    // Names spooled while the box sent them go without them once it stops.
+    let (later, cwd) = self::rig();
+    later.configure("session_names = true");
+    let mock = gate::watch_taking(&["session_name"]);
+    later.sign_in(&mock.url);
+    titled_hooks(&later, &cwd);
+    assert!(!held_on_disk(&later, "ZZNAMEZZ").is_empty());
+    later.configure("");
+    tick(&later);
+    assert!(!mock.to("/v1/events:ingest").is_empty());
+    assert!(!mock.everything().contains("ZZNAMEZZ"));
+    assert!(names_sent(&mock).iter().all(|(_, name)| name.is_none()));
 }
 
 #[test]

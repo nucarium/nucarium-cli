@@ -201,6 +201,43 @@ pub fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Er
     deserializer.deserialize_any(There)
 }
 
+// ---- a session's name, only when the box's owner sends names ---------------
+
+thread_local! {
+    /// Whether a session's name is read on this thread. Off unless
+    /// [`with_names`] turns it on around one read.
+    static NAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `read` with session names read or not, as the box's `session_names`
+/// setting says, and put back what was there before. Off, a field read with
+/// [`session_name`] is read past and never kept, as a key no struct names.
+pub fn with_names<T>(on: bool, read: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NAMES.with(|names| names.set(self.0));
+        }
+    }
+    let _restore = Restore(NAMES.with(|names| names.replace(on)));
+    read()
+}
+
+/// The one field that may hold words a person chose: the name of a session,
+/// read only inside [`with_names`] with names on, and kept only as
+/// [`crate::envelope::session_name`] makes it fit. For an `Option<String>`,
+/// with `#[serde(default, deserialize_with = "session_name")]`.
+pub fn session_name<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    if !NAMES.with(std::cell::Cell::get) {
+        IgnoredAny::deserialize(deserializer)?;
+        return Ok(None);
+    }
+    let text: Option<String> = only(deserializer)?;
+    Ok(text.as_deref().and_then(crate::envelope::session_name))
+}
+
 // ---- words told apart from their absence ------------------------------------
 
 /// A short string, with "not there" told apart from "there, and not a short
@@ -762,5 +799,46 @@ mod tests {
         // An answer longer than its limit is no answer.
         let mut long = "{\"state\":\"idle\",\"padding\":\"xxxxxxxxxxxxxxxxxxxx\"}\n".as_bytes();
         assert_eq!(read_line::<Row>(&mut long, 16), None);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Named {
+        #[serde(default, deserialize_with = "short_string")]
+        state: Option<String>,
+        #[serde(default, deserialize_with = "session_name")]
+        title: Option<String>,
+    }
+
+    #[test]
+    fn a_name_is_read_only_inside_with_names_on_and_the_switch_is_put_back() {
+        let named = || -> Named {
+            read_object(
+                &mut json!({ "state": "idle", "title": "Fix the login page" })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        assert_eq!(named().title, None);
+        assert_eq!(named().state.as_deref(), Some("idle"));
+        assert_eq!(
+            with_names(true, named).title.as_deref(),
+            Some("Fix the login page")
+        );
+        assert_eq!(with_names(false, named).title, None);
+        // Off again outside, and after a nested turn off.
+        assert_eq!(named().title, None);
+        with_names(true, || {
+            assert_eq!(with_names(false, named).title, None);
+            assert!(named().title.is_some());
+        });
+        assert_eq!(named().title, None);
+        // Put back after a panic, too.
+        let _ = std::panic::catch_unwind(|| with_names(true, || panic!("a look that failed")));
+        assert_eq!(named().title, None);
+        // Another thread never inherits it.
+        with_names(true, || {
+            assert_eq!(std::thread::spawn(named).join().unwrap().title, None);
+        });
     }
 }

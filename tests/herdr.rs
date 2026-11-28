@@ -630,6 +630,56 @@ fn a_herdr_tui_agent_that_has_hooks_of_its_own_is_left_to_them() {
 
 // ---- the privacy gate --------------------------------------------------------
 
+#[test]
+fn on_a_box_that_sends_names_herdr_s_own_title_for_the_agent_is_its_name() {
+    let names = |rig: &Rig| -> Vec<Option<String>> {
+        drain(rig)
+            .iter()
+            .map(|record| record["event"]["session_name"].as_str().map(str::to_string))
+            .collect()
+    };
+    for on in [false, true] {
+        // herdr-core: the program's own label in its 7501 status, never the
+        // terminal's name or its window title.
+        let (rig, fake) = rig_with("herdr-core");
+        if on {
+            rig.send_names();
+        }
+        let mut one = terminal(
+            "t7",
+            json!({ "state": "working", "title": "Speed up\nthe login page" }),
+        );
+        one["name"] = json!("reviewer");
+        one["title"] = json!("node ~/work");
+        fake.terminals(json!([one]));
+        assert_eq!(look(&rig, 0).condition, Condition::Ok);
+        let sent = names(&rig);
+        assert_eq!(sent.len(), 2, "names on: {on}");
+        for name in sent {
+            assert_eq!(name.as_deref(), on.then_some("Speed up the login page"));
+        }
+
+        // Herdr TUI: the title an integration reported, never the agent's
+        // name or the terminal's own title.
+        let (rig, fake) = rig_with("herdr-tui");
+        if on {
+            rig.send_names();
+        }
+        let mut one = agent("term_65f1a2b3c4d5e1", "w1:p2", "working");
+        one["title"] = json!("Refactor auth middleware");
+        one["name"] = json!("reviewer");
+        one["terminal_title"] = json!("node ~/work");
+        one["display_agent"] = json!("Claude: auth");
+        fake.agents(json!([one]));
+        assert_eq!(look(&rig, 0).condition, Condition::Ok);
+        let sent = names(&rig);
+        assert_eq!(sent.len(), 2, "names on: {on}");
+        for name in sent {
+            assert_eq!(name.as_deref(), on.then_some("Refactor auth middleware"));
+        }
+    }
+}
+
 /// The sentinel in every field of a herdr-core terminal that holds content,
 /// around the few fields the adapter reads.
 fn full_terminal(address: &str, status: Value, cwd: &Path) -> Value {

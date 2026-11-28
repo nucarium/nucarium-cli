@@ -27,7 +27,7 @@
 //! while it lists one the count would leave out, no count is sent.
 
 use super::{Condition, Driver, HookProcess, Look, Memory, Observed, Phase, ASK_LIMIT};
-use crate::allowlist::{self, flag, number, short_string, Keyed, MAX_PAYLOAD};
+use crate::allowlist::{self, flag, number, session_name, short_string, Keyed, MAX_PAYLOAD};
 use crate::bounded::{self, Failure};
 use crate::settings::Environment;
 use crate::{agent, hook};
@@ -112,6 +112,11 @@ struct Agent {
     restored_unconfirmed: Option<bool>,
     #[serde(default)]
     main_agent: Option<Keyed<Lead>>,
+    /// "The name desktop's compact row leads with (rename, chat or live
+    /// title)", from Orca hosts that send it. Read only when the box sends
+    /// names; otherwise skipped unread.
+    #[serde(default, deserialize_with = "session_name")]
+    conversation_name: Option<String>,
 }
 
 /// `AgentMainAgentStatus`: the main agent's own state, apart from its
@@ -354,6 +359,7 @@ fn sessions(environment: &Environment, answer: Answer) -> Result<Look, Condition
             // `updatedAt` moves on with each tool and prompt while the state
             // stays as it is (agent-status-types.ts).
             observed.activity = agent.updated_at;
+            observed.name = agent.conversation_name.clone();
             observed.cwd = cwd.clone();
             observed.claim_key = hooked(agent.agent_type.as_deref())
                 .zip(key.as_deref())

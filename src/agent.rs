@@ -7,7 +7,9 @@
 //! standard input, and answers with at most one lifecycle event built from a
 //! short list of named fields. The rest of the payload — prompts, messages,
 //! titles, tool input and output, transcript paths — is skipped by the parser
-//! and never held: every adapter reads through [`crate::allowlist`].
+//! and never held: every adapter reads through [`crate::allowlist`]. The one
+//! exception is the session's own name, read only on a box whose owner turned
+//! `session_names` on.
 //!
 //! A tool the daemon has to ask, because it calls no hook, is a driver and
 //! lives behind [`crate::driver`].
@@ -30,6 +32,9 @@ pub struct Lifecycle {
     /// The folder the session is working in. Used on the box to find the
     /// session's repos and branch, and never sent.
     pub cwd: Option<PathBuf>,
+    /// The session's name, as the agent has it. Only ever read inside
+    /// [`crate::allowlist::with_names`] with names on.
+    pub session_name: Option<String>,
     /// For a failure, the agent's short machine-readable kind.
     pub error_kind: Option<String>,
     /// For a failure on a usage limit, when the agent says the limit resets.

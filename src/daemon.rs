@@ -1065,9 +1065,14 @@ impl Daemon {
         let (Some(client), Some(token)) = (&self.client, &self.token) else {
             return Err(());
         };
-        // As this Watch takes them: never a claim, and a session's driver
-        // reference only once Watch has said it takes it.
-        let taken = self.taken_now(now);
+        // As this Watch takes them: never a claim, a session's driver
+        // reference only once Watch has said it takes it, and a session's
+        // name only while this box sends names. One spooled before the owner
+        // turned names off goes without it.
+        let mut taken = self.taken_now(now);
+        if !self.settings.session_names {
+            taken = taken.without("session_name");
+        }
         let envelopes: Vec<Envelope> = ids
             .iter()
             .filter_map(|id| self.pending.get(id).map(|p| p.envelope.as_sent(&taken)))

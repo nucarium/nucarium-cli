@@ -53,6 +53,9 @@ enum Command {
         /// What the last look left, as the daemon keeps it.
         #[arg(long, value_name = "JSON")]
         previous: Option<String>,
+        /// Read each session's name: the box sends names.
+        #[arg(long)]
+        names: bool,
     },
     /// Git for the daemon, from inside an environment's container: what the
     /// daemon runs there through `podman exec`. Prints one answer.
@@ -442,6 +445,7 @@ fn main() -> ExitCode {
         now,
         token: _,
         previous,
+        names,
     } = &cli.command
     {
         inside::run(&inside::Asked {
@@ -449,6 +453,7 @@ fn main() -> ExitCode {
             within_ms: *within,
             now_ms: *now,
             previous: previous.as_deref(),
+            names: *names,
         });
         return ExitCode::SUCCESS;
     }

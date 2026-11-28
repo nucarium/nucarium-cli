@@ -158,6 +158,11 @@ pub struct Observed {
     /// knows, or the driver itself is not sure. The session keeps the phase
     /// it had, and still counts as listed.
     pub phase: Option<Phase>,
+    /// The session's name, as the driver shows it. Read only inside
+    /// [`crate::allowlist::with_names`] with names on, through
+    /// [`crate::allowlist::session_name`], from the one field the adapter
+    /// names for it.
+    pub name: Option<String>,
     /// With [`Phase::Failed`], the driver's own short machine-readable kind,
     /// one of a list its documentation or source gives. Never a message.
     pub error_kind: Option<String>,
@@ -193,6 +198,7 @@ impl Observed {
         Observed {
             id: id.into(),
             phase,
+            name: None,
             error_kind: None,
             limit_resets_at: None,
             cwd: None,
@@ -1078,6 +1084,9 @@ pub fn apply(
                 session_id: observed.id.clone(),
                 repos: observed.repos.clone(),
                 branch: observed.branch.clone(),
+                // Every event of a named session carries its name, so a new
+                // name reaches Watch with the session's next change.
+                session_name: observed.name.clone().filter(|_| settings.session_names),
                 error_kind: observed.error_kind.clone(),
                 limit_resets_at,
                 ..Draft::default()
@@ -1389,10 +1398,14 @@ impl Runner {
             facts: memory.facts.clone(),
             ..Memory::default()
         };
-        let more = [
+        let mut more = vec![
             "--previous".to_string(),
             serde_json::to_string(&previous).unwrap_or_default(),
         ];
+        // Only a box that sends names asks the look for them.
+        if settings.session_names {
+            more.push("--names".to_string());
+        }
         let call = Call {
             container: environment.container(),
             env: &environment.name,

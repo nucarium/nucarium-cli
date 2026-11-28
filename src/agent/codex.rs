@@ -252,6 +252,9 @@ impl Agent for Codex {
             event: kind,
             session_id: session_id?,
             cwd: cwd.map(PathBuf::from),
+            // No Codex hook carries the session's name: its title is written
+            // by a hidden session of its own, which is not reported.
+            session_name: None,
             // No Codex hook carries a machine-readable error kind or a time
             // a limit resets, so neither is read.
             error_kind: None,
