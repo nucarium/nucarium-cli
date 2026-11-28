@@ -656,6 +656,68 @@ fn refresh_moves_a_nucleus_made_before_owner_folders() {
     assert!(flat.is_dir());
 }
 
+#[test]
+fn the_move_writes_through_no_link_a_session_left_and_trusts_no_repos_folder_it_made() {
+    use std::os::unix::fs::symlink;
+    let rig = Rig::new();
+    rig.session("fix-login");
+    rig.session("other");
+    let flat = rig.flatten();
+    // Files of the box's own, outside every session, and links to them
+    // under the names a write to the session's folder has gone by.
+    let token = rig.home.dir.join("box-token");
+    let rc = rig.home.dir.join("shell-rc");
+    fs::write(&token, "nuc_secret\n").unwrap();
+    fs::write(&rc, "export PATH\n").unwrap();
+    let session = rig.root.join(".worktrees/fix-login");
+    symlink(&token, session.join(".workspace.json.tmp")).unwrap();
+    fs::remove_file(session.join("AGENTS.md")).unwrap();
+    symlink(&rc, session.join("AGENTS.md")).unwrap();
+    // Another session's manifest names a `.repos` of the session's making,
+    // laid out as one whose repo has moved.
+    let other = rig.root.join(".worktrees/other/.workspace.json");
+    let made = rig.root.join(".worktrees/other/made/.repos");
+    fs::create_dir_all(made.join("_").join("web.git")).unwrap();
+    let named = fs::read_to_string(&other).unwrap().replace(
+        flat.to_str().unwrap(),
+        made.join("web.git").to_str().unwrap(),
+    );
+    fs::write(&other, &named).unwrap();
+
+    let report = housekeeping(&rig, &["refresh"]);
+    assert!(!flat.exists(), "{report}");
+    let moved = rig.root.join(".repos/_/web.git");
+    // The first session's manifest names the repo's new place.
+    let manifest: Value =
+        serde_json::from_str(&fs::read_to_string(session.join(".workspace.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["repos"]["web"]["bare"], moved.to_str().unwrap());
+    assert_eq!(fs::read(&token).unwrap(), b"nuc_secret\n");
+    assert_eq!(fs::read(&rc).unwrap(), b"export PATH\n");
+    // The other's is as the session left it.
+    assert_eq!(fs::read_to_string(&other).unwrap(), named);
+
+    // Adding a repo writes the manifest and `AGENTS.md` again: a file of
+    // its own in place of the link, and nothing through it.
+    let api = rig.home.dir.join("upstream").join("api");
+    fs::create_dir_all(&api).unwrap();
+    git(&api, &["init", "-q", "-b", "main"]);
+    git(&api, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let cloned = run(rig.nucleate().args(["clone", &common::remote_of(&api)]), "");
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+    let added = run(
+        rig.nucleate()
+            .args(["add", "api", "--session", "fix-login"]),
+        "",
+    );
+    assert!(added.status.success(), "{}", stderr(&added));
+    assert_eq!(fs::read(&token).unwrap(), b"nuc_secret\n");
+    assert_eq!(fs::read(&rc).unwrap(), b"export PATH\n");
+    let agents = session.join("AGENTS.md");
+    assert!(fs::symlink_metadata(&agents).unwrap().is_file());
+    assert!(fs::read_to_string(&agents).unwrap().contains("`api/`"));
+}
+
 /// Register, in `bare`, a worktree whose `gitdir` names a folder outside
 /// every environment, as a session can: what `git worktree repair` would
 /// write a `.git` file into. Returns that folder.

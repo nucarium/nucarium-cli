@@ -272,12 +272,7 @@ fn a_container_drivers_worktree_whose_git_is_outside_the_container_is_not_counte
     let project = rig.root.join("projects").join("web");
     git(
         &rig.home.dir,
-        &[
-            "clone",
-            "-q",
-            rig.upstream.to_str().unwrap(),
-            project.to_str().unwrap(),
-        ],
+        &["clone", "-q", &rig.remote(), project.to_str().unwrap()],
     );
     let task = workspaces.join("task");
     git(
@@ -302,12 +297,7 @@ fn a_container_drivers_worktree_whose_git_is_outside_the_container_is_not_counte
     let theirs = rig.home.dir.join("workspace-other").join("web");
     git(
         &rig.home.dir,
-        &[
-            "clone",
-            "-q",
-            rig.upstream.to_str().unwrap(),
-            theirs.to_str().unwrap(),
-        ],
+        &["clone", "-q", &rig.remote(), theirs.to_str().unwrap()],
     );
     let planted = workspaces.join("planted");
     git(

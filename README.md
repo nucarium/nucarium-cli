@@ -79,12 +79,16 @@ in the shape `nucleate available` uses, `{ "repo", "label", "bare" }`, with
 `"already_present"`: cloning a repo that is already there, however its owner
 and name are capitalised, finds it and changes nothing.
 
+`<url>` is an address git reaches over https or ssh: `https://…`, `ssh://…` or
+`git@host:path`. A folder on this machine, a `file://` address, `git://`, and
+`http://` to anywhere but this machine are refused, and nothing is made: see
+[Git in session repos](#git-in-session-repos).
+
 A repo is available when its clone exists. Its label is `owner/name`, and two
 owners' repos of the same name live side by side. `<owner>` is the repo's
-owner on GitHub. A repo from anywhere else, another host or a path on this
-machine, goes in `_`, and its label is its name alone: GitHub never gives an
-owner that name, and another host's path says nothing reliable about who owns
-a repo. A remote whose owner or name is not a plain name (letters, digits,
+owner on GitHub. A repo from any other host goes in `_`, and its label is its
+name alone: GitHub never gives an owner that name, and another host's path
+says nothing reliable about who owns a repo. A remote whose owner or name is not a plain name (letters, digits,
 `.`, `_` and `-`) counts as one from anywhere else.
 
 `nucleate add` takes a label (`octo/web`) or a name alone (`web`). A name alone
@@ -1444,7 +1448,11 @@ there:
   `branch.<name>.vscode-merge-base`, `extensions.worktreeConfig`, and any
   `gc.<key>` set to a number. These are what `git clone`, `git worktree add`
   and `nucleate` write, and the branch keys `nucleate hook-create` adds for
-  each session. A repo's `credential.*` and `url.*.insteadOf` are not on the
+  each session. A `remote.<name>.url` must be an address git reaches over
+  https or ssh (`https://…`, `ssh://…`, `git@host:path`; `http://` only to
+  this machine), or the repo is refused: a remote that is a folder on this machine has a push run that
+  folder's hooks and lets a fetch read any repo on the box, and `ext::` and
+  the like name a program outright. A repo's `credential.*` and `url.*.insteadOf` are not on the
   list: a fetch uses the agent user's own credential helper and rewrites, from
   the global config below, and never a repo's. Where a `github_token_file` is
   set, the helper for `https://github.com` is replaced on the command line by
@@ -1458,7 +1466,11 @@ there:
   driver runs in a container. Then they must point inside the folders of the
   environments in that container.
 - It follows no link in place of `.worktrees` or of a session folder, and
-  reads a session's manifest only up to 1 MiB and never through a link. For
+  reads a session's manifest only up to 1 MiB and never through a link. It
+  writes a session's manifest and `AGENTS.md` as new files put in place of
+  the old ones, in the session's folder held open, so a link a session
+  leaves under either name is replaced and never written through. What a
+  manifest says goes into `AGENTS.md` on the one line it belongs to. For
   an environment in a container, a worktree whose path leads out of the
   environment's folders is not looked at, and its count is then unknown.
 - It refuses a worktree whose index names a submodule, checked out or not:
@@ -1469,8 +1481,12 @@ there:
   `GIT_ATTR_NOSYSTEM=1`), with its own global config (the one its environment
   names in `GIT_CONFIG_GLOBAL`, else `~/.gitconfig`), and with
   `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
-  `core.attributesFile=/dev/null` and `diff.ignoreSubmodules=all` on the
+  `core.attributesFile=/dev/null`, `diff.ignoreSubmodules=all`,
+  `protocol.file.allow=never` and `protocol.ext.allow=never` on the
   command line, where they win over anything in a repo. That is why `core.hooksPath` may be set: it does nothing.
+  The two `protocol` settings also hold for your own global config: a
+  `url.*.insteadOf` there that sends a remote to a folder on this machine no
+  longer works for `nucleate` and the daemon.
 
 `nucleate` always enforces the check; `vetting` in the daemon's config does
 not change it. A command that would run git in a refused repo fails with

@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{git, run, stderr, stdout_json, Home, Rig};
+use common::{git, remote_of, run, stderr, stdout_json, Home, Rig};
 use std::fs;
 use std::path::PathBuf;
 
@@ -147,7 +147,7 @@ fn clone_prints_the_entry_available_would() {
     git(&other, &["commit", "-q", "-m", "init"]);
     let out = run(
         rig.nucleate()
-            .args(["clone", other.to_str().unwrap(), "--name", "backend"]),
+            .args(["clone", &remote_of(&other), "--name", "backend"]),
         "",
     );
     assert!(out.status.success(), "{}", stderr(&out));
@@ -188,11 +188,7 @@ fn clone_names_the_repo_from_the_url() {
 fn clone_finds_a_repo_already_there_and_refuses_one_it_cannot_name() {
     let rig = Rig::new();
     // The same repo again: found, and nothing changes.
-    let again = run(
-        rig.nucleate()
-            .args(["clone", rig.upstream.to_str().unwrap()]),
-        "",
-    );
+    let again = run(rig.nucleate().args(["clone", &rig.remote()]), "");
     assert!(again.status.success(), "{}", stderr(&again));
     let printed = stdout_json(&again);
     assert_eq!(printed["already_present"], true);
@@ -201,10 +197,7 @@ fn clone_finds_a_repo_already_there_and_refuses_one_it_cannot_name() {
     let elsewhere = rig.home.dir.join("elsewhere/web");
     fs::create_dir_all(&elsewhere).unwrap();
     git(&elsewhere, &["init", "-q", "-b", "main"]);
-    let other = run(
-        rig.nucleate().args(["clone", elsewhere.to_str().unwrap()]),
-        "",
-    );
+    let other = run(rig.nucleate().args(["clone", &remote_of(&elsewhere)]), "");
     assert_eq!(other.status.code(), Some(1));
     assert!(stderr(&other).contains("already available"));
     let unnamed = run(
@@ -213,6 +206,29 @@ fn clone_finds_a_repo_already_there_and_refuses_one_it_cannot_name() {
     );
     assert_eq!(unnamed.status.code(), Some(1));
     assert!(stderr(&unnamed).contains("--name"));
+}
+
+#[test]
+fn clone_takes_no_folder_or_program_on_this_machine_for_a_remote() {
+    let rig = Rig::new();
+    let folder = rig.home.dir.join("upstream/api");
+    fs::create_dir_all(&folder).unwrap();
+    git(&folder, &["init", "-q", "-b", "main"]);
+    git(&folder, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let marker = rig.home.dir.join("a-program-ran");
+    for url in [
+        folder.to_str().unwrap().to_string(),
+        format!("file://{}", folder.display()),
+        format!("ext::sh -c 'touch {}'", marker.display()),
+        "http://example.invalid/your-org/api.git".to_string(),
+        "git://example.invalid/your-org/api.git".to_string(),
+    ] {
+        let out = run(rig.nucleate().args(["clone", &url, "--name", "api"]), "");
+        assert_eq!(out.status.code(), Some(1), "{url}");
+        assert!(stderr(&out).contains("https:// or ssh"), "{}", stderr(&out));
+    }
+    assert!(!rig.root.join(".repos/_/api.git").exists());
+    assert!(!marker.exists(), "a program a remote names was run");
 }
 
 #[test]

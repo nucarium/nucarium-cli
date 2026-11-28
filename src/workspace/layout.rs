@@ -1,12 +1,11 @@
 //! Where a bare repo lives in `.repos`, and moving a nucleus from the flat
 //! layout (`.repos/<name>.git`) to owner folders (`.repos/<owner>/<name>.git`).
 //!
-//! A GitHub repo lives under its owner. Any other, from another host or a
-//! path on this machine, lives under [`NO_OWNER`]: GitHub allows only
-//! letters, digits and `-` in an owner's name, so `_` is never one, and an
-//! "owner" read from another host's path would follow no rule at all. Every
-//! repo is then two levels down, and a `*.git` directly in `.repos` is always
-//! one not moved yet.
+//! A GitHub repo lives under its owner. Any other, from another host, lives
+//! under [`NO_OWNER`]: GitHub allows only letters, digits and `-` in an
+//! owner's name, so `_` is never one, and an "owner" read from another host's
+//! path would follow no rule at all. Every repo is then two levels down, and
+//! a `*.git` directly in `.repos` is always one not moved yet.
 
 use super::{valid_name, Manifest, Workspace};
 use crate::github;
@@ -95,10 +94,12 @@ pub(crate) fn nested(repos: &Path) -> Vec<(String, String, PathBuf)> {
 
 /// Where a repo a manifest names in the flat layout is now: the one in an
 /// owner folder under the same name whose label the manifest has, else the
-/// only one of that name. Nothing for a path that is not a flat repo's.
-pub(crate) fn relocated(bare: &Path, label: &str) -> Option<PathBuf> {
-    let repos = bare.parent()?;
-    if repos.file_name()? != ".repos" {
+/// only one of that name. Nothing for a path that is not a flat repo's in
+/// `repos`, this nucleus's own: a session writes its manifest, and one that
+/// names a `.repos` of its own making is not sent looking through it.
+pub(crate) fn relocated(repos: &Path, bare: &Path, label: &str) -> Option<PathBuf> {
+    let named = bare.parent()?;
+    if named != repos && named.canonicalize().ok()? != repos.canonicalize().ok()? {
         return None;
     }
     let file = bare.file_name()?.to_string_lossy().to_string();
@@ -408,16 +409,22 @@ impl Workspace {
             }
         }
 
+        // A session wrote its manifest, and can leave anything in its
+        // folder: each is read and written in the folder held open, never
+        // through a link, and one that cannot be is left for the next run.
         for (_, session) in self.sessions() {
-            let Ok(text) = fs::read_to_string(session.join(super::MANIFEST)) else {
+            let Ok(held) = self.hold_session(&session) else {
                 continue;
             };
-            let Ok(mut manifest) = serde_json::from_str::<Manifest>(&text) else {
+            let Ok(mut manifest) = Self::read_manifest_in(&held, &session) else {
                 continue;
             };
-            if relocate_all(&mut manifest) {
-                Self::save_manifest(&session, &manifest)?;
-                moved.manifests.push(session.join(super::MANIFEST));
+            if relocate_all(&mut manifest, &self.repos_dir) {
+                let file = session.join(super::MANIFEST);
+                match Self::save_manifest(&held, &manifest) {
+                    Ok(()) => moved.manifests.push(file),
+                    Err(error) => moved.left.push((file, format!("{error:#}"))),
+                }
             }
         }
         drop(lock);
@@ -471,15 +478,15 @@ impl Workspace {
     }
 }
 
-/// Point every repo of a manifest that names a place no longer there at
-/// where it is now. True if anything changed.
-pub(crate) fn relocate_all(manifest: &mut Manifest) -> bool {
+/// Point every repo of a manifest that names a place in `repos` no longer
+/// there at where it is now. True if anything changed.
+pub(crate) fn relocate_all(manifest: &mut Manifest, repos: &Path) -> bool {
     let mut changed = false;
     for info in manifest.repos.values_mut() {
         if info.bare.exists() {
             continue;
         }
-        if let Some(now) = relocated(&info.bare, &info.label) {
+        if let Some(now) = relocated(repos, &info.bare, &info.label) {
             info.bare = now;
             changed = true;
         }
@@ -489,8 +496,32 @@ pub(crate) fn relocate_all(manifest: &mut Manifest) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_sessions, label, owner_of, valid_owner, NO_OWNER};
+    use super::{in_sessions, label, owner_of, relocated, valid_owner, NO_OWNER};
     use std::fs;
+
+    #[test]
+    fn only_a_repo_of_this_nucleus_is_found_where_it_moved_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repos = root.join("nucleus").join(".repos");
+        let now = repos.join("_").join("web.git");
+        fs::create_dir_all(&now).unwrap();
+        assert_eq!(
+            relocated(&repos, &repos.join("web.git"), "web"),
+            Some(now.clone())
+        );
+        // The same folder, named through a link.
+        std::os::unix::fs::symlink(root.join("nucleus"), root.join("alias")).unwrap();
+        let alias = root.join("alias").join(".repos").join("web.git");
+        assert_eq!(relocated(&repos, &alias, "web"), Some(now));
+        // A `.repos` a session made, laid out as a nucleus's is.
+        let made = root.join("nucleus/.worktrees/s1/made/.repos");
+        fs::create_dir_all(made.join("_").join("web.git")).unwrap();
+        assert_eq!(relocated(&repos, &made.join("web.git"), "web"), None);
+        // Not a flat repo's place at all.
+        assert_eq!(relocated(&repos, &repos.join("_/web.git"), "web"), None);
+        assert_eq!(relocated(&repos, &repos.join("web"), "web"), None);
+    }
 
     #[test]
     fn only_an_absolute_pointer_to_a_sessions_worktree_is_one_to_point_back() {
